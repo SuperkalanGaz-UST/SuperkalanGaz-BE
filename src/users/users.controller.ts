@@ -1,0 +1,85 @@
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  Param,
+  ParseUUIDPipe,
+  Patch,
+  Post,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
+import { AuthGuard } from '../auth/auth.guard';
+import { Principal } from '../auth/principal';
+import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
+import { RolesGuard } from '../auth/roles.guard';
+import { CreateUserDto } from './dto/create-user.dto';
+import { ListUsersQuery } from './dto/list-users.query';
+import { UpdateUserDto } from './dto/update-user.dto';
+import { Profile } from './profile.entity';
+import { UsersService } from './users.service';
+
+/**
+ * Staff-account management. Response shapes intentionally match the legacy
+ * Next.js /api/users handlers so the web dashboard needed no contract change.
+ * BM has no access: managing accounts is FA/BO territory (AGENTS.md §7).
+ */
+@Controller('users')
+@UseGuards(AuthGuard, RolesGuard)
+@Roles('franchise-admin', 'branch-owner')
+export class UsersController {
+  constructor(private readonly users: UsersService) {}
+
+  @Get()
+  async list(
+    @CurrentPrincipal() principal: Principal,
+    @Query() query: ListUsersQuery,
+  ): Promise<{ users: ReturnType<UsersController['toRow']>[] }> {
+    const profiles = await this.users.list(principal, query);
+    return { users: profiles.map((p) => this.toRow(p)) };
+  }
+
+  @Post()
+  async create(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: CreateUserDto,
+  ): Promise<{ id: string }> {
+    return this.users.create(principal, dto);
+  }
+
+  @Patch(':id')
+  async update(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateUserDto,
+  ): Promise<{ ok: true }> {
+    await this.users.update(principal, id, dto);
+    return { ok: true };
+  }
+
+  @Delete(':id')
+  @HttpCode(200)
+  async remove(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<{ ok: true }> {
+    await this.users.softDelete(principal, id);
+    return { ok: true };
+  }
+
+  private toRow(p: Profile) {
+    return {
+      id: p.id,
+      email: p.email,
+      username: p.username,
+      display_name: p.displayName,
+      role: p.role,
+      branches: p.branches,
+      phone: p.phone,
+      status: p.status,
+      created_at: p.createdAt,
+    };
+  }
+}
