@@ -216,6 +216,12 @@ propose an in-scope alternative.
 - App Router (Next.js). Server components for data fetch where sensible.
 - Role-gate every screen against §7; the UI must not render actions a role can't perform.
 - Talk to the API only; no direct DB access from the web app.
+- **No backend lives in this repo.** All backend logic, API endpoints, and database
+  access belong in **`superkalan-crm-api`** (NestJS). Do **not** create an `api/` folder
+  or Next.js API routes (e.g. `app/api/**`, `pages/api/**`) inside `superkalan-crm-web`;
+  the web app only calls the NestJS API over HTTP via the client in
+  `src/app/lib/api.ts`. If a request seems to need a new server route, add the endpoint in
+  `superkalan-crm-api` instead.
 
 ### `[mobile]`
 - Expo, customer-only flows. No staff/admin screens.
