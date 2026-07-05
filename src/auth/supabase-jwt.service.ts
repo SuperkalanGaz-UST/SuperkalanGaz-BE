@@ -17,7 +17,13 @@ export class SupabaseJwtService {
   constructor(config: ConfigService) {
     const supabaseUrl = config.getOrThrow<string>('SUPABASE_URL').replace(/\/$/, '');
     this.issuer = `${supabaseUrl}/auth/v1`;
-    this.jwks = createRemoteJWKSet(new URL(`${this.issuer}/.well-known/jwks.json`));
+    // The JWKS is fetched lazily on the first verify and then cached. Give that
+    // cold fetch generous headroom (default is 5s): all authentication depends
+    // on it, so a slow first fetch must not spuriously 401 every caller until
+    // the cache warms.
+    this.jwks = createRemoteJWKSet(new URL(`${this.issuer}/.well-known/jwks.json`), {
+      timeoutDuration: 10000,
+    });
 
     const secret = config.get<string>('SUPABASE_JWT_SECRET');
     this.hsSecret = secret ? new TextEncoder().encode(secret) : undefined;

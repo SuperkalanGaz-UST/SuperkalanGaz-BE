@@ -32,6 +32,22 @@ import { UsersService } from './users.service';
 export class UsersController {
   constructor(private readonly users: UsersService) {}
 
+  /**
+   * The caller's own profile. Every authenticated persona needs this at login
+   * to know which dashboard to render and its branch scope — so unlike the
+   * management endpoints it is open to all three roles (overriding the
+   * class-level @Roles). Scope still comes from the verified Principal, never
+   * the client.
+   */
+  @Get('me')
+  @Roles('franchise-admin', 'branch-owner', 'branch-manager')
+  async me(
+    @CurrentPrincipal() principal: Principal,
+  ): Promise<{ user: ReturnType<UsersController['toRow']> }> {
+    const profile = await this.users.findById(principal.userId);
+    return { user: this.toRow(profile) };
+  }
+
   @Get()
   async list(
     @CurrentPrincipal() principal: Principal,

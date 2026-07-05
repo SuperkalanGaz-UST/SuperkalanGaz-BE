@@ -26,6 +26,16 @@ export class UsersService {
     private readonly goTrue: GoTrueAdminService,
   ) {}
 
+  /**
+   * The caller's own profile. The AuthGuard has already verified this user is
+   * active and has a profile, so a missing row here would be a real anomaly.
+   */
+  async findById(id: string): Promise<Profile> {
+    const profile = await this.profiles.findOne({ where: { id, deletedAt: IsNull() } });
+    if (!profile) throw new NotFoundException('Profile not found');
+    return profile;
+  }
+
   async list(principal: Principal, query: ListUsersQuery): Promise<Profile[]> {
     const qb = this.profiles
       .createQueryBuilder('p')
