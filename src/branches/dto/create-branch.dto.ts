@@ -1,18 +1,19 @@
 import {
   IsIn,
-  IsInt,
   IsNotEmpty,
-  IsObject,
   IsOptional,
   IsString,
-  Min,
+  IsUUID,
 } from 'class-validator';
-import { Geofence } from '../branch.entity';
 
 /**
- * Payload from the "Register new branch account" wizard (all four steps
- * flattened). The ValidationPipe (whitelist: true) strips anything not declared
- * here, so the service only ever sees these fields (AGENTS.md §12).
+ * Payload from the "Register new branch account" wizard. The ValidationPipe
+ * (whitelist: true) strips anything not declared here, so the service only ever
+ * sees these fields (AGENTS.md §12).
+ *
+ * Deferred fields (geofence, curfew, low-stock threshold) are intentionally NOT
+ * accepted: they have no home in core.branches yet and are dropped even if the
+ * client sends them.
  */
 export class CreateBranchDto {
   @IsString()
@@ -27,18 +28,16 @@ export class CreateBranchDto {
   @IsNotEmpty()
   address!: string;
 
-  @IsString()
-  @IsNotEmpty()
-  city!: string;
-
-  @IsString()
-  @IsNotEmpty()
-  province!: string;
-
+  // City is left blank-but-editable on autofill, so it is not required.
   @IsOptional()
-  @IsInt()
-  @Min(0)
-  lowStockThreshold?: number;
+  @IsString()
+  city?: string;
+
+  // Province is an editable default (may come from a reference autofill); one
+  // reference row legitimately has no province, so it is optional.
+  @IsOptional()
+  @IsString()
+  province?: string;
 
   @IsOptional()
   @IsIn(['existing', 'new'])
@@ -59,15 +58,10 @@ export class CreateBranchDto {
   @IsString()
   ownerMobile?: string;
 
+  // The chosen core.known_store_locations id when provisioned from a reference
+  // location; omitted/null for a free-text branch. Records provenance and drives
+  // duplicate detection (never name/address).
   @IsOptional()
-  @IsObject()
-  geofence?: Geofence;
-
-  @IsOptional()
-  @IsString()
-  curfewStart?: string;
-
-  @IsOptional()
-  @IsString()
-  curfewEnd?: string;
+  @IsUUID()
+  sourceStoreLocationId?: string;
 }
