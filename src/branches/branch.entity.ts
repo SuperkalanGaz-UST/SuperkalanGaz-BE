@@ -1,14 +1,24 @@
 import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
 
 /**
+ * Delivery coverage area for a branch. Currently only hand-drawn polygons are
+ * supported (the registration wizard's "Draw on map"); `points` are [lat, lng]
+ * vertices. Stored as jsonb; null means no coverage set.
+ */
+export interface BranchGeofence {
+  type: 'polygon';
+  points: [number, number][];
+}
+
+/**
  * Maps core.branches — one row per registered franchise branch, created by the
  * Franchise Admin "Register new branch account" flow. Lives in the `core` schema
  * per the 7-schema design (AGENTS.md §6).
  *
  * Soft delete is via `status` ('active' | 'inactive') — this table has no
  * deleted_at; retiring a branch flips it inactive (AGENTS.md §3.2, never
- * hard-delete). `status` and `review_status` are guarded by CHECK constraints in
- * the DB, so the union types below must stay in sync with them.
+ * hard-delete). `status` is guarded by a CHECK constraint in the DB, so its
+ * union type below must stay in sync with it.
  *
  * NOTE: geofence, curfew, and the low-stock threshold are intentionally NOT
  * mapped here — they have no home in core.branches and are deferred (geofence is
@@ -55,20 +65,6 @@ export class Branch {
   @Column({ type: 'text', default: 'active' })
   status!: 'active' | 'inactive';
 
-  /** Franchise Admin review state. DB CHECK: 'none' | 'flagged' | 'cleared'. */
-  @Column({ name: 'review_status', type: 'text', default: 'none' })
-  reviewStatus!: 'none' | 'flagged' | 'cleared';
-
-  @Column({ name: 'review_note', type: 'text', nullable: true })
-  reviewNote!: string | null;
-
-  /** profiles/auth id of the FA who last reviewed this branch. */
-  @Column({ name: 'reviewed_by', type: 'uuid', nullable: true })
-  reviewedBy!: string | null;
-
-  @Column({ name: 'reviewed_at', type: 'timestamptz', nullable: true })
-  reviewedAt!: Date | null;
-
   /**
    * The core.known_store_locations row this branch was provisioned from; null
    * for free-text registrations. Sole basis for "already registered" detection
@@ -77,6 +73,10 @@ export class Branch {
    */
   @Column({ name: 'source_store_location_id', type: 'uuid', nullable: true })
   sourceStoreLocationId!: string | null;
+
+  /** Delivery coverage polygon (added in migration 0006). Null = none set. */
+  @Column({ type: 'jsonb', nullable: true })
+  geofence!: BranchGeofence | null;
 
   @Column({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;

@@ -7,7 +7,8 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Request } from 'express';
-import { IsNull, Repository } from 'typeorm';
+import { In, IsNull, Repository } from 'typeorm';
+import { Branch } from '../branches/branch.entity';
 import { Profile } from '../users/profile.entity';
 import { Principal, REQUEST_PRINCIPAL, Role } from './principal';
 import { SupabaseJwtService } from './supabase-jwt.service';
@@ -24,6 +25,8 @@ export class AuthGuard implements CanActivate {
     private readonly jwt: SupabaseJwtService,
     @InjectRepository(Profile)
     private readonly profiles: Repository<Profile>,
+    @InjectRepository(Branch)
+    private readonly branches: Repository<Branch>,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -51,10 +54,23 @@ export class AuthGuard implements CanActivate {
       throw new ForbiddenException('This account is inactive');
     }
 
+    // Resolve the caller's branch names to their UUIDs once here, so every
+    // domain service can scope by branch_id (AGENTS.md §5/§6) without repeating
+    // the lookup. Only live branches count: this table soft-deletes via
+    // status='inactive' (no deleted_at), so an inactive/renamed name drops out.
+    const names = profile.branches ?? [];
+    const liveBranches = names.length
+      ? await this.branches.find({
+          where: { name: In(names), status: 'active' },
+          select: { id: true },
+        })
+      : [];
+
     const principal: Principal = {
       userId: profile.id,
       role: profile.role as Role,
-      branches: profile.branches ?? [],
+      branches: names,
+      branchIds: liveBranches.map((b) => b.id),
     };
     Object.defineProperty(request, REQUEST_PRINCIPAL, {
       value: principal,

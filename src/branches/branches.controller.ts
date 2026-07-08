@@ -1,7 +1,9 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
+  HttpCode,
   Param,
   ParseUUIDPipe,
   Patch,
@@ -14,7 +16,7 @@ import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { BranchRow, BranchesService, CreateBranchResult } from './branches.service';
 import { CreateBranchDto } from './dto/create-branch.dto';
-import { ReviewBranchDto } from './dto/review-branch.dto';
+import { UpdateBranchDto } from './dto/update-branch.dto';
 
 /**
  * Branch registry. Registering, listing, and reviewing branches are all
@@ -42,13 +44,25 @@ export class BranchesController {
     return this.branches.create(principal, dto);
   }
 
-  @Patch(':id/review')
-  async review(
+  /** Edit a branch's details. */
+  @Patch(':id')
+  async update(
     @CurrentPrincipal() principal: Principal,
     @Param('id', ParseUUIDPipe) id: string,
-    @Body() dto: ReviewBranchDto,
+    @Body() dto: UpdateBranchDto,
   ): Promise<{ branch: BranchRow }> {
-    const branch = await this.branches.review(principal, id, dto);
+    const branch = await this.branches.update(principal, id, dto);
+    return { branch };
+  }
+
+  /** Soft-delete: retire a branch by flipping it inactive (AGENTS.md §3.2). */
+  @Delete(':id')
+  @HttpCode(200)
+  async remove(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<{ branch: BranchRow }> {
+    const branch = await this.branches.deactivate(principal, id);
     return { branch };
   }
 }

@@ -8,9 +8,10 @@ import { randomBytes } from 'crypto';
 import { QueryFailedError, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { GoTrueAdminService } from '../users/gotrue-admin.service';
-import { Branch } from './branch.entity';
+import { Profile } from '../users/profile.entity';
+import { Branch, BranchGeofence } from './branch.entity';
 import { CreateBranchDto } from './dto/create-branch.dto';
-import { ReviewBranchDto } from './dto/review-branch.dto';
+import { UpdateBranchDto } from './dto/update-branch.dto';
 
 /** Postgres unique_violation — raised by the partial unique index on code. */
 const PG_UNIQUE_VIOLATION = '23505';
@@ -35,12 +36,11 @@ export interface BranchRow {
   name: string;
   code: string;
   status: 'active' | 'inactive';
-  review_status: 'none' | 'flagged' | 'cleared';
-  review_note: string | null;
-  reviewed_at: Date | null;
   province: string | null;
   city: string | null;
   address: string | null;
+  contact_number: string | null;
+  geofence: BranchGeofence | null;
   source_store_location_id: string | null;
   created_at: Date;
 }
@@ -78,6 +78,8 @@ export class BranchesService {
   constructor(
     @InjectRepository(Branch)
     private readonly branches: Repository<Branch>,
+    @InjectRepository(Profile)
+    private readonly profiles: Repository<Profile>,
     private readonly goTrue: GoTrueAdminService,
   ) {}
 
@@ -126,10 +128,6 @@ export class BranchesService {
         province: dto.province?.trim() ? dto.province.trim() : null,
         city: dto.city?.trim() ? dto.city.trim() : null,
         status: 'active',
-        reviewStatus: 'none',
-        reviewNote: null,
-        reviewedBy: null,
-        reviewedAt: null,
         sourceStoreLocationId: dto.sourceStoreLocationId ?? null,
         createdAt: now,
         updatedAt: now,
@@ -165,21 +163,56 @@ export class BranchesService {
   }
 
   /**
-   * Records a Franchise Admin review decision on a branch, stamping who acted
-   * and when. 'flag' → flagged (with optional note); 'clear' → cleared.
+   * Edits a branch's details (Franchise Registry "Edit"). Only the fields
+   * present on the DTO are touched; name/address are trimmed, and blankable
+   * fields (city/province/contact) normalize an empty string to null.
    */
-  async review(
-    principal: Principal,
+  async update(
+    _principal: Principal,
     id: string,
-    dto: ReviewBranchDto,
+    dto: UpdateBranchDto,
   ): Promise<BranchRow> {
     const branch = await this.branches.findOne({ where: { id } });
     if (!branch) throw new NotFoundException('Branch not found');
 
-    branch.reviewStatus = dto.action === 'flag' ? 'flagged' : 'cleared';
-    branch.reviewNote = dto.note?.trim() ? dto.note.trim() : null;
-    branch.reviewedBy = principal.userId;
-    branch.reviewedAt = new Date();
+    const oldName = branch.name;
+
+    if (dto.name !== undefined) branch.name = dto.name.trim();
+    if (dto.address !== undefined) branch.address = dto.address.trim();
+    if (dto.contactNumber !== undefined)
+      branch.contactNumber = dto.contactNumber.trim() ? dto.contactNumber.trim() : null;
+    if (dto.city !== undefined) branch.city = dto.city.trim() ? dto.city.trim() : null;
+    if (dto.province !== undefined)
+      branch.province = dto.province.trim() ? dto.province.trim() : null;
+    if (dto.geofence !== undefined) branch.geofence = dto.geofence ?? null;
+    branch.updatedAt = new Date();
+
+    const saved = await this.branches.save(branch);
+
+    // Tenancy is keyed by branch NAME on profiles.branches (AGENTS.md §5), so a
+    // rename must cascade to every profile (owners and managers) referencing the
+    // old name — otherwise they silently lose access to the renamed branch.
+    if (saved.name !== oldName) {
+      await this.profiles.query(
+        `UPDATE public.profiles
+            SET branches = array_replace(branches, $1, $2), updated_at = now()
+          WHERE branches @> ARRAY[$1]::text[]`,
+        [oldName, saved.name],
+      );
+    }
+
+    return this.toRow(saved);
+  }
+
+  /**
+   * Soft-delete: retire a branch by flipping it inactive. Never a hard delete —
+   * the row is kept for history (AGENTS.md §3.2). Idempotent if already inactive.
+   */
+  async deactivate(_principal: Principal, id: string): Promise<BranchRow> {
+    const branch = await this.branches.findOne({ where: { id } });
+    if (!branch) throw new NotFoundException('Branch not found');
+
+    branch.status = 'inactive';
     branch.updatedAt = new Date();
 
     const saved = await this.branches.save(branch);
@@ -192,12 +225,11 @@ export class BranchesService {
       name: b.name,
       code: b.code,
       status: b.status,
-      review_status: b.reviewStatus,
-      review_note: b.reviewNote,
-      reviewed_at: b.reviewedAt,
       province: b.province,
       city: b.city,
       address: b.address,
+      contact_number: b.contactNumber,
+      geofence: b.geofence,
       source_store_location_id: b.sourceStoreLocationId,
       created_at: b.createdAt,
     };
