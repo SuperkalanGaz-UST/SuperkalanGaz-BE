@@ -117,6 +117,7 @@ export class BranchesService {
     // Insert, re-rolling the code once if the unique index rejects it. A fresh
     // owner is rolled back (banned) if the branch ultimately fails to persist so
     // we never strand a login with no branch.
+    let saved: Branch | undefined;
     let lastErr: unknown;
     for (let attempt = 0; attempt < 2; attempt++) {
       const branch = this.branches.create({
@@ -129,13 +130,14 @@ export class BranchesService {
         city: dto.city?.trim() ? dto.city.trim() : null,
         status: 'active',
         sourceStoreLocationId: dto.sourceStoreLocationId ?? null,
+        geofence: dto.geofence ?? null,
         createdAt: now,
         updatedAt: now,
       });
 
       try {
-        const saved = await this.branches.save(branch);
-        return { id: saved.id, code: saved.code, owner };
+        saved = await this.branches.save(branch);
+        break;
       } catch (err) {
         lastErr = err;
         const isCodeClash =
@@ -146,10 +148,54 @@ export class BranchesService {
       }
     }
 
-    if (owner) {
-      await this.goTrue.banUser(owner.id).catch(() => undefined);
+    if (!saved) {
+      if (owner) {
+        await this.goTrue.banUser(owner.id).catch(() => undefined);
+      }
+      throw lastErr;
     }
-    throw lastErr;
+
+    // "Existing owner" path: the branch persisted, so grant that owner access by
+    // adding this branch to their profile. Without this the branch has no linked
+    // owner and the Edit screen reports "No Branch Owner is linked to this
+    // branch". (The "new owner" path already seeded its branch via GoTrue
+    // metadata above.) Kept out of the retry loop so a link failure never trips
+    // the branch-code re-roll.
+    if (dto.ownerType === 'existing') {
+      await this.linkExistingOwner(dto, saved.name);
+    }
+
+    return { id: saved.id, code: saved.code, owner };
+  }
+
+  /**
+   * Adds `branchName` to the selected existing owner's profile so they gain
+   * Branch Owner access to it (tenancy is keyed by branch name on
+   * profiles.branches — AGENTS.md §5). Idempotent: the branch is appended only
+   * when not already present, preserving the existing order. The owner is
+   * matched by id when supplied (the integrity boundary), else by email as a
+   * fallback for older clients. A no-op if neither identifier is present.
+   */
+  private async linkExistingOwner(
+    dto: CreateBranchDto,
+    branchName: string,
+  ): Promise<void> {
+    const where = dto.ownerId
+      ? { clause: 'id = $2', value: dto.ownerId }
+      : dto.ownerEmail
+        ? { clause: 'lower(email) = lower($2)', value: dto.ownerEmail }
+        : null;
+    if (!where) return; // nothing to match on — leave profiles untouched
+
+    await this.profiles.query(
+      `UPDATE public.profiles
+          SET branches = array_append(coalesce(branches, '{}'::text[]), $1),
+              updated_at = now()
+        WHERE ${where.clause}
+          AND deleted_at IS NULL
+          AND NOT (coalesce(branches, '{}'::text[]) @> ARRAY[$1]::text[])`,
+      [branchName, where.value],
+    );
   }
 
   /**

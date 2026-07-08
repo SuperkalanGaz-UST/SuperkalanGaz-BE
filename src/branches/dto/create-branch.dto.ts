@@ -3,20 +3,22 @@ import {
   IsEmail,
   IsIn,
   IsNotEmpty,
+  IsObject,
   IsOptional,
   IsString,
   IsUUID,
   Matches,
 } from 'class-validator';
+import { BranchGeofence } from '../branch.entity';
 
 /**
  * Payload from the "Register new branch account" wizard. The ValidationPipe
  * (whitelist: true) strips anything not declared here, so the service only ever
  * sees these fields (AGENTS.md §12).
  *
- * Deferred fields (geofence, curfew, low-stock threshold) are intentionally NOT
- * accepted: they have no home in core.branches yet and are dropped even if the
- * client sends them.
+ * Deferred fields (curfew, low-stock threshold) are intentionally NOT accepted:
+ * they have no home in core.branches yet and are dropped even if the client
+ * sends them. The geofence polygon, however, IS persisted (jsonb column).
  */
 export class CreateBranchDto {
   @IsString()
@@ -45,6 +47,14 @@ export class CreateBranchDto {
   @IsOptional()
   @IsIn(['existing', 'new'])
   ownerType?: 'existing' | 'new';
+
+  // The chosen existing owner's profile id. Only sent (and only used) on the
+  // "existing owner" path, where it is the integrity boundary for linking the
+  // new branch onto that owner's profile. Omitted for the "new owner" path,
+  // which provisions a fresh login instead.
+  @IsOptional()
+  @IsUUID()
+  ownerId?: string;
 
   @IsOptional()
   @IsString()
@@ -78,4 +88,10 @@ export class CreateBranchDto {
   @IsOptional()
   @IsUUID()
   sourceStoreLocationId?: string;
+
+  // Delivery coverage polygon drawn in the wizard's Geofence step, or null/omitted
+  // when none was drawn. Shape is validated on the client; stored as jsonb.
+  @IsOptional()
+  @IsObject()
+  geofence?: BranchGeofence | null;
 }
