@@ -83,4 +83,17 @@ describe('FleetService', () => {
     expect((patch as Partial<Rider>).status).toBe('On Delivery');
     expect((patch as Partial<Rider>).updatedAt).toBeInstanceOf(Date);
   });
+
+  it('returns a rider to Available and bumps updated_at (mark delivered, Slice 3)', async () => {
+    const repo = makeRepo();
+    const service = new FleetService(repo);
+
+    await service.markAvailable('rider-1');
+
+    expect(repo.update).toHaveBeenCalledTimes(1);
+    const [criteria, patch] = repo.update.mock.calls[0];
+    expect(criteria).toEqual({ id: 'rider-1' });
+    expect((patch as Partial<Rider>).status).toBe('Available');
+    expect((patch as Partial<Rider>).updatedAt).toBeInstanceOf(Date);
+  });
 });

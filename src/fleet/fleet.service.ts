@@ -79,6 +79,18 @@ export class FleetService {
     );
   }
 
+  /**
+   * Return a rider to 'Available' once their Service Request is marked delivered
+   * (Slice 3, story BM-007) — the inverse of markOnDelivery. Puts the rider back
+   * on the dispatch roster so the branch can assign them to the next order.
+   */
+  async markAvailable(riderId: string): Promise<void> {
+    await this.riders.update(
+      { id: riderId },
+      { status: 'Available', updatedAt: new Date() },
+    );
+  }
+
   /** The caller's active branch UUIDs; fails closed if they have none. */
   private requireBranches(principal: Principal): string[] {
     if (principal.branchIds.length === 0) {

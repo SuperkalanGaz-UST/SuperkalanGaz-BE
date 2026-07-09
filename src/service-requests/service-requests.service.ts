@@ -181,6 +181,76 @@ export class ServiceRequestsService {
     return serviceRequest;
   }
 
+  /**
+   * Mark delivered (story BM-007): close the SLA chain on an out-for-delivery
+   * request and return its rider to the roster. This is the inverse of dispatch.
+   *
+   * Order of checks (all in the service layer, AGENTS.md §5/§6):
+   *  1. Load the SR scoped to the caller's branches — 404 if missing,
+   *     soft-deleted, or out of scope (never leak another branch's rows).
+   *  2. Race guard (mirrors dispatch): the request must currently be out for
+   *     delivery — dispatched_at IS NOT NULL AND delivered_at IS NULL (status
+   *     'Dispatched' or 'En Route'). Enforced authoritatively by the conditional
+   *     UPDATE below, so a still-Pending / already-Delivered / Cancelled request
+   *     (0 rows affected) is a 409 and two concurrent deliveries can't both win.
+   *  3. Commit: stamp delivered_at + status='Delivered', bump updated_at.
+   *  4. Return the rider to 'Available' so the branch can dispatch them again.
+   *
+   * En Route / in_transit_at is GPS/hardware-dependent and deferred (AGENTS.md
+   * §8) — a request may be delivered with in_transit_at still NULL; that is
+   * expected and NOT backfilled here.
+   *
+   * PANEL-CHECK: BM-007's CSAT rating prompt to the customer is a customer MOBILE
+   * concern (customers are mobile-only, AGENTS.md §7) — it is deliberately NOT
+   * triggered from this backend endpoint. Out of scope for this slice.
+   */
+  async deliver(principal: Principal, id: string): Promise<ServiceRequest> {
+    const branchIds = this.requireBranches(principal);
+
+    // 1. Load, scoped to the caller's branch(es). Out-of-scope / soft-deleted /
+    //    unknown ids all 404 — same as findById (AGENTS.md §5).
+    const serviceRequest = await this.serviceRequests.findOne({
+      where: { id, branchId: In(branchIds), deletedAt: IsNull() },
+    });
+    if (!serviceRequest) throw new NotFoundException('Service request not found');
+
+    // 2 + 3. Commit atomically: only a request that is out for delivery
+    //    (dispatched, not yet delivered) is updated. 0 rows affected means the
+    //    request is not out for delivery (still Pending, already Delivered, or
+    //    Cancelled) — or a concurrent deliver already won — so treat it as the
+    //    conflict, mirroring the dispatch race guard (AGENTS.md §8.2).
+    const now = new Date();
+    const result = await this.serviceRequests
+      .createQueryBuilder()
+      .update(ServiceRequest)
+      .set({
+        deliveredAt: now,
+        status: 'Delivered',
+        updatedAt: now,
+      })
+      .where(
+        'id = :id AND dispatched_at IS NOT NULL AND delivered_at IS NULL',
+        { id },
+      )
+      .execute();
+    if (!result.affected) {
+      throw new ConflictException('Service request is not out for delivery');
+    }
+
+    // 4. Return the assigned rider to the Available roster (inverse of dispatch's
+    //    markOnDelivery). rider_id is always set on an out-for-delivery request,
+    //    but guard defensively in case of legacy data.
+    if (serviceRequest.riderId) {
+      await this.fleet.markAvailable(serviceRequest.riderId);
+    }
+
+    // Reflect the committed state back to the caller without a re-read.
+    serviceRequest.deliveredAt = now;
+    serviceRequest.status = 'Delivered';
+    serviceRequest.updatedAt = now;
+    return serviceRequest;
+  }
+
   /** The caller's active branch UUIDs; fails closed if they have none. */
   private requireBranches(principal: Principal): string[] {
     if (principal.branchIds.length === 0) {

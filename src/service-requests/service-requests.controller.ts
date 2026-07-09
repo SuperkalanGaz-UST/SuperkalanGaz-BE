@@ -71,6 +71,23 @@ export class ServiceRequestsController {
     return { serviceRequest: this.toRow(row) };
   }
 
+  /**
+   * Mark an out-for-delivery request delivered (story BM-007). Closes the SLA
+   * chain (delivered_at + status='Delivered') and returns the assigned rider to
+   * the Available roster. No request body. Conflicts if the request is not out
+   * for delivery — still Pending, already Delivered, or Cancelled (409) — see the
+   * service for the race guard. The updated row (status='Delivered', delivered_at
+   * set) is returned in the standard envelope.
+   */
+  @Post(':id/deliver')
+  async deliver(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
+    const row = await this.serviceRequests.deliver(principal, id);
+    return { serviceRequest: this.toRow(row) };
+  }
+
   /** Snake_case response row, matching the precedent in UsersController.toRow. */
   private toRow(sr: ServiceRequest) {
     return {

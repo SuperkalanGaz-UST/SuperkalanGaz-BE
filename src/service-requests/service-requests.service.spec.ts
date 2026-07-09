@@ -44,11 +44,12 @@ describe('ServiceRequestsService', () => {
   };
 
   // Fake Fleet service: `findAssignableRider` returns a rider (or null when not
-  // assignable); `markOnDelivery` is a spy.
+  // assignable); `markOnDelivery` / `markAvailable` are spies.
   const makeFleet = (rider: Rider | null) =>
     ({
       findAssignableRider: jest.fn(() => Promise.resolve(rider)),
       markOnDelivery: jest.fn(() => Promise.resolve()),
+      markAvailable: jest.fn(() => Promise.resolve()),
     }) as unknown as jest.Mocked<FleetService>;
 
   const principal = (branchIds: string[]): Principal => ({
@@ -65,6 +66,19 @@ describe('ServiceRequestsService', () => {
       status: 'Pending',
       dispatchedAt: null,
       riderId: null,
+    }) as ServiceRequest;
+
+  // A request currently out for delivery: dispatched, rider assigned, not yet
+  // delivered. in_transit_at stays null (En Route leg is deferred, AGENTS.md §8).
+  const outForDeliverySr = (): ServiceRequest =>
+    ({
+      id: 'sr-1',
+      branchId: 'branch-uuid-1',
+      status: 'Dispatched',
+      dispatchedAt: new Date(),
+      inTransitAt: null,
+      deliveredAt: null,
+      riderId: 'rider-1',
     }) as ServiceRequest;
 
   const availableRider = (): Rider =>
@@ -112,6 +126,9 @@ describe('ServiceRequestsService', () => {
     await expect(
       service.dispatch(principal([]), 'sr-1', { riderId: 'rider-1' }),
     ).rejects.toBeInstanceOf(ForbiddenException);
+    await expect(service.deliver(principal([]), 'sr-1')).rejects.toBeInstanceOf(
+      ForbiddenException,
+    );
     // Nothing should reach the data layer once scoping fails.
     expect(repo.save).not.toHaveBeenCalled();
     expect(repo.find).not.toHaveBeenCalled();
@@ -218,6 +235,59 @@ describe('ServiceRequestsService', () => {
         service.dispatch(principal(['branch-uuid-1']), 'missing', { riderId: 'rider-1' }),
       ).rejects.toBeInstanceOf(NotFoundException);
       expect(fleet.findAssignableRider).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('deliver', () => {
+    it('stamps delivery, closes the chain, and returns the rider to Available', async () => {
+      const { repo, qb } = makeRepo(1);
+      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
+      const fleet = makeFleet(null);
+      const service = new ServiceRequestsService(repo, fleet);
+
+      const result = await service.deliver(principal(['branch-uuid-1']), 'sr-1');
+
+      // The fields the deliver commits.
+      expect(result.deliveredAt).toBeInstanceOf(Date);
+      expect(result.status).toBe('Delivered');
+      expect(result.updatedAt).toBeInstanceOf(Date);
+      // in_transit_at is not backfilled — the En Route leg is deferred (§8).
+      expect(result.inTransitAt).toBeNull();
+      // Committed via the conditional UPDATE (the race guard), not a plain save.
+      expect(qb.execute).toHaveBeenCalledTimes(1);
+      // The assigned rider goes back on the roster.
+      expect(fleet.markAvailable).toHaveBeenCalledWith('rider-1');
+    });
+
+    it('409s when the request is not out for delivery (0 rows affected)', async () => {
+      // Covers still-Pending, already-Delivered, and Cancelled: the conditional
+      // UPDATE (dispatched_at IS NOT NULL AND delivered_at IS NULL) touches 0
+      // rows, and a concurrent deliver that already won hits the same guard.
+      const { repo, qb } = makeRepo(0);
+      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
+      const fleet = makeFleet(null);
+      const service = new ServiceRequestsService(repo, fleet);
+
+      await expect(
+        service.deliver(principal(['branch-uuid-1']), 'sr-1'),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(qb.execute).toHaveBeenCalledTimes(1);
+      // The loser must NOT touch the rider — nothing was committed.
+      expect(fleet.markAvailable).not.toHaveBeenCalled();
+    });
+
+    it('404s for a request outside the caller scope or not found', async () => {
+      const { repo, qb } = makeRepo();
+      // findOne returns null by default (out of scope / missing).
+      const fleet = makeFleet(null);
+      const service = new ServiceRequestsService(repo, fleet);
+
+      await expect(
+        service.deliver(principal(['branch-uuid-1']), 'missing'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      // Bailed before committing or touching the fleet.
+      expect(qb.execute).not.toHaveBeenCalled();
+      expect(fleet.markAvailable).not.toHaveBeenCalled();
     });
   });
 });
