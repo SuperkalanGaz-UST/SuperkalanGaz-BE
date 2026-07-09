@@ -8,6 +8,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, IsNull, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
+import { CimService } from '../cim/cim.service';
 import { FleetService } from '../fleet/fleet.service';
 import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
@@ -31,12 +32,22 @@ export class ServiceRequestsService {
     // Reused to validate a rider at dispatch time and flip them to 'On Delivery'
     // — mirrors how BranchesService reuses GoTrueAdminService across modules.
     private readonly fleet: FleetService,
+    // Reused to validate an optionally-linked customer at create time (same
+    // cross-module reuse pattern as fleet above).
+    private readonly cim: CimService,
   ) {}
 
   /**
    * Walk-in / phone intake. The server owns branch_id (the caller's own
    * branch), order_source ('Walk-in/Phone', story BM-027) and status
    * ('Pending') — the client only supplies the customer/order details.
+   *
+   * An optional customerId links the order to a CIM profile (stories
+   * BM-029..BM-032). When supplied it must resolve to a live customer in the
+   * SAME branch as the request (integrity check in the service layer, AGENTS.md
+   * §6) — else 400. When omitted the order is filed with customer_id NULL, so
+   * walk-in intake without a profile is unchanged (story BM-005). The
+   * denormalized customer_* fields are always captured as the order's snapshot.
    */
   async create(
     principal: Principal,
@@ -44,11 +55,25 @@ export class ServiceRequestsService {
   ): Promise<ServiceRequest> {
     const branchId = this.requireBranch(principal);
 
+    // Validate the optional customer link before persisting. A customer from
+    // another branch (or unknown / soft-deleted) is rejected — mirrors the rider
+    // check in dispatch. Only the id is stored; the customer_* snapshot fields
+    // still come from the intake form.
+    let customerId: string | null = null;
+    if (dto.customerId) {
+      const customer = await this.cim.findInBranch(dto.customerId, branchId);
+      if (!customer) {
+        throw new BadRequestException('Customer not found in this branch');
+      }
+      customerId = customer.id;
+    }
+
     const now = new Date();
     const serviceRequest = this.serviceRequests.create({
       branchId,
       orderSource: 'Walk-in/Phone',
       status: 'Pending',
+      customerId,
       customerName: dto.customerName.trim(),
       customerContact: dto.customerContact.trim(),
       deliveryAddress: dto.deliveryAddress.trim(),

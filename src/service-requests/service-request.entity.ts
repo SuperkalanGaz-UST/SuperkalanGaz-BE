@@ -37,8 +37,18 @@ export class ServiceRequest {
   @Column({ type: 'text', default: 'Pending' })
   status!: ServiceRequestStatus;
 
-  // Customer details are denormalized onto the order for now — the CIM module
-  // (customer profiles) is not built yet, so intake captures them inline.
+  /** Optional link to the CIM customer profile this order was filed against
+   * (stories BM-029..BM-032). Null for walk-in intake with no linked customer —
+   * that path is unchanged (story BM-005). No FK by design (AGENTS.md §6); the
+   * service validates the customer is live and in the SAME branch before
+   * persisting. The denormalized customer_* fields below remain the order's
+   * point-in-time snapshot even when this is set. */
+  @Column({ name: 'customer_id', type: 'uuid', nullable: true })
+  customerId!: string | null;
+
+  // Customer details are denormalized onto the order as a point-in-time snapshot.
+  // A CIM profile may now be linked via customer_id above, but these captured
+  // values are kept as-is so the order reflects what was entered at intake.
   @Column({ name: 'customer_name', type: 'text' })
   customerName!: string;
 

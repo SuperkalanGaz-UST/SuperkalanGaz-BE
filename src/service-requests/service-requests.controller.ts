@@ -95,6 +95,7 @@ export class ServiceRequestsController {
       branch_id: sr.branchId,
       order_source: sr.orderSource,
       status: sr.status,
+      customer_id: sr.customerId,
       customer_name: sr.customerName,
       customer_contact: sr.customerContact,
       delivery_address: sr.deliveryAddress,

@@ -6,6 +6,8 @@ import {
 } from '@nestjs/common';
 import { Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
+import { CimService } from '../cim/cim.service';
+import { Customer } from '../cim/customer.entity';
 import { FleetService } from '../fleet/fleet.service';
 import { Rider } from '../fleet/rider.entity';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
@@ -52,6 +54,16 @@ describe('ServiceRequestsService', () => {
       markAvailable: jest.fn(() => Promise.resolve()),
     }) as unknown as jest.Mocked<FleetService>;
 
+  // Fake CIM service: `findInBranch` returns a customer (in-branch link valid) or
+  // null (unknown / soft-deleted / other branch → the create rejects with 400).
+  const makeCim = (customer: Customer | null) =>
+    ({
+      findInBranch: jest.fn(() => Promise.resolve(customer)),
+    }) as unknown as jest.Mocked<CimService>;
+
+  const inBranchCustomer = (): Customer =>
+    ({ id: 'cust-1', branchId: 'branch-uuid-1' }) as Customer;
+
   const principal = (branchIds: string[]): Principal => ({
     userId: 'user-1',
     role: 'branch-manager',
@@ -94,7 +106,7 @@ describe('ServiceRequestsService', () => {
 
   it('files a request under the caller branch with server-owned fields', async () => {
     const { repo } = makeRepo();
-    const service = new ServiceRequestsService(repo, makeFleet(null));
+    const service = new ServiceRequestsService(repo, makeFleet(null), makeCim(null));
 
     const result = await service.create(principal(['branch-uuid-1']), dto);
 
@@ -107,12 +119,48 @@ describe('ServiceRequestsService', () => {
     expect(result.deliveredAt).toBeNull();
     // Free-text inputs are trimmed.
     expect(result.customerName).toBe('Juan Dela Cruz');
+    // No customerId on this dto → the order is filed with no linked profile
+    // (walk-in intake is unchanged, story BM-005).
+    expect(result.customerId).toBeNull();
     expect(repo.save).toHaveBeenCalledTimes(1);
+  });
+
+  it('links a same-branch customer when customerId is supplied', async () => {
+    const { repo } = makeRepo();
+    const cim = makeCim(inBranchCustomer());
+    const service = new ServiceRequestsService(repo, makeFleet(null), cim);
+
+    const result = await service.create(principal(['branch-uuid-1']), {
+      ...dto,
+      customerId: 'cust-1',
+    });
+
+    // The customer is validated against the request's own branch, then its id is
+    // stored on the order.
+    expect(cim.findInBranch).toHaveBeenCalledWith('cust-1', 'branch-uuid-1');
+    expect(result.customerId).toBe('cust-1');
+    expect(repo.save).toHaveBeenCalledTimes(1);
+  });
+
+  it('400s when the linked customer is not in the request branch', async () => {
+    const { repo } = makeRepo();
+    // findInBranch returns null for an unknown / soft-deleted / other-branch id.
+    const cim = makeCim(null);
+    const service = new ServiceRequestsService(repo, makeFleet(null), cim);
+
+    await expect(
+      service.create(principal(['branch-uuid-1']), {
+        ...dto,
+        customerId: 'cust-other-branch',
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    // Rejected before persisting the order.
+    expect(repo.save).not.toHaveBeenCalled();
   });
 
   it('fails closed when the caller has no active branch', async () => {
     const { repo } = makeRepo();
-    const service = new ServiceRequestsService(repo, makeFleet(null));
+    const service = new ServiceRequestsService(repo, makeFleet(null), makeCim(null));
 
     await expect(service.create(principal([]), dto)).rejects.toBeInstanceOf(
       ForbiddenException,
@@ -136,7 +184,7 @@ describe('ServiceRequestsService', () => {
 
   it('scopes the queue to the caller branches, newest first', async () => {
     const { repo } = makeRepo();
-    const service = new ServiceRequestsService(repo, makeFleet(null));
+    const service = new ServiceRequestsService(repo, makeFleet(null), makeCim(null));
 
     await service.list(principal(['branch-uuid-1', 'branch-uuid-2']));
 
@@ -149,7 +197,7 @@ describe('ServiceRequestsService', () => {
 
   it('returns 404 for an id outside the caller scope or not found', async () => {
     const { repo } = makeRepo();
-    const service = new ServiceRequestsService(repo, makeFleet(null));
+    const service = new ServiceRequestsService(repo, makeFleet(null), makeCim(null));
 
     await expect(
       service.findById(principal(['branch-uuid-1']), 'missing'),
@@ -161,7 +209,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo(1);
       repo.findOne = jest.fn(() => Promise.resolve(pendingSr())) as never;
       const fleet = makeFleet(availableRider());
-      const service = new ServiceRequestsService(repo, fleet);
+      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
 
       const result = await service.dispatch(principal(['branch-uuid-1']), 'sr-1', {
         riderId: 'rider-1',
@@ -183,7 +231,7 @@ describe('ServiceRequestsService', () => {
       const dispatched = { ...pendingSr(), status: 'Dispatched' } as ServiceRequest;
       repo.findOne = jest.fn(() => Promise.resolve(dispatched)) as never;
       const fleet = makeFleet(availableRider());
-      const service = new ServiceRequestsService(repo, fleet);
+      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
 
       await expect(
         service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-1' }),
@@ -199,7 +247,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo(0);
       repo.findOne = jest.fn(() => Promise.resolve(pendingSr())) as never;
       const fleet = makeFleet(availableRider());
-      const service = new ServiceRequestsService(repo, fleet);
+      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
 
       await expect(
         service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-1' }),
@@ -215,7 +263,7 @@ describe('ServiceRequestsService', () => {
       // Fleet lookup returns null for any of: unknown, soft-deleted, wrong
       // branch, or not-Available rider.
       const fleet = makeFleet(null);
-      const service = new ServiceRequestsService(repo, fleet);
+      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
 
       await expect(
         service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-x' }),
@@ -229,7 +277,7 @@ describe('ServiceRequestsService', () => {
       const { repo } = makeRepo();
       // findOne already returns null by default (out of scope / missing).
       const fleet = makeFleet(availableRider());
-      const service = new ServiceRequestsService(repo, fleet);
+      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
 
       await expect(
         service.dispatch(principal(['branch-uuid-1']), 'missing', { riderId: 'rider-1' }),
@@ -243,7 +291,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo(1);
       repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
       const fleet = makeFleet(null);
-      const service = new ServiceRequestsService(repo, fleet);
+      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
 
       const result = await service.deliver(principal(['branch-uuid-1']), 'sr-1');
 
@@ -266,7 +314,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo(0);
       repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
       const fleet = makeFleet(null);
-      const service = new ServiceRequestsService(repo, fleet);
+      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
 
       await expect(
         service.deliver(principal(['branch-uuid-1']), 'sr-1'),
@@ -280,7 +328,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo();
       // findOne returns null by default (out of scope / missing).
       const fleet = makeFleet(null);
-      const service = new ServiceRequestsService(repo, fleet);
+      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
 
       await expect(
         service.deliver(principal(['branch-uuid-1']), 'missing'),
