@@ -59,6 +59,13 @@ export class ServiceRequest {
   @Column({ name: 'special_instructions', type: 'text', nullable: true })
   specialInstructions!: string | null;
 
+  /** The rider assigned on dispatch (fleet.riders id). Null until dispatched;
+   * set alongside dispatched_at + status='Dispatched'. No FK by design
+   * (AGENTS.md §6) — the service validates the rider is live, Available, and in
+   * the same branch before persisting. */
+  @Column({ name: 'rider_id', type: 'uuid', nullable: true })
+  riderId!: string | null;
+
   // Four-timestamp SLA chain (AGENTS.md §8.2). requested_at is set on create;
   // the rest stay null until the dispatch / in-transit / delivery slices land.
   @Column({ name: 'requested_at', type: 'timestamptz' })
