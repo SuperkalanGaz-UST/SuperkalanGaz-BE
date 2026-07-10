@@ -8,7 +8,6 @@ import { randomBytes } from 'crypto';
 import { QueryFailedError, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { GoTrueAdminService } from '../users/gotrue-admin.service';
-import { Profile } from '../users/profile.entity';
 import { Branch, BranchGeofence } from './branch.entity';
 import { CreateBranchDto } from './dto/create-branch.dto';
 import { UpdateBranchDto } from './dto/update-branch.dto';
@@ -78,18 +77,16 @@ export class BranchesService {
   constructor(
     @InjectRepository(Branch)
     private readonly branches: Repository<Branch>,
-    @InjectRepository(Profile)
-    private readonly profiles: Repository<Profile>,
     private readonly goTrue: GoTrueAdminService,
   ) {}
 
   async create(_principal: Principal, dto: CreateBranchDto): Promise<CreateBranchResult> {
     const name = dto.name.trim();
 
-    // "New owner" path: create a real Branch Owner login. The
-    // on_auth_user_created trigger mirrors the metadata into public.profiles,
-    // which is where the API reads role + branch membership from. Owner identity
-    // is NOT stored on core.branches (it has no owner columns).
+    // "New owner" path: create a real Branch Owner login. Role + branch
+    // membership are written to the auth user's app_metadata (service-role-only),
+    // which is where the API reads them from — there is no profiles table. Owner
+    // identity is NOT stored on core.branches (it has no owner columns).
     let owner: ProvisionedOwner | null = null;
     if (dto.ownerType === 'new') {
       if (!dto.ownerEmail || !dto.ownerName) {
@@ -100,7 +97,7 @@ export class BranchesService {
         email: dto.ownerEmail,
         password: tempPassword,
         email_confirm: true,
-        user_metadata: {
+        app_metadata: {
           username: dto.ownerEmail.split('@')[0],
           display_name: dto.ownerName,
           role: 'branch-owner',
@@ -169,33 +166,33 @@ export class BranchesService {
   }
 
   /**
-   * Adds `branchName` to the selected existing owner's profile so they gain
-   * Branch Owner access to it (tenancy is keyed by branch name on
-   * profiles.branches — AGENTS.md §5). Idempotent: the branch is appended only
-   * when not already present, preserving the existing order. The owner is
+   * Adds `branchName` to the selected existing owner's branch scope so they gain
+   * Branch Owner access to it (tenancy is keyed by branch name in the auth user's
+   * app_metadata.branches — AGENTS.md §5). Idempotent: the branch is appended
+   * only when not already present, preserving the existing order. The owner is
    * matched by id when supplied (the integrity boundary), else by email as a
-   * fallback for older clients. A no-op if neither identifier is present.
+   * fallback for older clients. A no-op if neither identifier resolves a user.
    */
   private async linkExistingOwner(
     dto: CreateBranchDto,
     branchName: string,
   ): Promise<void> {
-    const where = dto.ownerId
-      ? { clause: 'id = $2', value: dto.ownerId }
+    const owner = dto.ownerId
+      ? await this.goTrue.getUser(dto.ownerId)
       : dto.ownerEmail
-        ? { clause: 'lower(email) = lower($2)', value: dto.ownerEmail }
+        ? await this.goTrue.findByEmail(dto.ownerEmail)
         : null;
-    if (!where) return; // nothing to match on — leave profiles untouched
+    if (!owner) return; // nothing to match on / owner not found — leave auth untouched
 
-    await this.profiles.query(
-      `UPDATE public.profiles
-          SET branches = array_append(coalesce(branches, '{}'::text[]), $1),
-              updated_at = now()
-        WHERE ${where.clause}
-          AND deleted_at IS NULL
-          AND NOT (coalesce(branches, '{}'::text[]) @> ARRAY[$1]::text[])`,
-      [branchName, where.value],
-    );
+    const meta = owner.app_metadata ?? {};
+    const branches = Array.isArray(meta.branches)
+      ? (meta.branches as unknown[]).filter((b): b is string => typeof b === 'string')
+      : [];
+    if (branches.includes(branchName)) return; // idempotent
+
+    await this.goTrue.updateUser(owner.id, {
+      app_metadata: { ...meta, branches: [...branches, branchName] },
+    });
   }
 
   /**
@@ -235,16 +232,26 @@ export class BranchesService {
 
     const saved = await this.branches.save(branch);
 
-    // Tenancy is keyed by branch NAME on profiles.branches (AGENTS.md §5), so a
-    // rename must cascade to every profile (owners and managers) referencing the
-    // old name — otherwise they silently lose access to the renamed branch.
+    // Tenancy is keyed by branch NAME in each user's app_metadata.branches
+    // (AGENTS.md §5), so a rename must cascade to every user (owners and
+    // managers) referencing the old name — otherwise they silently lose access
+    // to the renamed branch. No profiles table to UPDATE now, so we page the
+    // auth users and patch the ones that reference it.
     if (saved.name !== oldName) {
-      await this.profiles.query(
-        `UPDATE public.profiles
-            SET branches = array_replace(branches, $1, $2), updated_at = now()
-          WHERE branches @> ARRAY[$1]::text[]`,
-        [oldName, saved.name],
-      );
+      const users = await this.goTrue.listUsers();
+      for (const u of users) {
+        const meta = u.app_metadata ?? {};
+        const branches = Array.isArray(meta.branches)
+          ? (meta.branches as unknown[]).filter((b): b is string => typeof b === 'string')
+          : [];
+        if (!branches.includes(oldName)) continue;
+        await this.goTrue.updateUser(u.id, {
+          app_metadata: {
+            ...meta,
+            branches: branches.map((b) => (b === oldName ? saved.name : b)),
+          },
+        });
+      }
     }
 
     return this.toRow(saved);

@@ -7,24 +7,23 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Request } from 'express';
-import { In, IsNull, Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { Branch } from '../branches/branch.entity';
-import { Profile } from '../users/profile.entity';
 import { Principal, REQUEST_PRINCIPAL, Role } from './principal';
 import { SupabaseJwtService } from './supabase-jwt.service';
 
 /**
- * Authenticates every request: verifies the Supabase JWT, then loads the
- * caller's profiles row to build the Principal. Isolation is enforced HERE,
- * at the application layer (guards + service checks) — not by Postgres RLS
- * and not by physical partitioning (AGENTS.md §5).
+ * Authenticates every request: verifies the Supabase JWT and builds the
+ * Principal straight from its claims. The caller's role + branch scope live in
+ * the token's `app_metadata` — set only by our service-role GoTrue calls, so the
+ * client can never forge or widen them, and there is no profiles table to read.
+ * Isolation is enforced HERE, at the application layer (guards + service checks)
+ * — not by Postgres RLS and not by physical partitioning (AGENTS.md §5).
  */
 @Injectable()
 export class AuthGuard implements CanActivate {
   constructor(
     private readonly jwt: SupabaseJwtService,
-    @InjectRepository(Profile)
-    private readonly profiles: Repository<Profile>,
     @InjectRepository(Branch)
     private readonly branches: Repository<Branch>,
   ) {}
@@ -42,23 +41,26 @@ export class AuthGuard implements CanActivate {
       throw new UnauthorizedException('Token has no subject');
     }
 
-    // Role and branch scope come from our own DB row for this user — the
-    // client never supplies them.
-    const profile = await this.profiles.findOne({
-      where: { id: payload.sub, deletedAt: IsNull() },
-    });
-    if (!profile) {
-      throw new ForbiddenException('No CRM profile for this account');
+    // Role/branch scope/status come from app_metadata — written only by our
+    // service-role GoTrue calls, so the client cannot widen its own access.
+    const claims = (payload.app_metadata ?? {}) as Record<string, unknown>;
+    const role = claims.role;
+    if (typeof role !== 'string') {
+      throw new ForbiddenException('No CRM role for this account');
     }
-    if (profile.status !== 'Active') {
+    if (claims.status !== undefined && claims.status !== 'Active') {
       throw new ForbiddenException('This account is inactive');
     }
 
-    // Resolve the caller's branch names to their UUIDs once here, so every
-    // domain service can scope by branch_id (AGENTS.md §5/§6) without repeating
-    // the lookup. Only live branches count: this table soft-deletes via
-    // status='inactive' (no deleted_at), so an inactive/renamed name drops out.
-    const names = profile.branches ?? [];
+    const names = Array.isArray(claims.branches)
+      ? (claims.branches as unknown[]).filter((b): b is string => typeof b === 'string')
+      : [];
+
+    // Resolve the caller's branch names to their core.branches UUIDs once here,
+    // so every domain service can scope by branch_id (AGENTS.md §5/§6) without
+    // repeating the lookup. Only live branches count: this table soft-deletes via
+    // status='inactive', so an inactive/renamed name drops out and scoping fails
+    // closed.
     const liveBranches = names.length
       ? await this.branches.find({
           where: { name: In(names), status: 'active' },
@@ -67,8 +69,8 @@ export class AuthGuard implements CanActivate {
       : [];
 
     const principal: Principal = {
-      userId: profile.id,
-      role: profile.role as Role,
+      userId: payload.sub,
+      role: role as Role,
       branches: names,
       branchIds: liveBranches.map((b) => b.id),
     };

@@ -18,8 +18,7 @@ import { RolesGuard } from '../auth/roles.guard';
 import { CreateUserDto } from './dto/create-user.dto';
 import { ListUsersQuery } from './dto/list-users.query';
 import { UpdateUserDto } from './dto/update-user.dto';
-import { Profile } from './profile.entity';
-import { UsersService } from './users.service';
+import { CrmUser, UsersService } from './users.service';
 
 /**
  * Staff-account management. Response shapes intentionally match the legacy
@@ -85,17 +84,17 @@ export class UsersController {
     return { ok: true };
   }
 
-  private toRow(p: Profile) {
+  private toRow(u: CrmUser) {
     return {
-      id: p.id,
-      email: p.email,
-      username: p.username,
-      display_name: p.displayName,
-      role: p.role,
-      branches: p.branches,
-      phone: p.phone,
-      status: p.status,
-      created_at: p.createdAt,
+      id: u.id,
+      email: u.email,
+      username: u.username,
+      display_name: u.displayName,
+      role: u.role,
+      branches: u.branches,
+      phone: u.phone,
+      status: u.status,
+      created_at: u.createdAt,
     };
   }
 }

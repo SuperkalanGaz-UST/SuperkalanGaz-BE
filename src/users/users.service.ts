@@ -3,61 +3,103 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { IsNull, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { CreateUserDto } from './dto/create-user.dto';
 import { ListUsersQuery } from './dto/list-users.query';
 import { UpdateUserDto } from './dto/update-user.dto';
-import { GoTrueAdminService } from './gotrue-admin.service';
-import { Profile } from './profile.entity';
+import { GoTrueAdminService, GoTrueUser } from './gotrue-admin.service';
+
+/** A staff account as the CRM sees it, projected from auth.users app_metadata. */
+export interface CrmUser {
+  id: string;
+  email: string | null;
+  username: string | null;
+  displayName: string | null;
+  role: string;
+  branches: string[];
+  phone: string | null;
+  status: 'Active' | 'Inactive';
+  createdAt: Date;
+}
+
+function str(v: unknown): string | null {
+  return typeof v === 'string' && v !== '' ? v : null;
+}
+
+function strArray(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+}
+
+/** True once a user has been soft-deleted (banned into the future). */
+function isBanned(u: GoTrueUser): boolean {
+  return !!u.banned_until && new Date(u.banned_until).getTime() > Date.now();
+}
+
+/** Projects a GoTrue user into the CRM shape, reading claims from app_metadata. */
+function toCrmUser(u: GoTrueUser): CrmUser {
+  const m = u.app_metadata ?? {};
+  return {
+    id: u.id,
+    email: u.email,
+    username: str(m.username),
+    displayName: str(m.display_name),
+    role: str(m.role) ?? '',
+    branches: strArray(m.branches),
+    phone: str(m.phone),
+    status: m.status === 'Inactive' ? 'Inactive' : 'Active',
+    createdAt: new Date(u.created_at),
+  };
+}
 
 /**
- * Staff-account management (FA: branch accounts; BO: Branch Manager accounts
- * for their own branch). All scoping derives from the verified Principal —
- * request params can only NARROW visibility, never widen it (AGENTS.md §5).
- * Isolation is guard/service-enforced at this application layer, not by the DB.
+ * Staff-account management (FA: branch accounts; BO: Branch Manager accounts for
+ * their own branch). Identity lives entirely in Supabase Auth: there is no
+ * public.profiles table, so every read/write goes through the GoTrue Admin API
+ * and CRM claims live in each user's app_metadata (AGENTS.md §5, §6). All scoping
+ * derives from the verified Principal — request params can only NARROW
+ * visibility, never widen it. Isolation is guard/service-enforced here.
  */
 @Injectable()
 export class UsersService {
-  constructor(
-    @InjectRepository(Profile)
-    private readonly profiles: Repository<Profile>,
-    private readonly goTrue: GoTrueAdminService,
-  ) {}
+  constructor(private readonly goTrue: GoTrueAdminService) {}
 
   /**
-   * The caller's own profile. The AuthGuard has already verified this user is
-   * active and has a profile, so a missing row here would be a real anomaly.
+   * The caller's own account. The AuthGuard has already verified this user is
+   * active, so a missing/banned record here would be a real anomaly.
    */
-  async findById(id: string): Promise<Profile> {
-    const profile = await this.profiles.findOne({ where: { id, deletedAt: IsNull() } });
-    if (!profile) throw new NotFoundException('Profile not found');
-    return profile;
+  async findById(id: string): Promise<CrmUser> {
+    const user = await this.goTrue.getUser(id);
+    if (!user || isBanned(user)) throw new NotFoundException('User not found');
+    return toCrmUser(user);
   }
 
-  async list(principal: Principal, query: ListUsersQuery): Promise<Profile[]> {
-    const qb = this.profiles
-      .createQueryBuilder('p')
-      .where('p.deleted_at IS NULL')
-      .orderBy('p.created_at', 'ASC');
+  async list(principal: Principal, query: ListUsersQuery): Promise<CrmUser[]> {
+    // Validate the requested branch scope once, up front (a BO cannot list
+    // outside their own branches), before we fan out over the user set.
+    if (query.branch) this.assertBranchInScope(principal, query.branch);
 
     // BO may only ever see Branch Manager accounts, whatever the query says.
     const role = principal.role === 'branch-owner' ? 'branch-manager' : query.role;
-    if (role) qb.andWhere('p.role = :role', { role });
 
-    if (query.branch) {
-      this.assertBranchInScope(principal, query.branch);
-      qb.andWhere('p.branches @> ARRAY[:branch]::text[]', { branch: query.branch });
-    } else if (principal.role === 'branch-owner') {
-      // No branch requested: BO still only sees users overlapping their own branches.
-      if (principal.branches.length === 0) return [];
-      qb.andWhere('p.branches && :callerBranches::text[]', {
-        callerBranches: principal.branches,
-      });
+    // A BO with no branch requested and no branches of their own overlaps nobody.
+    if (!query.branch && principal.role === 'branch-owner' && principal.branches.length === 0) {
+      return [];
     }
 
-    return qb.getMany();
+    const users = (await this.goTrue.listUsers())
+      .filter((u) => !isBanned(u)) // soft-deleted accounts drop out of the list
+      .map(toCrmUser)
+      .filter((u) => {
+        if (role && u.role !== role) return false;
+        if (query.branch) return u.branches.includes(query.branch);
+        // No branch requested: a BO still only sees users overlapping their own.
+        if (principal.role === 'branch-owner') {
+          return u.branches.some((b) => principal.branches.includes(b));
+        }
+        return true;
+      });
+
+    return users.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
   }
 
   async create(principal: Principal, dto: CreateUserDto): Promise<{ id: string }> {
@@ -69,18 +111,19 @@ export class UsersService {
       this.assertBranchInScope(principal, branch);
     }
 
-    // Identity is created in Supabase Auth; the on_auth_user_created trigger
-    // mirrors these claims into public.profiles.
+    // Identity AND CRM claims both live in Supabase Auth. The claims go in
+    // app_metadata — service-role-only, so a user can never edit their own role
+    // or branch scope (AGENTS.md §5).
     return this.goTrue.createUser({
       email: dto.email,
       password: dto.password,
       email_confirm: true,
-      user_metadata: {
-        username: dto.username,
-        display_name: dto.name,
+      app_metadata: {
+        username: dto.username ?? dto.email.split('@')[0],
+        display_name: dto.name ?? null,
         role,
         branches: dto.branches,
-        phone: dto.phone,
+        phone: dto.phone ?? null,
         status: dto.status ?? 'Active',
       },
     });
@@ -98,7 +141,7 @@ export class UsersService {
       }
     }
 
-    // Auth-owned fields go through the Auth Admin API…
+    // Auth-owned fields go through the Admin API's first-class columns…
     if (dto.email || dto.password) {
       await this.goTrue.updateUser(id, {
         ...(dto.email ? { email: dto.email } : {}),
@@ -106,49 +149,65 @@ export class UsersService {
       });
     }
 
-    // …CRM claims are ours, updated directly on the profile row.
-    const patch: Partial<Profile> = { updatedAt: new Date() };
-    if (dto.email !== undefined) patch.email = dto.email;
-    if (dto.name !== undefined) patch.displayName = dto.name;
-    if (dto.phone !== undefined) patch.phone = dto.phone;
-    if (dto.username !== undefined) patch.username = dto.username;
-    if (dto.role !== undefined) patch.role = dto.role;
-    if (dto.branches !== undefined) patch.branches = dto.branches;
-    if (dto.status !== undefined) patch.status = dto.status;
-    await this.profiles.update({ id }, patch);
+    // …CRM claims are patched onto app_metadata. We re-send the full claim set
+    // (current values overlaid with the change) so the write is robust whether
+    // GoTrue merges or replaces app_metadata.
+    const next: Record<string, unknown> = {
+      username: target.username,
+      display_name: target.displayName,
+      role: target.role,
+      branches: target.branches,
+      phone: target.phone,
+      status: target.status,
+    };
+    if (dto.username !== undefined) next.username = dto.username;
+    if (dto.name !== undefined) next.display_name = dto.name;
+    if (dto.role !== undefined) next.role = dto.role;
+    if (dto.branches !== undefined) next.branches = dto.branches;
+    if (dto.phone !== undefined) next.phone = dto.phone;
+    if (dto.status !== undefined) next.status = dto.status;
+
+    await this.goTrue.updateUser(id, { app_metadata: next });
   }
 
   /**
-   * Soft delete only (AGENTS.md §3.2): mark the profile deleted and ban the
-   * auth user so they can no longer sign in. The row is retained for
-   * audit/history; nothing is ever hard-deleted.
+   * Soft delete only (AGENTS.md §3.2): ban the auth user so they can no longer
+   * sign in, and flip the status claim inactive. The auth.users row is retained
+   * for audit/history; nothing is ever hard-deleted.
    */
   async softDelete(principal: Principal, id: string): Promise<void> {
-    await this.findManageable(principal, id);
+    const target = await this.findManageable(principal, id);
 
     await this.goTrue.banUser(id);
-    await this.profiles.update(
-      { id },
-      { deletedAt: new Date(), status: 'Inactive', updatedAt: new Date() },
-    );
+    await this.goTrue.updateUser(id, {
+      app_metadata: {
+        username: target.username,
+        display_name: target.displayName,
+        role: target.role,
+        branches: target.branches,
+        phone: target.phone,
+        status: 'Inactive',
+      },
+    });
   }
 
   /**
    * Loads a target account and verifies the caller may manage it. Referential
-   * integrity is checked here in the service layer — the schema has no FK
-   * constraints by design (AGENTS.md §6). Out-of-scope targets return 404
-   * rather than 403 so a BO cannot probe for accounts in other branches.
+   * integrity is checked here in the service layer (AGENTS.md §6). Out-of-scope
+   * targets return 404 rather than 403 so a BO cannot probe for accounts in
+   * other branches.
    */
-  private async findManageable(principal: Principal, id: string): Promise<Profile> {
-    const target = await this.profiles.findOne({ where: { id, deletedAt: IsNull() } });
-    if (!target) throw new NotFoundException('User not found');
+  private async findManageable(principal: Principal, id: string): Promise<CrmUser> {
+    const user = await this.goTrue.getUser(id);
+    if (!user || isBanned(user)) throw new NotFoundException('User not found');
+    const target = toCrmUser(user);
 
     if (target.role === 'franchise-admin') {
       throw new ForbiddenException('Franchise Administrator accounts cannot be managed here');
     }
 
     if (principal.role === 'branch-owner') {
-      const overlaps = target.branches?.some((b) => principal.branches.includes(b));
+      const overlaps = target.branches.some((b) => principal.branches.includes(b));
       if (target.role !== 'branch-manager' || !overlaps) {
         throw new NotFoundException('User not found');
       }

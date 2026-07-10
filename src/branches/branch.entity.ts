@@ -24,7 +24,7 @@ export interface BranchGeofence {
  * mapped here — they have no home in core.branches and are deferred (geofence is
  * a later delivery-zone feature; the threshold lives per-product on
  * inventory.stock_levels). Owner identity is not stored on the branch either: it
- * is provisioned into Supabase auth + public.profiles by the service.
+ * is provisioned into Supabase Auth (CRM claims in app_metadata) by the service.
  */
 @Entity({ schema: 'core', name: 'branches' })
 export class Branch {
