@@ -5,6 +5,7 @@ import { AuthModule } from './auth/auth.module';
 import { BranchesModule } from './branches/branches.module';
 import { CimModule } from './cim/cim.module';
 import { FleetModule } from './fleet/fleet.module';
+import { ReferenceModule } from './reference/reference.module';
 import { ServiceRequestsModule } from './service-requests/service-requests.module';
 import { UsersModule } from './users/users.module';
 
@@ -32,6 +33,7 @@ import { UsersModule } from './users/users.module';
     AuthModule,
     UsersModule,
     BranchesModule,
+    ReferenceModule,
     CimModule,
     FleetModule,
     ServiceRequestsModule,

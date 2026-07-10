@@ -87,6 +87,19 @@ Scoping by role (see §7 for full permissions):
 ## 6. Database Conventions `[api]`
 
 - **7 schemas:** `core`, `cim`, `srd`, `fleet`, `loyalty`, `csat`, `inventory` (23 tables).
+  All application tables live in exactly one of these. `core.branches` is the branch
+  table — never `public.branches`.
+- **The `public` schema MUST stay empty — no application tables, views, or functions.**
+  Supabase auto-exposes `public` over PostgREST, which the browser's anon/publishable key
+  can call directly, bypassing the NestJS branch-scoped guards (§5). Keeping `public` empty
+  removes that side-door entirely, so no per-table RLS lockdown is needed. Keep the 7 schemas
+  above OFF the Supabase API "Exposed schemas" list too, and they stay sealed as well.
+- **Identity is owned by Supabase Auth, not a `public.profiles` table.** The one row per
+  user lives in `auth.users`; CRM claims (role, branch scope, status) are stored in that
+  user's **`app_metadata`** (service-role-only — never `user_metadata`, which the user can
+  self-edit and would allow tenancy/privilege escalation). These claims ride in the verified
+  JWT, so the guard reads them from the token (§5) and never queries a mirror table. Manage
+  them through the GoTrue Admin API, never a `public.profiles` row or PostgREST.
 - **UUID primary keys** everywhere.
 - **No foreign-key constraints in the schema.** Referential integrity is enforced in the
   **NestJS service layer**. When writing services, validate referenced records exist and
@@ -263,3 +276,49 @@ Ask, or leave an explicit `// DECISION PENDING` / `// PANEL-CHECK` comment, rath
 guessing. Prefer the answer that is **defensible to the panel** over the one that is merely
 convenient. If a request conflicts with anything in this file, this file wins — surface the
 conflict.
+
+---
+
+## 16. Philippine Phone Number Convention `[all]`
+
+Applies to EVERY phone/contact number field in the system:
+- Branch contact number (web)
+- Branch Owner (web)
+- Branch Manager (web)
+- Customer (mobile)
+
+**CANONICAL STORAGE** (the only format that hits the database):
+E.164 — `+63` followed by the 10-digit subscriber number.
+Validation regex: `^\+639\d{9}$` — e.g. `+639171234567`.
+Never store spaces, dashes, a doubled `+63`, or a leading `0`.
+
+**DISPLAY / INPUT** (all UIs must match):
+Render a FIXED, non-editable `+63` prefix element inside the field border. The user types
+only `9XX XXX XXXX`. The `+63` is a prefix element, **NOT** placeholder text (placeholder
+text disappears on typing and reintroduces the `0917...` bug).
+
+**NORMALIZATION** — run before validating or storing. Shared logic; copy identically into
+web and mobile:
+
+```ts
+function normalizePhMobile(raw: string): string | null {
+  const digits = raw.replace(/\D/g, '');   // strip +, spaces, dashes
+  let n = digits;
+  if (n.startsWith('63')) n = n.slice(2);   // full country code pasted
+  else if (n.startsWith('0')) n = n.slice(1); // reflexive 0917... entry
+  if (!/^9\d{9}$/.test(n)) return null;      // must be 9 + 9 digits
+  return '+63' + n;                          // canonical E.164
+}
+```
+
+Invalid (`null`) → inline error `"Enter a valid PH mobile number"`, block form submission.
+
+**ENFORCEMENT BOUNDARY:**
+Frontend normalization is convenience only and is bypassable. The create/update DTOs in
+`superkalan-crm-api` MUST independently enforce `@Matches(/^\+639\d{9}$/)` on every phone
+field. The DTO is the real integrity boundary — same principle as service-layer referential
+integrity (no FK constraints).
+
+**DRIFT NOTE:** this util exists as identical copies in web and mobile. When AGENTS.md is
+split per-repo, this convention must be duplicated into each repo's file (or kept in a shared
+root file all agents read), not left in only one.

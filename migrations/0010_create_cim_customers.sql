@@ -1,4 +1,4 @@
--- 0006_create_cim_customers.sql
+-- 0010_create_cim_customers.sql
 -- Creates cim.customers — one row per customer profile a branch has registered
 -- (Customer Information Management module, AGENTS.md §8.1 / ITIL 4 Relationship
 -- Management §9). This backs the Branch Manager intake flow: search existing

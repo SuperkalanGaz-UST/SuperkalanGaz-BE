@@ -1,4 +1,4 @@
--- 0005_add_rider_to_service_requests.sql
+-- 0009_add_rider_to_service_requests.sql
 -- Adds the rider assignment to srd.service_requests for the dispatch action
 -- (story BM-004). On dispatch the service sets rider_id alongside dispatched_at
 -- and status='Dispatched' (the request→dispatch leg of the four-timestamp SLA

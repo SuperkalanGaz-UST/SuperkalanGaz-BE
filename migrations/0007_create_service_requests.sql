@@ -1,4 +1,4 @@
--- 0002_create_service_requests.sql
+-- 0007_create_service_requests.sql
 -- Creates srd.service_requests — one row per LPG delivery order (a "Service
 -- Request" in ITIL 4 terms, AGENTS.md §9). This is the foundation of the SRD
 -- module: staff-initiated (walk-in/phone) and, later, mobile-app intake.

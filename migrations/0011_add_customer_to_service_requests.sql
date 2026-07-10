@@ -1,4 +1,4 @@
--- 0007_add_customer_to_service_requests.sql
+-- 0011_add_customer_to_service_requests.sql
 -- Links a Service Request to a CIM customer profile (stories BM-029..BM-032). At
 -- intake the Branch Manager may search + select (or register + select) a customer
 -- and file the order against them; this column records that link.

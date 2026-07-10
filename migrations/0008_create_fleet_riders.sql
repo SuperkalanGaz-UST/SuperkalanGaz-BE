@@ -1,4 +1,4 @@
--- 0004_create_fleet_riders.sql
+-- 0008_create_fleet_riders.sql
 -- Creates fleet.riders — one row per delivery rider (motorcycle courier) that a
 -- branch can dispatch a Service Request to. This is the minimal roster backing
 -- the BM dispatch dropdown (story BM-003); riders are seeded manually for now,

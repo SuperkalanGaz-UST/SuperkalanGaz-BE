@@ -9,7 +9,9 @@ import { BranchesService } from './branches.service';
 @Module({
   imports: [TypeOrmModule.forFeature([Branch]), AuthModule],
   controllers: [BranchesController],
-  // GoTrueAdminService (from the Users module) provisions a new owner's login.
+  // GoTrueAdminService (from the Users module) provisions a new owner's login and
+  // cascades branch renames into each owner/manager's app_metadata.branches
+  // (tenancy is keyed by branch name — AGENTS.md §5).
   providers: [BranchesService, GoTrueAdminService],
 })
 export class BranchesModule {}
