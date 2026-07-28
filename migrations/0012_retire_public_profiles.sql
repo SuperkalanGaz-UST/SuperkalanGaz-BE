@@ -6,23 +6,36 @@
 -- the `public` schema is empty — nothing is reachable via Supabase's anon
 -- PostgREST path, so no per-table RLS lockdown is needed.
 --
--- Apply via the Supabase SQL editor. Order matters: BACKFILL FIRST, then tear
--- down, then have every user sign out/in so their token carries the new claims.
--- This is destructive (drops a table) — take a snapshot first if unsure.
+-- Apply through the migration runner so the teardown is recorded. Order matters:
+-- BACKFILL FIRST when the legacy table still exists, then tear down, then have
+-- every user sign out/in so their token carries the new claims. The existence
+-- guard also repairs environments where public.profiles was dropped manually
+-- but its auth.users trigger was accidentally left behind.
 
 -- 1) Backfill: copy each profile row's claims into the auth user's app_metadata.
 --    `||` shallow-merges, preserving any keys Supabase already set.
-update auth.users u
-set raw_app_meta_data = coalesce(u.raw_app_meta_data, '{}'::jsonb) || jsonb_build_object(
-  'username',     p.username,
-  'display_name', p.display_name,
-  'role',         p.role,
-  'branches',     to_jsonb(coalesce(p.branches, '{}'::text[])),
-  'phone',        p.phone,
-  'status',       p.status
-)
-from public.profiles p
-where p.id = u.id;
+--    Dynamic SQL keeps the migration valid when the legacy table is already gone.
+do $$
+begin
+  if to_regclass('public.profiles') is not null then
+    execute $backfill$
+      update auth.users u
+      set raw_app_meta_data =
+        coalesce(u.raw_app_meta_data, '{}'::jsonb) ||
+        jsonb_build_object(
+          'username',     p.username,
+          'display_name', p.display_name,
+          'role',         p.role,
+          'branches',     to_jsonb(coalesce(p.branches, '{}'::text[])),
+          'phone',        p.phone,
+          'status',       p.status
+        )
+      from public.profiles p
+      where p.id = u.id
+    $backfill$;
+  end if;
+end
+$$;
 
 -- 2) Stop the mirror. The trigger fired on new auth users to seed public.profiles;
 --    provisioning now writes app_metadata directly, so it is obsolete. Confirm the

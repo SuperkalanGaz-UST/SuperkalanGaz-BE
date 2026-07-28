@@ -26,7 +26,7 @@ constraints must never be violated.
 | ---------------------- | ------------------------- | -------------------------------- |
 | `superkalan-crm-api`   | NestJS + TypeScript       | Backend, business logic, data    |
 | `superkalan-crm-web`   | Next.js (React)           | Internal staff dashboard (FA/BO/BM) |
-| `superkalan-crm-mobile`| React Native + Expo       | **Customer-only** mobile app     |
+| `SuperkalanGaz-Mobile` | React Native + Expo      | **Customer-only** mobile app     |
 
 Sections below are tagged `[api]`, `[web]`, `[mobile]`, or `[all]` where they apply.
 
@@ -46,6 +46,9 @@ Sections below are tagged `[api]`, `[web]`, `[mobile]`, or `[all]` where they ap
 6. **Don't invent resolutions to open questions.** See §13. If a needed decision is
    unresolved, ask rather than assume.
 7. **No hallucinated ITIL practices.** Only the four in §9 are implemented.
+8. **Respect repository boundaries.** The parent workspace is only a container—never create
+   application code in a root-level `src/`, `app/`, `pages/`, or `api/` directory. Backend,
+   web, and mobile files belong only in the repositories listed in §2.
 
 ---
 
