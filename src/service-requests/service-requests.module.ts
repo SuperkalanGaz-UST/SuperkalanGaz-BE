@@ -4,6 +4,7 @@ import { AuthModule } from '../auth/auth.module';
 import { CimModule } from '../cim/cim.module';
 import { FleetModule } from '../fleet/fleet.module';
 import { ServiceRequest } from './service-request.entity';
+import { ServiceRequestStatusHistory } from './service-request-status-history.entity';
 import { ServiceRequestsController } from './service-requests.controller';
 import { ServiceRequestsService } from './service-requests.service';
 
@@ -14,7 +15,7 @@ import { ServiceRequestsService } from './service-requests.service';
   // reusing the Users module's GoTrueAdminService. The dependency runs SRD → CIM
   // only (CIM never imports SRD), so there is no module cycle.
   imports: [
-    TypeOrmModule.forFeature([ServiceRequest]),
+    TypeOrmModule.forFeature([ServiceRequest, ServiceRequestStatusHistory]),
     AuthModule,
     FleetModule,
     CimModule,
