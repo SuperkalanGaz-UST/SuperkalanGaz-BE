@@ -12,7 +12,10 @@ import { CimService } from '../cim/cim.service';
 import { FleetService } from '../fleet/fleet.service';
 import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
+import { EditServiceRequestDto } from './dto/edit-service-request.dto';
+import { CancelServiceRequestDto } from './dto/cancel-service-request.dto';
 import { ServiceRequest } from './service-request.entity';
+import { ServiceRequestStatusHistory } from './service-request-status-history.entity';
 
 /**
  * Service Request intake & queue (SRD module). This slice covers create
@@ -29,6 +32,10 @@ export class ServiceRequestsService {
   constructor(
     @InjectRepository(ServiceRequest)
     private readonly serviceRequests: Repository<ServiceRequest>,
+    // Append-only audit trail for guarded lifecycle actions (edit / cancel,
+    // BM-US-07). Maps the existing srd.service_request_status_history table.
+    @InjectRepository(ServiceRequestStatusHistory)
+    private readonly statusHistory: Repository<ServiceRequestStatusHistory>,
     // Reused to validate a rider at dispatch time and flip them to 'On Delivery'
     // — mirrors how BranchesService reuses GoTrueAdminService across modules.
     private readonly fleet: FleetService,
@@ -274,6 +281,192 @@ export class ServiceRequestsService {
     serviceRequest.status = 'Delivered';
     serviceRequest.updatedAt = now;
     return serviceRequest;
+  }
+
+  /**
+   * Edit a pre-dispatch request (stories BM-034/035/037). Only the mutable order
+   * details may change, and ONLY while the request is still Pending and not yet
+   * dispatched — this is the whole point of the story: a Branch Manager can
+   * correct an order right up until a rider is assigned, never after.
+   *
+   * Order of checks (all in the service layer, AGENTS.md §5/§6):
+   *  1. Load the SR scoped to the caller's branches — 404 if missing,
+   *     soft-deleted, or out of scope (never leak another branch's rows).
+   *  2. Diff the requested changes against the loaded (OLD) values, so the audit
+   *     note records exactly what changed and untouched fields are left alone.
+   *  3. Pre-dispatch guard (real-time, race-safe): commit with a conditional
+   *     UPDATE (WHERE still Pending / not dispatched / not deleted). 0 rows means
+   *     the request was dispatched (or cancelled/deleted) between load and write
+   *     — a concurrent dispatch won — so it is a 409, NOT a silent no-op
+   *     (BM-034/BM-037: the check is at write time, not just on load).
+   *  4. Append a status-history row summarising the old→new change (from and to
+   *     status both 'Pending' — an edit is not a lifecycle transition). Written
+   *     only when something actually changed, and only after the authoritative
+   *     UPDATE succeeded, so a 409 leaves no audit noise.
+   */
+  async edit(
+    principal: Principal,
+    id: string,
+    dto: EditServiceRequestDto,
+  ): Promise<ServiceRequest> {
+    const branchIds = this.requireBranches(principal);
+
+    // 1. Load, scoped to the caller's branch(es). Out-of-scope / soft-deleted /
+    //    unknown ids all 404 — same as findById (AGENTS.md §5).
+    const serviceRequest = await this.serviceRequests.findOne({
+      where: { id, branchId: In(branchIds), deletedAt: IsNull() },
+    });
+    if (!serviceRequest) throw new NotFoundException('Service request not found');
+
+    // 2. Diff against the OLD values. Only changed fields land in `set` (the
+    //    UPDATE) and `changes` (the human-readable audit note). specialInstructions
+    //    is normalised to null when blank so "" genuinely clears it.
+    const set: Partial<ServiceRequest> = {};
+    const changes: string[] = [];
+
+    if (dto.deliveryAddress !== undefined) {
+      const next = dto.deliveryAddress.trim();
+      if (next !== serviceRequest.deliveryAddress) {
+        changes.push(
+          `delivery_address "${serviceRequest.deliveryAddress}" → "${next}"`,
+        );
+        set.deliveryAddress = next;
+      }
+    }
+    if (dto.cylinderSize !== undefined) {
+      const next = dto.cylinderSize.trim();
+      if (next !== serviceRequest.cylinderSize) {
+        changes.push(`cylinder_size "${serviceRequest.cylinderSize}" → "${next}"`);
+        set.cylinderSize = next;
+      }
+    }
+    if (dto.quantity !== undefined && dto.quantity !== serviceRequest.quantity) {
+      changes.push(`quantity ${serviceRequest.quantity} → ${dto.quantity}`);
+      set.quantity = dto.quantity;
+    }
+    if (dto.specialInstructions !== undefined) {
+      const next = dto.specialInstructions.trim() || null;
+      if (next !== serviceRequest.specialInstructions) {
+        changes.push(
+          `special_instructions ${this.quoteNullable(serviceRequest.specialInstructions)} → ${this.quoteNullable(next)}`,
+        );
+        set.specialInstructions = next;
+      }
+    }
+
+    // 3. Commit atomically under the pre-dispatch guard. Even a no-op edit (all
+    //    values unchanged) runs the guarded UPDATE so the pre-dispatch invariant
+    //    is enforced at write time and updated_at is bumped. 0 rows affected =>
+    //    the request is no longer editable (dispatched / cancelled / deleted).
+    const now = new Date();
+    const result = await this.serviceRequests
+      .createQueryBuilder()
+      .update(ServiceRequest)
+      .set({ ...set, updatedAt: now })
+      .where(
+        'id = :id AND dispatched_at IS NULL AND status = :status AND deleted_at IS NULL',
+        { id, status: 'Pending' },
+      )
+      .execute();
+    if (!result.affected) {
+      throw new ConflictException('Cannot edit: request already dispatched');
+    }
+
+    // 4. Audit the diff. An edit keeps the status Pending → Pending; the note
+    //    carries the actual field changes. Skipped when nothing changed.
+    if (changes.length > 0) {
+      await this.statusHistory.save(
+        this.statusHistory.create({
+          serviceRequestId: id,
+          branchId: serviceRequest.branchId,
+          fromStatus: 'Pending',
+          toStatus: 'Pending',
+          changedBy: principal.userId,
+          changedAt: now,
+          note: `Edited: ${changes.join('; ')}`,
+        }),
+      );
+    }
+
+    // Reflect the committed state back to the caller without a re-read.
+    Object.assign(serviceRequest, set);
+    serviceRequest.updatedAt = now;
+    return serviceRequest;
+  }
+
+  /**
+   * Cancel a pre-dispatch request (story BM-036). Like edit, this is only valid
+   * while the request is still Pending and not yet dispatched — once a rider is
+   * assigned it is out of the Branch Manager's hands. Cancelling simply voids the
+   * SLA clock: none of the four SLA timestamps are set (a cancelled order was
+   * never delivered, so there is no leg to measure).
+   *
+   * Order of checks (all in the service layer, AGENTS.md §5/§6):
+   *  1. Load the SR scoped to the caller's branches — 404 if missing,
+   *     soft-deleted, or out of scope (never leak another branch's rows).
+   *  2. Pre-dispatch guard (race-safe): conditional UPDATE flipping status to
+   *     'Cancelled' (WHERE still Pending / not dispatched / not deleted). 0 rows
+   *     => already dispatched (or cancelled/deleted) => 409.
+   *  3. Append a status-history row: Pending → Cancelled, with the caller's
+   *     reason recorded verbatim for accountability.
+   *
+   * PANEL-CHECK: BM-036 also calls for an in-app notification to the customer.
+   * Customers are MOBILE-ONLY (AGENTS.md §7), so that notification is a mobile
+   * concern and is deliberately NOT built here — out of scope for this backend.
+   */
+  async cancel(
+    principal: Principal,
+    id: string,
+    dto: CancelServiceRequestDto,
+  ): Promise<ServiceRequest> {
+    const branchIds = this.requireBranches(principal);
+
+    // 1. Load, scoped to the caller's branch(es). Out-of-scope / soft-deleted /
+    //    unknown ids all 404 — same as findById (AGENTS.md §5).
+    const serviceRequest = await this.serviceRequests.findOne({
+      where: { id, branchId: In(branchIds), deletedAt: IsNull() },
+    });
+    if (!serviceRequest) throw new NotFoundException('Service request not found');
+
+    // 2. Commit atomically under the pre-dispatch guard. 0 rows affected means
+    //    the request was dispatched (or already cancelled/deleted) between load
+    //    and write — treat as the conflict, mirroring dispatch/deliver.
+    const now = new Date();
+    const result = await this.serviceRequests
+      .createQueryBuilder()
+      .update(ServiceRequest)
+      .set({ status: 'Cancelled', updatedAt: now })
+      .where(
+        'id = :id AND dispatched_at IS NULL AND status = :status AND deleted_at IS NULL',
+        { id, status: 'Pending' },
+      )
+      .execute();
+    if (!result.affected) {
+      throw new ConflictException('Cannot cancel: request already dispatched');
+    }
+
+    // 3. Audit the transition with the caller's reason.
+    await this.statusHistory.save(
+      this.statusHistory.create({
+        serviceRequestId: id,
+        branchId: serviceRequest.branchId,
+        fromStatus: 'Pending',
+        toStatus: 'Cancelled',
+        changedBy: principal.userId,
+        changedAt: now,
+        note: dto.reason,
+      }),
+    );
+
+    // Reflect the committed state back to the caller without a re-read.
+    serviceRequest.status = 'Cancelled';
+    serviceRequest.updatedAt = now;
+    return serviceRequest;
+  }
+
+  /** Render a nullable string for an audit note: quoted value, or (none). */
+  private quoteNullable(value: string | null): string {
+    return value === null ? '(none)' : `"${value}"`;
   }
 
   /** The caller's active branch UUIDs; fails closed if they have none. */
