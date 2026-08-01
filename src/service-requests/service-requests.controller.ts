@@ -4,6 +4,7 @@ import {
   Get,
   Param,
   ParseUUIDPipe,
+  Patch,
   Post,
   UseGuards,
 } from '@nestjs/common';
@@ -13,6 +14,8 @@ import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
 import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
+import { EditServiceRequestDto } from './dto/edit-service-request.dto';
+import { CancelServiceRequestDto } from './dto/cancel-service-request.dto';
 import { ServiceRequest } from './service-request.entity';
 import { ServiceRequestsService } from './service-requests.service';
 
@@ -85,6 +88,40 @@ export class ServiceRequestsController {
     @Param('id', ParseUUIDPipe) id: string,
   ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
     const row = await this.serviceRequests.deliver(principal, id);
+    return { serviceRequest: this.toRow(row) };
+  }
+
+  /**
+   * Edit a pre-dispatch request (stories BM-034/035/037). Body is a partial set
+   * of mutable order details — at least one field, enforced by the DTO (empty
+   * body → 400). Conflicts if the request is no longer editable, i.e. already
+   * dispatched, cancelled, or deleted (409); 404 if outside the caller's branch.
+   * The updated row is returned in the standard envelope.
+   */
+  @Patch(':id')
+  async edit(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: EditServiceRequestDto,
+  ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
+    const row = await this.serviceRequests.edit(principal, id, dto);
+    return { serviceRequest: this.toRow(row) };
+  }
+
+  /**
+   * Cancel a pre-dispatch request (story BM-036). Requires a non-empty reason
+   * (enforced by the DTO → 400 otherwise), which is recorded to the audit trail.
+   * Voids the SLA clock without setting any SLA timestamp. Conflicts if the
+   * request is already dispatched, cancelled, or deleted (409); 404 if outside
+   * the caller's branch. The updated row (status='Cancelled') is returned.
+   */
+  @Post(':id/cancel')
+  async cancel(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: CancelServiceRequestDto,
+  ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
+    const row = await this.serviceRequests.cancel(principal, id, dto);
     return { serviceRequest: this.toRow(row) };
   }
 

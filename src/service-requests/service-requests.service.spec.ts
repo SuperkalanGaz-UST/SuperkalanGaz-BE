@@ -13,6 +13,7 @@ import { Rider } from '../fleet/rider.entity';
 import { PricesService } from '../prices/prices.service';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
 import { ServiceRequest } from './service-request.entity';
+import { ServiceRequestStatusHistory } from './service-request-status-history.entity';
 import { ServiceRequestsService } from './service-requests.service';
 
 /**
@@ -61,6 +62,15 @@ describe('ServiceRequestsService', () => {
     ({
       findInBranch: jest.fn(() => Promise.resolve(customer)),
     }) as unknown as jest.Mocked<CimService>;
+
+  // Fake status-history repo: `create` echoes its input (as the real one does),
+  // `save` is a spy. Edit/cancel tests inspect these to assert an audit row was
+  // written with the right from/to status, actor, and note.
+  const makeHistory = () =>
+    ({
+      create: jest.fn((v: Partial<ServiceRequestStatusHistory>) => v),
+      save: jest.fn((v: ServiceRequestStatusHistory) => Promise.resolve(v)),
+    }) as unknown as jest.Mocked<Repository<ServiceRequestStatusHistory>>;
 
   const makePrices = () =>
     ({
@@ -120,7 +130,7 @@ describe('ServiceRequestsService', () => {
 
   it('files a request under the caller branch with server-owned fields', async () => {
     const { repo } = makeRepo();
-    const service = makeService(repo, makeFleet(null), makeCim(null));
+    const service = makeService(repo, makeHistory(), makeFleet(null), makeCim(null));
 
     const result = await service.create(principal(['branch-uuid-1']), dto);
 
@@ -146,7 +156,7 @@ describe('ServiceRequestsService', () => {
   it('links a same-branch customer when customerId is supplied', async () => {
     const { repo } = makeRepo();
     const cim = makeCim(inBranchCustomer());
-    const service = makeService(repo, makeFleet(null), cim);
+    const service = makeService(repo, makeHistory(), makeFleet(null), cim);
 
     const result = await service.create(principal(['branch-uuid-1']), {
       ...dto,
@@ -164,7 +174,7 @@ describe('ServiceRequestsService', () => {
     const { repo } = makeRepo();
     // findInBranch returns null for an unknown / soft-deleted / other-branch id.
     const cim = makeCim(null);
-    const service = makeService(repo, makeFleet(null), cim);
+    const service = makeService(repo, makeHistory(), makeFleet(null), cim);
 
     await expect(
       service.create(principal(['branch-uuid-1']), {
@@ -178,7 +188,7 @@ describe('ServiceRequestsService', () => {
 
   it('fails closed when the caller has no active branch', async () => {
     const { repo } = makeRepo();
-    const service = makeService(repo, makeFleet(null), makeCim(null));
+    const service = makeService(repo, makeHistory(), makeFleet(null), makeCim(null));
 
     await expect(service.create(principal([]), dto)).rejects.toBeInstanceOf(
       ForbiddenException,
@@ -195,6 +205,12 @@ describe('ServiceRequestsService', () => {
     await expect(service.deliver(principal([]), 'sr-1')).rejects.toBeInstanceOf(
       ForbiddenException,
     );
+    await expect(
+      service.edit(principal([]), 'sr-1', { deliveryAddress: '1 New St' }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    await expect(
+      service.cancel(principal([]), 'sr-1', { reason: 'no longer needed' }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
     // Nothing should reach the data layer once scoping fails.
     expect(repo.save).not.toHaveBeenCalled();
     expect(repo.find).not.toHaveBeenCalled();
@@ -202,7 +218,7 @@ describe('ServiceRequestsService', () => {
 
   it('scopes the queue to the caller branches, newest first', async () => {
     const { repo } = makeRepo();
-    const service = makeService(repo, makeFleet(null), makeCim(null));
+    const service = makeService(repo, makeHistory(), makeFleet(null), makeCim(null));
 
     await service.list(principal(['branch-uuid-1', 'branch-uuid-2']));
 
@@ -215,7 +231,7 @@ describe('ServiceRequestsService', () => {
 
   it('returns 404 for an id outside the caller scope or not found', async () => {
     const { repo } = makeRepo();
-    const service = makeService(repo, makeFleet(null), makeCim(null));
+    const service = makeService(repo, makeHistory(), makeFleet(null), makeCim(null));
 
     await expect(
       service.findById(principal(['branch-uuid-1']), 'missing'),
@@ -227,7 +243,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo(1);
       repo.findOne = jest.fn(() => Promise.resolve(pendingSr())) as never;
       const fleet = makeFleet(availableRider());
-      const service = makeService(repo, fleet, makeCim(null));
+      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
 
       const result = await service.dispatch(principal(['branch-uuid-1']), 'sr-1', {
         riderId: 'rider-1',
@@ -249,7 +265,7 @@ describe('ServiceRequestsService', () => {
       const dispatched = { ...pendingSr(), status: 'Dispatched' } as ServiceRequest;
       repo.findOne = jest.fn(() => Promise.resolve(dispatched)) as never;
       const fleet = makeFleet(availableRider());
-      const service = makeService(repo, fleet, makeCim(null));
+      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
 
       await expect(
         service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-1' }),
@@ -265,7 +281,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo(0);
       repo.findOne = jest.fn(() => Promise.resolve(pendingSr())) as never;
       const fleet = makeFleet(availableRider());
-      const service = makeService(repo, fleet, makeCim(null));
+      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
 
       await expect(
         service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-1' }),
@@ -281,7 +297,7 @@ describe('ServiceRequestsService', () => {
       // Fleet lookup returns null for any of: unknown, soft-deleted, wrong
       // branch, or not-Available rider.
       const fleet = makeFleet(null);
-      const service = makeService(repo, fleet, makeCim(null));
+      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
 
       await expect(
         service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-x' }),
@@ -295,7 +311,7 @@ describe('ServiceRequestsService', () => {
       const { repo } = makeRepo();
       // findOne already returns null by default (out of scope / missing).
       const fleet = makeFleet(availableRider());
-      const service = makeService(repo, fleet, makeCim(null));
+      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
 
       await expect(
         service.dispatch(principal(['branch-uuid-1']), 'missing', { riderId: 'rider-1' }),
@@ -309,7 +325,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo(1);
       repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
       const fleet = makeFleet(null);
-      const service = makeService(repo, fleet, makeCim(null));
+      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
 
       const result = await service.deliver(principal(['branch-uuid-1']), 'sr-1');
 
@@ -332,7 +348,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo(0);
       repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
       const fleet = makeFleet(null);
-      const service = makeService(repo, fleet, makeCim(null));
+      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
 
       await expect(
         service.deliver(principal(['branch-uuid-1']), 'sr-1'),
@@ -346,7 +362,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo();
       // findOne returns null by default (out of scope / missing).
       const fleet = makeFleet(null);
-      const service = makeService(repo, fleet, makeCim(null));
+      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
 
       await expect(
         service.deliver(principal(['branch-uuid-1']), 'missing'),
@@ -354,6 +370,177 @@ describe('ServiceRequestsService', () => {
       // Bailed before committing or touching the fleet.
       expect(qb.execute).not.toHaveBeenCalled();
       expect(fleet.markAvailable).not.toHaveBeenCalled();
+    });
+  });
+
+  // A pre-dispatch request carrying the mutable order fields an edit can touch.
+  const editablePendingSr = (): ServiceRequest =>
+    ({
+      id: 'sr-1',
+      branchId: 'branch-uuid-1',
+      status: 'Pending',
+      dispatchedAt: null,
+      deletedAt: null,
+      riderId: null,
+      deliveryAddress: '123 Rizal St',
+      cylinderSize: '11kg',
+      quantity: 2,
+      specialInstructions: null,
+    }) as ServiceRequest;
+
+  describe('edit', () => {
+    it('updates the changed fields and writes a history row with an old→new note', async () => {
+      const { repo, qb } = makeRepo(1);
+      repo.findOne = jest.fn(() => Promise.resolve(editablePendingSr())) as never;
+      const history = makeHistory();
+      const service = new ServiceRequestsService(
+        repo,
+        history,
+        makeFleet(null),
+        makeCim(null),
+      );
+
+      const result = await service.edit(principal(['branch-uuid-1']), 'sr-1', {
+        deliveryAddress: '456 Bonifacio Ave',
+        quantity: 3,
+      });
+
+      // The committed fields are reflected back; untouched fields are unchanged.
+      expect(result.deliveryAddress).toBe('456 Bonifacio Ave');
+      expect(result.quantity).toBe(3);
+      expect(result.cylinderSize).toBe('11kg');
+      // An edit is not a lifecycle transition — the request stays Pending.
+      expect(result.status).toBe('Pending');
+      expect(result.updatedAt).toBeInstanceOf(Date);
+      // Committed via the conditional UPDATE (the pre-dispatch race guard).
+      expect(qb.execute).toHaveBeenCalledTimes(1);
+      // Exactly one audit row, capturing the old→new diff of only what changed.
+      expect(history.save).toHaveBeenCalledTimes(1);
+      const saved = history.create.mock.calls[0][0] as ServiceRequestStatusHistory;
+      expect(saved.fromStatus).toBe('Pending');
+      expect(saved.toStatus).toBe('Pending');
+      expect(saved.changedBy).toBe('user-1');
+      expect(saved.branchId).toBe('branch-uuid-1');
+      expect(saved.note).toContain('delivery_address');
+      expect(saved.note).toContain('"123 Rizal St" → "456 Bonifacio Ave"');
+      expect(saved.note).toContain('quantity 2 → 3');
+      // Untouched fields are absent from the note.
+      expect(saved.note).not.toContain('cylinder_size');
+    });
+
+    it('409s when already dispatched (0 rows affected) and writes no history', async () => {
+      // Row looks Pending on load, but the guarded UPDATE touches 0 rows because
+      // a concurrent dispatch committed first — the write-time check (BM-034/037).
+      const { repo, qb } = makeRepo(0);
+      repo.findOne = jest.fn(() => Promise.resolve(editablePendingSr())) as never;
+      const history = makeHistory();
+      const service = new ServiceRequestsService(
+        repo,
+        history,
+        makeFleet(null),
+        makeCim(null),
+      );
+
+      await expect(
+        service.edit(principal(['branch-uuid-1']), 'sr-1', {
+          deliveryAddress: '456 Bonifacio Ave',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(qb.execute).toHaveBeenCalledTimes(1);
+      // No audit row when the authoritative commit failed.
+      expect(history.save).not.toHaveBeenCalled();
+    });
+
+    it('404s for a request outside the caller scope or not found', async () => {
+      const { repo, qb } = makeRepo();
+      // findOne returns null by default (out of scope / missing).
+      const history = makeHistory();
+      const service = new ServiceRequestsService(
+        repo,
+        history,
+        makeFleet(null),
+        makeCim(null),
+      );
+
+      await expect(
+        service.edit(principal(['branch-uuid-1']), 'missing', {
+          deliveryAddress: '456 Bonifacio Ave',
+        }),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      // Bailed before committing or auditing.
+      expect(qb.execute).not.toHaveBeenCalled();
+      expect(history.save).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('cancel', () => {
+    it('sets status Cancelled and logs the reason to history', async () => {
+      const { repo, qb } = makeRepo(1);
+      repo.findOne = jest.fn(() => Promise.resolve(editablePendingSr())) as never;
+      const history = makeHistory();
+      const service = new ServiceRequestsService(
+        repo,
+        history,
+        makeFleet(null),
+        makeCim(null),
+      );
+
+      const result = await service.cancel(principal(['branch-uuid-1']), 'sr-1', {
+        reason: 'Customer changed their mind',
+      });
+
+      expect(result.status).toBe('Cancelled');
+      expect(result.updatedAt).toBeInstanceOf(Date);
+      // No SLA timestamp is stamped — a cancelled order voids the clock.
+      expect(result.dispatchedAt).toBeNull();
+      // Committed via the conditional UPDATE (the pre-dispatch race guard).
+      expect(qb.execute).toHaveBeenCalledTimes(1);
+      // The transition is audited with the reason recorded verbatim.
+      expect(history.save).toHaveBeenCalledTimes(1);
+      const saved = history.create.mock.calls[0][0] as ServiceRequestStatusHistory;
+      expect(saved.fromStatus).toBe('Pending');
+      expect(saved.toStatus).toBe('Cancelled');
+      expect(saved.changedBy).toBe('user-1');
+      expect(saved.note).toBe('Customer changed their mind');
+    });
+
+    it('409s when already dispatched (0 rows affected) and writes no history', async () => {
+      const { repo, qb } = makeRepo(0);
+      repo.findOne = jest.fn(() => Promise.resolve(editablePendingSr())) as never;
+      const history = makeHistory();
+      const service = new ServiceRequestsService(
+        repo,
+        history,
+        makeFleet(null),
+        makeCim(null),
+      );
+
+      await expect(
+        service.cancel(principal(['branch-uuid-1']), 'sr-1', {
+          reason: 'too late',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(qb.execute).toHaveBeenCalledTimes(1);
+      expect(history.save).not.toHaveBeenCalled();
+    });
+
+    it('404s for a request outside the caller scope or not found', async () => {
+      const { repo, qb } = makeRepo();
+      const history = makeHistory();
+      const service = new ServiceRequestsService(
+        repo,
+        history,
+        makeFleet(null),
+        makeCim(null),
+      );
+
+      await expect(
+        service.cancel(principal(['branch-uuid-1']), 'missing', {
+          reason: 'no longer needed',
+        }),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(qb.execute).not.toHaveBeenCalled();
+      expect(history.save).not.toHaveBeenCalled();
     });
   });
 });

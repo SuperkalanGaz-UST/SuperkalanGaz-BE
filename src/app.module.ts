@@ -5,6 +5,7 @@ import { AuthModule } from './auth/auth.module';
 import { BranchesModule } from './branches/branches.module';
 import { CimModule } from './cim/cim.module';
 import { FleetModule } from './fleet/fleet.module';
+import { LoyaltyModule } from './loyalty/loyalty.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { PricesModule } from './prices/prices.module';
 import { ReferenceModule } from './reference/reference.module';
@@ -39,6 +40,7 @@ import { UsersModule } from './users/users.module';
     CimModule,
     FleetModule,
     ServiceRequestsModule,
+    LoyaltyModule,
     NotificationsModule,
     PricesModule,
   ],
