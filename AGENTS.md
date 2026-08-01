@@ -247,13 +247,13 @@ propose an in-scope alternative.
 
 ## 13. Open Decisions — DO NOT ASSUME `[api]`
 
-These are unresolved. Do not silently pick one; ask or leave a `// DECISION PENDING` marker:
+The shared pricing decision is now resolved: `srd.products` is the system-wide
+catalog, and its effective price is snapshotted onto each order at creation.
+
+These remaining items are unresolved. Do not silently pick one; ask or leave a `// DECISION PENDING` marker:
 
 - **`branch_review_log`**: separate entity vs. a status field on the `branches` table.
   (Must be settled before UAT seeding.)
-- **`srd.products` pricing**: shared catalog vs. branch-independent. Current working
-  assumption is a **shared catalog with price snapshotted onto the order at creation time** —
-  confirm before relying on it.
 - Some **Section 1.2 operational figures** (order volume, delay minutes, follow-up %) are
   pending client confirmation; do not hardcode invented numbers as if verified.
 

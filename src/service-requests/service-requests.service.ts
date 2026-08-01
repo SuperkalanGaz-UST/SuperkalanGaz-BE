@@ -10,6 +10,7 @@ import { In, IsNull, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { CimService } from '../cim/cim.service';
 import { FleetService } from '../fleet/fleet.service';
+import { PricesService } from '../prices/prices.service';
 import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
 import { ServiceRequest } from './service-request.entity';
@@ -35,6 +36,9 @@ export class ServiceRequestsService {
     // Reused to validate an optionally-linked customer at create time (same
     // cross-module reuse pattern as fleet above).
     private readonly cim: CimService,
+    // Shared catalog lookup. Money is resolved server-side and snapshotted so
+    // staff clients cannot submit a forged price.
+    private readonly prices: PricesService,
   ) {}
 
   /**
@@ -68,6 +72,8 @@ export class ServiceRequestsService {
       customerId = customer.id;
     }
 
+    const product = await this.prices.findByCylinderSize(dto.cylinderSize);
+
     const now = new Date();
     const serviceRequest = this.serviceRequests.create({
       branchId,
@@ -77,8 +83,10 @@ export class ServiceRequestsService {
       customerName: dto.customerName.trim(),
       customerContact: dto.customerContact.trim(),
       deliveryAddress: dto.deliveryAddress.trim(),
-      cylinderSize: dto.cylinderSize.trim(),
+      cylinderSize: product.cylinderSize,
       quantity: dto.quantity,
+      unitPrice: product.unitPrice,
+      totalAmount: Number((product.unitPrice * dto.quantity).toFixed(2)),
       specialInstructions: dto.specialInstructions?.trim() || null,
       // requested_at opens the SLA chain now; the rest fill in on later slices.
       requestedAt: now,

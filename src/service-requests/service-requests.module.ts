@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from '../auth/auth.module';
 import { CimModule } from '../cim/cim.module';
 import { FleetModule } from '../fleet/fleet.module';
+import { PricesModule } from '../prices/prices.module';
 import { ServiceRequest } from './service-request.entity';
 import { ServiceRequestsController } from './service-requests.controller';
 import { ServiceRequestsService } from './service-requests.service';
@@ -18,6 +19,7 @@ import { ServiceRequestsService } from './service-requests.service';
     AuthModule,
     FleetModule,
     CimModule,
+    PricesModule,
   ],
   controllers: [ServiceRequestsController],
   providers: [ServiceRequestsService],

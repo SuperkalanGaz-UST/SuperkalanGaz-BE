@@ -1,5 +1,6 @@
 import {
   IsInt,
+  IsIn,
   IsNotEmpty,
   IsOptional,
   IsString,
@@ -7,6 +8,7 @@ import {
   Matches,
   Min,
 } from 'class-validator';
+import { CYLINDER_SIZES, CylinderSize } from '../../prices/dto/update-prices.dto';
 
 /**
  * Canonical PH mobile in E.164: +63 then the 10-digit national number (always
@@ -49,11 +51,11 @@ export class CreateServiceRequestDto {
   @IsNotEmpty()
   deliveryAddress!: string;
 
-  // Plain string for MVP (e.g. "11kg"); a products/pricing catalog is deferred
-  // (AGENTS.md §13), so this is free text rather than a catalog reference.
+  // Canonical shared-catalog key. The server looks up the effective database
+  // price and snapshots it onto the request; the client never supplies money.
   @IsString()
-  @IsNotEmpty()
-  cylinderSize!: string;
+  @IsIn([...CYLINDER_SIZES])
+  cylinderSize!: CylinderSize;
 
   @IsInt()
   @Min(1)

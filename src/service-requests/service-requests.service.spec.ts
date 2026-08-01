@@ -10,6 +10,7 @@ import { CimService } from '../cim/cim.service';
 import { Customer } from '../cim/customer.entity';
 import { FleetService } from '../fleet/fleet.service';
 import { Rider } from '../fleet/rider.entity';
+import { PricesService } from '../prices/prices.service';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
 import { ServiceRequest } from './service-request.entity';
 import { ServiceRequestsService } from './service-requests.service';
@@ -61,6 +62,19 @@ describe('ServiceRequestsService', () => {
       findInBranch: jest.fn(() => Promise.resolve(customer)),
     }) as unknown as jest.Mocked<CimService>;
 
+  const makePrices = () =>
+    ({
+      findByCylinderSize: jest.fn((cylinderSize: string) =>
+        Promise.resolve({ cylinderSize, unitPrice: 650 }),
+      ),
+    }) as unknown as jest.Mocked<PricesService>;
+
+  const makeService = (
+    repo: jest.Mocked<Repository<ServiceRequest>>,
+    fleet: jest.Mocked<FleetService>,
+    cim: jest.Mocked<CimService>,
+  ) => new ServiceRequestsService(repo, fleet, cim, makePrices());
+
   const inBranchCustomer = (): Customer =>
     ({ id: 'cust-1', branchId: 'branch-uuid-1' }) as Customer;
 
@@ -106,7 +120,7 @@ describe('ServiceRequestsService', () => {
 
   it('files a request under the caller branch with server-owned fields', async () => {
     const { repo } = makeRepo();
-    const service = new ServiceRequestsService(repo, makeFleet(null), makeCim(null));
+    const service = makeService(repo, makeFleet(null), makeCim(null));
 
     const result = await service.create(principal(['branch-uuid-1']), dto);
 
@@ -119,6 +133,10 @@ describe('ServiceRequestsService', () => {
     expect(result.deliveredAt).toBeNull();
     // Free-text inputs are trimmed.
     expect(result.customerName).toBe('Juan Dela Cruz');
+    // Price comes from the shared catalog and is copied onto this order so a
+    // later catalog update cannot change its historical amount.
+    expect(result.unitPrice).toBe(650);
+    expect(result.totalAmount).toBe(1300);
     // No customerId on this dto → the order is filed with no linked profile
     // (walk-in intake is unchanged, story BM-005).
     expect(result.customerId).toBeNull();
@@ -128,7 +146,7 @@ describe('ServiceRequestsService', () => {
   it('links a same-branch customer when customerId is supplied', async () => {
     const { repo } = makeRepo();
     const cim = makeCim(inBranchCustomer());
-    const service = new ServiceRequestsService(repo, makeFleet(null), cim);
+    const service = makeService(repo, makeFleet(null), cim);
 
     const result = await service.create(principal(['branch-uuid-1']), {
       ...dto,
@@ -146,7 +164,7 @@ describe('ServiceRequestsService', () => {
     const { repo } = makeRepo();
     // findInBranch returns null for an unknown / soft-deleted / other-branch id.
     const cim = makeCim(null);
-    const service = new ServiceRequestsService(repo, makeFleet(null), cim);
+    const service = makeService(repo, makeFleet(null), cim);
 
     await expect(
       service.create(principal(['branch-uuid-1']), {
@@ -160,7 +178,7 @@ describe('ServiceRequestsService', () => {
 
   it('fails closed when the caller has no active branch', async () => {
     const { repo } = makeRepo();
-    const service = new ServiceRequestsService(repo, makeFleet(null), makeCim(null));
+    const service = makeService(repo, makeFleet(null), makeCim(null));
 
     await expect(service.create(principal([]), dto)).rejects.toBeInstanceOf(
       ForbiddenException,
@@ -184,7 +202,7 @@ describe('ServiceRequestsService', () => {
 
   it('scopes the queue to the caller branches, newest first', async () => {
     const { repo } = makeRepo();
-    const service = new ServiceRequestsService(repo, makeFleet(null), makeCim(null));
+    const service = makeService(repo, makeFleet(null), makeCim(null));
 
     await service.list(principal(['branch-uuid-1', 'branch-uuid-2']));
 
@@ -197,7 +215,7 @@ describe('ServiceRequestsService', () => {
 
   it('returns 404 for an id outside the caller scope or not found', async () => {
     const { repo } = makeRepo();
-    const service = new ServiceRequestsService(repo, makeFleet(null), makeCim(null));
+    const service = makeService(repo, makeFleet(null), makeCim(null));
 
     await expect(
       service.findById(principal(['branch-uuid-1']), 'missing'),
@@ -209,7 +227,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo(1);
       repo.findOne = jest.fn(() => Promise.resolve(pendingSr())) as never;
       const fleet = makeFleet(availableRider());
-      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
+      const service = makeService(repo, fleet, makeCim(null));
 
       const result = await service.dispatch(principal(['branch-uuid-1']), 'sr-1', {
         riderId: 'rider-1',
@@ -231,7 +249,7 @@ describe('ServiceRequestsService', () => {
       const dispatched = { ...pendingSr(), status: 'Dispatched' } as ServiceRequest;
       repo.findOne = jest.fn(() => Promise.resolve(dispatched)) as never;
       const fleet = makeFleet(availableRider());
-      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
+      const service = makeService(repo, fleet, makeCim(null));
 
       await expect(
         service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-1' }),
@@ -247,7 +265,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo(0);
       repo.findOne = jest.fn(() => Promise.resolve(pendingSr())) as never;
       const fleet = makeFleet(availableRider());
-      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
+      const service = makeService(repo, fleet, makeCim(null));
 
       await expect(
         service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-1' }),
@@ -263,7 +281,7 @@ describe('ServiceRequestsService', () => {
       // Fleet lookup returns null for any of: unknown, soft-deleted, wrong
       // branch, or not-Available rider.
       const fleet = makeFleet(null);
-      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
+      const service = makeService(repo, fleet, makeCim(null));
 
       await expect(
         service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-x' }),
@@ -277,7 +295,7 @@ describe('ServiceRequestsService', () => {
       const { repo } = makeRepo();
       // findOne already returns null by default (out of scope / missing).
       const fleet = makeFleet(availableRider());
-      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
+      const service = makeService(repo, fleet, makeCim(null));
 
       await expect(
         service.dispatch(principal(['branch-uuid-1']), 'missing', { riderId: 'rider-1' }),
@@ -291,7 +309,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo(1);
       repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
       const fleet = makeFleet(null);
-      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
+      const service = makeService(repo, fleet, makeCim(null));
 
       const result = await service.deliver(principal(['branch-uuid-1']), 'sr-1');
 
@@ -314,7 +332,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo(0);
       repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
       const fleet = makeFleet(null);
-      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
+      const service = makeService(repo, fleet, makeCim(null));
 
       await expect(
         service.deliver(principal(['branch-uuid-1']), 'sr-1'),
@@ -328,7 +346,7 @@ describe('ServiceRequestsService', () => {
       const { repo, qb } = makeRepo();
       // findOne returns null by default (out of scope / missing).
       const fleet = makeFleet(null);
-      const service = new ServiceRequestsService(repo, fleet, makeCim(null));
+      const service = makeService(repo, fleet, makeCim(null));
 
       await expect(
         service.deliver(principal(['branch-uuid-1']), 'missing'),

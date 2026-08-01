@@ -101,6 +101,8 @@ export class ServiceRequestsController {
       delivery_address: sr.deliveryAddress,
       cylinder_size: sr.cylinderSize,
       quantity: sr.quantity,
+      unit_price: sr.unitPrice,
+      total_amount: sr.totalAmount,
       special_instructions: sr.specialInstructions,
       rider_id: sr.riderId,
       requested_at: sr.requestedAt,

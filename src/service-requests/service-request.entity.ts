@@ -1,5 +1,10 @@
 import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
 
+const decimalTransformer = {
+  to: (value: number | null) => value,
+  from: (value: string | null) => (value === null ? null : Number(value)),
+};
+
 /** Channel an order came through — mandatory for channel-level SLA reporting
  * (AGENTS.md §8.2). Walk-in/phone intake is staff-initiated; the mobile app is
  * customer-initiated (later slice). */
@@ -58,13 +63,32 @@ export class ServiceRequest {
   @Column({ name: 'delivery_address', type: 'text' })
   deliveryAddress!: string;
 
-  /** Plain string for MVP (e.g. "11kg"); a products/pricing catalog is deferred
-   * (AGENTS.md §13). */
+  /** Canonical product key; the amount fields below preserve the price used. */
   @Column({ name: 'cylinder_size', type: 'text' })
   cylinderSize!: string;
 
   @Column({ type: 'int' })
   quantity!: number;
+
+  @Column({
+    name: 'unit_price',
+    type: 'numeric',
+    precision: 10,
+    scale: 2,
+    nullable: true,
+    transformer: decimalTransformer,
+  })
+  unitPrice!: number | null;
+
+  @Column({
+    name: 'total_amount',
+    type: 'numeric',
+    precision: 12,
+    scale: 2,
+    nullable: true,
+    transformer: decimalTransformer,
+  })
+  totalAmount!: number | null;
 
   @Column({ name: 'special_instructions', type: 'text', nullable: true })
   specialInstructions!: string | null;
