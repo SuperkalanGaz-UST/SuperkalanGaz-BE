@@ -10,27 +10,38 @@ import { DataSource, In, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { CimService } from '../cim/cim.service';
 import { CatalogItem } from './catalog-item.entity';
+import { CommercialLoyaltyAccount } from './commercial-loyalty-account.entity';
 import { HouseholdLoyaltyAccount } from './household-loyalty-account.entity';
 import { HouseholdPointTransaction } from './household-point-transaction.entity';
 import { Redemption } from './redemption.entity';
 import { CreateRedemptionDto } from './dto/create-redemption.dto';
+import { CreateCommercialRedemptionDto } from './dto/create-commercial-redemption.dto';
 import { RejectRedemptionDto } from './dto/reject-redemption.dto';
-import { ListRedemptionsQuery } from './dto/list-redemptions.query';
+import { ListRedemptionsQuery, RedemptionTrack } from './dto/list-redemptions.query';
 
-/** The household track — this slice never touches the commercial track (AGENTS.md
- * §8a: the two tracks are separate and must not be merged). Every query filters
- * on this. Value must match the DB CHECK constraint redemptions_track_check
- * (allowed: 'household_points' | 'commercial_30plus1'). */
+/** The two loyalty tracks (AGENTS.md §8a) — kept strictly separate, never merged
+ * in one query. Values must match the DB CHECK constraint redemptions_track_check.
+ * Household earns/spends POINTS against a reward catalog; commercial completes
+ * 30-purchase CYCLES that each earn one free cylinder. */
 const HOUSEHOLD_TRACK = 'household_points';
+const COMMERCIAL_TRACK = 'commercial_30plus1';
 
-/** A redemption enriched for the approval queue UI: the row plus the resolved
- * customer name, the catalog reward name (if any), and the household account's
- * current balance. The controller flattens this into the snake_case list row. */
+/** Reward snapshot for a commercial free-cylinder redemption — the commercial
+ * track has no catalog item, so the description is fixed. */
+const COMMERCIAL_REWARD = 'Free cylinder (30+1)';
+
+/** A redemption enriched for the approval queue UI: the base row plus the resolved
+ * customer name and per-track figures. Household rows carry the catalog reward name
+ * + the account's points balance; commercial rows instead carry the account's
+ * completed (redeemable) cycles and current cycle progress. Fields not relevant to
+ * a row's track are null. The controller flattens this into the snake_case row. */
 export interface RedemptionListItem {
   redemption: Redemption;
   customerName: string | null;
   catalogItemName: string | null;
   pointsBalance: number | null;
+  completedCycles: number | null;
+  currentCycleCount: number | null;
 }
 
 /**
@@ -55,6 +66,8 @@ export class LoyaltyService {
     private readonly catalogItems: Repository<CatalogItem>,
     @InjectRepository(HouseholdLoyaltyAccount)
     private readonly accounts: Repository<HouseholdLoyaltyAccount>,
+    @InjectRepository(CommercialLoyaltyAccount)
+    private readonly commercialAccounts: Repository<CommercialLoyaltyAccount>,
     // The approval flow mutates redemption + catalog stock + account balance +
     // ledger atomically, so it needs a transaction that spans all four.
     private readonly dataSource: DataSource,
@@ -80,12 +93,13 @@ export class LoyaltyService {
   }
 
   /**
-   * The approval queue: household redemptions for the caller's branch(es), newest
-   * first, optionally narrowed to one lifecycle state (default 'pending'; 'all'
-   * drops the status filter). Each row is enriched with the customer name, the
-   * catalog reward name, and the account's current balance so the queue UI can
-   * render without extra round-trips. Branch + track scope come from the
-   * principal / this slice, never from request input (AGENTS.md §5).
+   * The approval queue for ONE track: redemptions for the caller's branch(es),
+   * newest first, optionally narrowed to one lifecycle state (default 'pending';
+   * 'all' drops the status filter). ?track selects the track (default household).
+   * Rows are enriched per track — household with catalog reward name + points
+   * balance, commercial with completed/current cycles — so the queue UI renders
+   * without extra round-trips. Branch + track scope come from the principal / the
+   * query, never widening beyond the caller's own branch(es) (AGENTS.md §5).
    */
   async listRedemptions(
     principal: Principal,
@@ -93,21 +107,41 @@ export class LoyaltyService {
   ): Promise<RedemptionListItem[]> {
     const branchIds = this.requireBranches(principal);
 
+    const track: RedemptionTrack = query.track ?? HOUSEHOLD_TRACK;
     // Default to the actionable queue; 'all' means "no status filter".
     const status = query.status ?? 'pending';
     const redemptions = await this.redemptions.find({
       where: {
         branchId: In(branchIds),
-        track: HOUSEHOLD_TRACK,
+        track,
         ...(status === 'all' ? {} : { status }),
       },
       order: { requestedAt: 'DESC' },
     });
     if (redemptions.length === 0) return [];
 
-    // Batch-resolve the three enrichments in bulk (no per-row N+1). All lookups
-    // stay scoped to the caller's branch(es).
     const customerIds = [...new Set(redemptions.map((r) => r.customerId))];
+    const customerNames = await this.customerNames(branchIds, customerIds);
+
+    // The commercial track has no catalog and no points — it enriches with cycle
+    // figures instead. Keep the two tracks' enrichment paths fully separate
+    // (AGENTS.md §8a) rather than interleaving their lookups.
+    if (track === COMMERCIAL_TRACK) {
+      const cycles = await this.commercialCycleStats(branchIds, customerIds);
+      return redemptions.map((redemption) => {
+        const stat = cycles.get(this.accountKey(redemption.customerId, redemption.branchId));
+        return {
+          redemption,
+          customerName: customerNames.get(redemption.customerId) ?? null,
+          catalogItemName: null,
+          pointsBalance: null,
+          completedCycles: stat?.completedCycles ?? null,
+          currentCycleCount: stat?.currentCycleCount ?? null,
+        };
+      });
+    }
+
+    // Household enrichment: catalog reward name + current points balance.
     const catalogItemIds = [
       ...new Set(
         redemptions
@@ -115,9 +149,7 @@ export class LoyaltyService {
           .filter((id): id is string => id !== null),
       ),
     ];
-
-    const [customerNames, catalogNames, balances] = await Promise.all([
-      this.customerNames(branchIds, customerIds),
+    const [catalogNames, balances] = await Promise.all([
       this.catalogItemNames(branchIds, catalogItemIds),
       this.accountBalances(branchIds, customerIds),
     ]);
@@ -132,6 +164,8 @@ export class LoyaltyService {
       pointsBalance:
         balances.get(this.accountKey(redemption.customerId, redemption.branchId)) ??
         null,
+      completedCycles: null,
+      currentCycleCount: null,
     }));
   }
 
@@ -341,11 +375,13 @@ export class LoyaltyService {
   }
 
   /**
-   * Reject a pending household redemption (BM-US-03). Records who actioned it
-   * (approved_by / approved_at) and the reason (rejected_reason). No points or
-   * stock change — a rejected request never debits. The pending→rejected
-   * transition is race-safe: 0 rows affected (already approved / rejected, or a
-   * concurrent action won) => 409.
+   * Reject a pending redemption (BM-US-03) — track-agnostic. Rejecting is a pure
+   * status transition with no earn/spend side effects (no points, stock, or cycles
+   * change), so it is shared by BOTH tracks; the row's own `track` is left as-is.
+   * Records who actioned it (approved_by / approved_at) and the reason. The
+   * pending→rejected transition is race-safe: 0 rows affected (already approved /
+   * rejected, or a concurrent action won) => 409. Branch scope still isolates the
+   * caller (AGENTS.md §5).
    */
   async rejectRedemption(
     principal: Principal,
@@ -354,9 +390,11 @@ export class LoyaltyService {
   ): Promise<Redemption> {
     const branchIds = this.requireBranches(principal);
 
-    // Load scoped to branch + household track — 404 if missing / out of scope.
+    // Load scoped to branch — 404 if missing / out of scope. A redemption id is
+    // globally unique, so branch scope alone is sufficient isolation for a status
+    // transition; no track filter (this handler serves both tracks).
     const redemption = await this.redemptions.findOne({
-      where: { id, branchId: In(branchIds), track: HOUSEHOLD_TRACK },
+      where: { id, branchId: In(branchIds) },
     });
     if (!redemption) throw new NotFoundException('Redemption not found');
 
@@ -372,8 +410,8 @@ export class LoyaltyService {
         updatedAt: now,
       })
       .where(
-        'id = :id AND branch_id IN (:...branchIds) AND track = :track AND status = :status',
-        { id, branchIds, track: HOUSEHOLD_TRACK, status: 'pending' },
+        'id = :id AND branch_id IN (:...branchIds) AND status = :status',
+        { id, branchIds, status: 'pending' },
       )
       .execute();
     if (!result.affected) {
@@ -390,10 +428,11 @@ export class LoyaltyService {
   }
 
   /**
-   * Mark an approved household redemption fulfilled (BM-US-03) — the reward has
-   * been physically handed over. Stamps fulfilled_at. The approved→fulfilled
-   * transition is race-safe: 0 rows affected (still pending, already fulfilled,
-   * or rejected) => 409.
+   * Mark an approved redemption fulfilled (BM-US-03) — track-agnostic. The reward
+   * (a catalog item or a free cylinder) has been physically handed over. Fulfilling
+   * is a pure status transition with no side effects, so it is shared by BOTH
+   * tracks. Stamps fulfilled_at. The approved→fulfilled transition is race-safe: 0
+   * rows affected (still pending, already fulfilled, or rejected) => 409.
    */
   async fulfillRedemption(
     principal: Principal,
@@ -401,9 +440,10 @@ export class LoyaltyService {
   ): Promise<Redemption> {
     const branchIds = this.requireBranches(principal);
 
-    // Load scoped to branch + household track — 404 if missing / out of scope.
+    // Load scoped to branch — 404 if missing / out of scope. No track filter: this
+    // handler serves both tracks and a status transition needs only branch scope.
     const redemption = await this.redemptions.findOne({
-      where: { id, branchId: In(branchIds), track: HOUSEHOLD_TRACK },
+      where: { id, branchId: In(branchIds) },
     });
     if (!redemption) throw new NotFoundException('Redemption not found');
 
@@ -413,8 +453,8 @@ export class LoyaltyService {
       .update(Redemption)
       .set({ status: 'fulfilled', fulfilledAt: now, updatedAt: now })
       .where(
-        'id = :id AND branch_id IN (:...branchIds) AND track = :track AND status = :status',
-        { id, branchIds, track: HOUSEHOLD_TRACK, status: 'approved' },
+        'id = :id AND branch_id IN (:...branchIds) AND status = :status',
+        { id, branchIds, status: 'approved' },
       )
       .execute();
     if (!result.affected) {
@@ -426,6 +466,134 @@ export class LoyaltyService {
     redemption.fulfilledAt = now;
     redemption.updatedAt = now;
     return redemption;
+  }
+
+  /**
+   * File a PENDING commercial "30+1" free-cylinder redemption (BM-US-03 commercial
+   * track). Only files the request; the free cylinder is deducted on approval, not
+   * here. The server owns branch_id, track, status, and the reward snapshot; there
+   * is no catalog item and no points on this track (AGENTS.md §5, §8a).
+   *
+   * Integrity checks in the service layer (no FK constraints, AGENTS.md §6):
+   *  1. The customer must be a live cim.customers profile in the caller's branch.
+   *  2. A commercial_loyalty_accounts row must exist for (customer, branch).
+   *  3. That account must have at least one completed (earned) cycle to redeem —
+   *     else 400 (nothing to redeem yet).
+   */
+  async createCommercialRedemption(
+    principal: Principal,
+    dto: CreateCommercialRedemptionDto,
+  ): Promise<Redemption> {
+    const branchId = this.requireBranch(principal);
+
+    const customer = await this.cim.findInBranch(dto.customerId, branchId);
+    if (!customer) {
+      throw new BadRequestException('Customer not found in this branch');
+    }
+
+    const account = await this.commercialAccounts.findOne({
+      where: { customerId: customer.id, branchId },
+    });
+    if (!account) {
+      throw new BadRequestException('Customer has no commercial loyalty account in this branch');
+    }
+    if (account.completedCycles < 1) {
+      throw new BadRequestException('No completed cycle available to redeem yet');
+    }
+
+    const now = new Date();
+    const redemption = this.redemptions.create({
+      branchId,
+      customerId: customer.id,
+      track: COMMERCIAL_TRACK,
+      catalogItemId: null,
+      rewardDescription: COMMERCIAL_REWARD,
+      pointsSpent: null,
+      status: 'pending',
+      requestedAt: now,
+      approvedBy: null,
+      approvedAt: null,
+      rejectedReason: null,
+      fulfilledAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    return this.redemptions.save(redemption);
+  }
+
+  /**
+   * Approve a pending commercial free-cylinder redemption (BM-US-03 commercial
+   * track) — the dual-authorization commit. Mutates the redemption AND the
+   * account's completed_cycles, so it runs in a single transaction. Unlike the
+   * household track there are no points, no catalog stock, and no ledger: the
+   * only debit is one earned free cylinder.
+   *
+   * Steps, race-safe (AGENTS.md §8a: re-validate eligibility at approval time):
+   *  (a) Conditional-update the redemption pending→approved. 0 rows => it is no
+   *      longer pending (already actioned, or a concurrent approve won) => 409.
+   *  (b) Decrement completed_cycles by one via a conditional UPDATE
+   *      (WHERE completed_cycles >= 1) — the AUTHORITATIVE eligibility guard,
+   *      race-safe against a concurrent approval on the same account. 0 rows =>
+   *      no cycle left to redeem => 409 (rolls back the whole transaction).
+   */
+  async approveCommercialRedemption(
+    principal: Principal,
+    id: string,
+  ): Promise<Redemption> {
+    const branchIds = this.requireBranches(principal);
+
+    return this.dataSource.transaction(async (manager) => {
+      // Load scoped to branch + commercial track — 404 otherwise (never leak
+      // another branch's or the household track's row).
+      const redemption = await manager.findOne(Redemption, {
+        where: { id, branchId: In(branchIds), track: COMMERCIAL_TRACK },
+      });
+      if (!redemption) throw new NotFoundException('Redemption not found');
+
+      const now = new Date();
+
+      // (a) Commit the state transition first, race-safe.
+      const approved = await manager
+        .createQueryBuilder()
+        .update(Redemption)
+        .set({
+          status: 'approved',
+          approvedBy: principal.userId,
+          approvedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          'id = :id AND branch_id IN (:...branchIds) AND track = :track AND status = :status',
+          { id, branchIds, track: COMMERCIAL_TRACK, status: 'pending' },
+        )
+        .execute();
+      if (!approved.affected) {
+        throw new ConflictException('Redemption is not pending');
+      }
+
+      // (b) Redeem one earned free cylinder, race-safe. 0 rows => the account has
+      //     no completed cycle left (or none exists) => 409 + rollback.
+      const debited = await manager
+        .createQueryBuilder()
+        .update(CommercialLoyaltyAccount)
+        .set({ completedCycles: () => 'completed_cycles - 1', updatedAt: now })
+        .where(
+          'customer_id = :customerId AND branch_id = :branchId AND completed_cycles >= 1',
+          { customerId: redemption.customerId, branchId: redemption.branchId },
+        )
+        .execute();
+      if (!debited.affected) {
+        throw new ConflictException('No completed cycle available to redeem');
+      }
+
+      // Reflect the committed state back to the caller without a re-read.
+      redemption.status = 'approved';
+      redemption.approvedBy = principal.userId;
+      redemption.approvedAt = now;
+      redemption.updatedAt = now;
+      return redemption;
+    });
   }
 
   /**
@@ -483,6 +651,30 @@ export class LoyaltyService {
     });
     return new Map(
       accounts.map((a) => [this.accountKey(a.customerId, a.branchId), a.pointsBalance]),
+    );
+  }
+
+  /**
+   * Cycle figures per commercial account, keyed by (customer, branch): the number
+   * of completed (redeemable) cycles and progress toward the next. Scoped to the
+   * caller's branch(es); a customer without a commercial account is simply absent
+   * (→ null cycle figures in the list row). The commercial analogue of
+   * accountBalances.
+   */
+  private async commercialCycleStats(
+    branchIds: string[],
+    customerIds: string[],
+  ): Promise<Map<string, { completedCycles: number; currentCycleCount: number }>> {
+    if (customerIds.length === 0) return new Map();
+
+    const accounts = await this.commercialAccounts.find({
+      where: { customerId: In(customerIds), branchId: In(branchIds) },
+    });
+    return new Map(
+      accounts.map((a) => [
+        this.accountKey(a.customerId, a.branchId),
+        { completedCycles: a.completedCycles, currentCycleCount: a.currentCycleCount },
+      ]),
     );
   }
 

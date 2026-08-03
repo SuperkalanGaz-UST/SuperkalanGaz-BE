@@ -7,7 +7,12 @@ import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
  * The pending→{approved,rejected} gate is the Branch Manager dual-authorization
  * step (AGENTS.md §8a); fulfilled marks the reward physically handed over.
  */
-export type RedemptionStatus = 'pending' | 'approved' | 'rejected' | 'fulfilled';
+export type RedemptionStatus =
+  | 'pending'
+  | 'approved'
+  | 'rejected'
+  | 'fulfilled'
+  | 'cancelled';
 
 /**
  * Maps loyalty.redemptions — one row per reward redemption request. There are two

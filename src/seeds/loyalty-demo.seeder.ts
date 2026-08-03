@@ -5,6 +5,7 @@ import { AppModule } from '../app.module';
 import { Branch } from '../branches/branch.entity';
 import { Customer } from '../cim/customer.entity';
 import { CatalogItem } from '../loyalty/catalog-item.entity';
+import { CommercialLoyaltyAccount } from '../loyalty/commercial-loyalty-account.entity';
 import { HouseholdLoyaltyAccount } from '../loyalty/household-loyalty-account.entity';
 import { Redemption } from '../loyalty/redemption.entity';
 
@@ -20,6 +21,12 @@ const CATALOG: { name: string; description: string; pointsCost: number; stockQty
  * catalog item so the approve flow is demoable end to end. */
 const DEMO_POINTS_BALANCE = 500;
 
+/** Demo commercial "30+1" account state: one earned-but-unredeemed free cylinder
+ * (completed_cycles) and partway through the next cycle (current_cycle_count, 0–30)
+ * — enough to approve one free-cylinder redemption end to end. */
+const DEMO_COMPLETED_CYCLES = 1;
+const DEMO_CURRENT_CYCLE = 12;
+
 /** A demo household customer, planted only when the target branch has none so the
  * redemption flow has someone to redeem against. Keyed by contact_number (a valid
  * PH E.164 mobile per §16) for idempotency. */
@@ -30,9 +37,11 @@ const DEMO_CUSTOMER = {
 };
 
 /**
- * Seeds the household loyalty track for a demo (BM-US-03): a small reward catalog,
- * one funded household account, and one PENDING redemption so the Branch Manager
- * approval queue is non-empty on first load.
+ * Seeds BOTH loyalty tracks for a demo (BM-US-03): the household track (a small
+ * reward catalog, one funded account, one PENDING points redemption) and the
+ * commercial "30+1" track (an account with one earned free cylinder + one PENDING
+ * free-cylinder redemption), so both Branch Manager approval queues are non-empty
+ * on first load.
  *
  * IDEMPOTENT. Re-running never duplicates:
  *  - catalog items are keyed by (branch_id, name) — updated in place, never dropped;
@@ -58,6 +67,9 @@ async function run(): Promise<void> {
     const catalog = app.get<Repository<CatalogItem>>(getRepositoryToken(CatalogItem));
     const accounts = app.get<Repository<HouseholdLoyaltyAccount>>(
       getRepositoryToken(HouseholdLoyaltyAccount),
+    );
+    const commercialAccounts = app.get<Repository<CommercialLoyaltyAccount>>(
+      getRepositoryToken(CommercialLoyaltyAccount),
     );
     const redemptions = app.get<Repository<Redemption>>(getRepositoryToken(Redemption));
 
@@ -221,10 +233,67 @@ async function run(): Promise<void> {
       redemptionNote = `pending redemption created for "${affordable.name}" (${affordable.pointsCost} pts)`;
     }
 
+    // --- Commercial "30+1" track: account with one earned free cylinder + a
+    //     pending free-cylinder redemption, so the commercial queue is demoable. ---
+    let commercial = await commercialAccounts.findOne({
+      where: { customerId: customer.id, branchId: branch.id },
+    });
+    if (!commercial) {
+      commercial = await commercialAccounts.save(
+        commercialAccounts.create({
+          customerId: customer.id,
+          branchId: branch.id,
+          currentCycleCount: DEMO_CURRENT_CYCLE,
+          completedCycles: DEMO_COMPLETED_CYCLES,
+          createdAt: now,
+          updatedAt: now,
+        }),
+      );
+    } else if (commercial.completedCycles < DEMO_COMPLETED_CYCLES) {
+      // Top up to at least one redeemable cycle (don't clobber a spent-down demo).
+      commercial.completedCycles = DEMO_COMPLETED_CYCLES;
+      commercial.updatedAt = now;
+      commercial = await commercialAccounts.save(commercial);
+    }
+
+    const commercialPending = await redemptions.findOne({
+      where: {
+        customerId: customer.id,
+        branchId: branch.id,
+        track: 'commercial_30plus1',
+        status: 'pending',
+      },
+    });
+    let commercialNote: string;
+    if (commercialPending) {
+      commercialNote = 'commercial pending redemption already present (left as is)';
+    } else {
+      await redemptions.save(
+        redemptions.create({
+          branchId: branch.id,
+          customerId: customer.id,
+          track: 'commercial_30plus1',
+          catalogItemId: null,
+          rewardDescription: 'Free cylinder (30+1)',
+          pointsSpent: null,
+          status: 'pending',
+          requestedAt: now,
+          approvedBy: null,
+          approvedAt: null,
+          rejectedReason: null,
+          fulfilledAt: null,
+          createdAt: now,
+          updatedAt: now,
+        }),
+      );
+      commercialNote = 'commercial pending free-cylinder redemption created';
+    }
+
     console.log(
       `[seed] loyalty-demo — branch "${branch.name}", customer "${customer.name}"; ` +
         `catalog inserted: ${catInserted}, updated: ${catUpdated}; ` +
-        `account balance: ${account.pointsBalance} pts; ${redemptionNote}`,
+        `account balance: ${account.pointsBalance} pts; ${redemptionNote}; ` +
+        `commercial cycles: ${commercial.completedCycles} completed / ${commercial.currentCycleCount} in progress; ${commercialNote}`,
     );
   } finally {
     await app.close();

@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from '../auth/auth.module';
 import { CimModule } from '../cim/cim.module';
 import { CatalogItem } from './catalog-item.entity';
+import { CommercialLoyaltyAccount } from './commercial-loyalty-account.entity';
 import { HouseholdLoyaltyAccount } from './household-loyalty-account.entity';
 import { HouseholdPointTransaction } from './household-point-transaction.entity';
 import { Redemption } from './redemption.entity';
@@ -24,6 +25,7 @@ import { LoyaltyService } from './loyalty.service';
       CatalogItem,
       HouseholdLoyaltyAccount,
       HouseholdPointTransaction,
+      CommercialLoyaltyAccount,
     ]),
     AuthModule,
     CimModule,
