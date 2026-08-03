@@ -16,6 +16,7 @@ import { CatalogItem } from './catalog-item.entity';
 import { Redemption } from './redemption.entity';
 import { LoyaltyService, RedemptionListItem } from './loyalty.service';
 import { CreateRedemptionDto } from './dto/create-redemption.dto';
+import { CreateCommercialRedemptionDto } from './dto/create-commercial-redemption.dto';
 import { RejectRedemptionDto } from './dto/reject-redemption.dto';
 import { ListRedemptionsQuery } from './dto/list-redemptions.query';
 
@@ -119,6 +120,38 @@ export class LoyaltyController {
     return { redemption: this.toRedemptionRow(row) };
   }
 
+  /**
+   * Seed a PENDING commercial "30+1" free-cylinder redemption (BM-US-03 commercial
+   * track). Body is just the customer; there is no reward catalog on this track.
+   * Validates the customer (in-branch, live) and that their commercial account has
+   * at least one completed cycle — 400 otherwise (see the service). Returns 201.
+   */
+  @Post('commercial/redemptions')
+  async createCommercial(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: CreateCommercialRedemptionDto,
+  ): Promise<{ redemption: ReturnType<LoyaltyController['toRedemptionRow']> }> {
+    const row = await this.loyalty.createCommercialRedemption(principal, dto);
+    return { redemption: this.toRedemptionRow(row) };
+  }
+
+  /**
+   * Approve a pending commercial redemption (BM-US-03 commercial track) —
+   * transactional: decrements one earned free cylinder (completed_cycles) atomically
+   * with the status change. No points, catalog, or ledger on this track. Conflicts
+   * (409) if it is not pending or the account has no completed cycle left; 404 if
+   * outside the caller's branch. Reject / fulfill are shared with the household
+   * track (POST redemptions/:id/reject|fulfill). Returns the approved row.
+   */
+  @Post('commercial/redemptions/:id/approve')
+  async approveCommercial(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<{ redemption: ReturnType<LoyaltyController['toRedemptionRow']> }> {
+    const row = await this.loyalty.approveCommercialRedemption(principal, id);
+    return { redemption: this.toRedemptionRow(row) };
+  }
+
   /** Snake_case redemption row, matching the precedent in the SRD controller. */
   private toRedemptionRow(r: Redemption) {
     return {
@@ -141,10 +174,11 @@ export class LoyaltyController {
   }
 
   /**
-   * The enriched queue row: the base redemption fields plus the resolved
-   * customer_name, catalog_item_name, and the household's current points_balance.
-   * These three are derived in the service (joins/lookups), not columns on the
-   * entity, so they are appended here.
+   * The enriched queue row: the base redemption fields plus per-track figures
+   * derived in the service (joins/lookups), not columns on the entity. Household
+   * rows populate catalog_item_name + points_balance; commercial rows populate
+   * completed_cycles + current_cycle_count. Fields not relevant to the row's track
+   * are null.
    */
   private toRedemptionListRow(item: RedemptionListItem) {
     return {
@@ -152,6 +186,8 @@ export class LoyaltyController {
       customer_name: item.customerName,
       catalog_item_name: item.catalogItemName,
       points_balance: item.pointsBalance,
+      completed_cycles: item.completedCycles,
+      current_cycle_count: item.currentCycleCount,
     };
   }
 
