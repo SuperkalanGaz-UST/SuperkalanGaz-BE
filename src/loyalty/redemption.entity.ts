@@ -82,6 +82,12 @@ export class Redemption {
   @Column({ name: 'fulfilled_at', type: 'timestamptz', nullable: true })
   fulfilledAt!: Date | null;
 
+  /** The system-generated redemption code, issued when the request is approved
+   * (BM-016/017). Null while pending/rejected/cancelled. Unique among issued codes
+   * (partial unique index). The Branch Manager never types this — it is generated. */
+  @Column({ name: 'redemption_code', type: 'text', nullable: true })
+  redemptionCode!: string | null;
+
   @Column({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;
 
