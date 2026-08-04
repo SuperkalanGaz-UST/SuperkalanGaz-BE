@@ -71,6 +71,12 @@ export class AuthGuard implements CanActivate {
     const principal: Principal = {
       userId: payload.sub,
       role: role as Role,
+      email: typeof payload.email === 'string' ? payload.email : null,
+      username: typeof claims.username === 'string' ? claims.username : null,
+      displayName: typeof claims.display_name === 'string' ? claims.display_name : null,
+      phone: typeof claims.phone === 'string' ? claims.phone : null,
+      // Inactive accounts were rejected above, so every constructed principal is active.
+      status: 'Active',
       branches: names,
       branchIds: liveBranches.map((b) => b.id),
     };

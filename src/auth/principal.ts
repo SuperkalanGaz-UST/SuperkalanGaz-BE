@@ -9,6 +9,12 @@ export type Role = 'franchise-admin' | 'branch-owner' | 'branch-manager';
 export interface Principal {
   userId: string;
   role: Role;
+  /** Self-service identity fields copied from the verified token, never request input. */
+  email?: string | null;
+  username?: string | null;
+  displayName?: string | null;
+  phone?: string | null;
+  status?: 'Active' | 'Inactive';
   /**
    * Branch NAMES this caller belongs to — the tenancy handle carried in the
    * JWT's app_metadata.branches. Kept for name-based scoping (e.g. the Users
