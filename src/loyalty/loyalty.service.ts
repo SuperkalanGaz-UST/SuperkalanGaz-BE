@@ -6,11 +6,14 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, In, Repository } from 'typeorm';
+import { randomBytes } from 'crypto';
+import { DataSource, EntityManager, In, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { CimService } from '../cim/cim.service';
+import { Branch } from '../branches/branch.entity';
 import { CatalogItem } from './catalog-item.entity';
 import { CommercialLoyaltyAccount } from './commercial-loyalty-account.entity';
+import { CommercialPurchaseRecord } from './commercial-purchase-record.entity';
 import { HouseholdLoyaltyAccount } from './household-loyalty-account.entity';
 import { HouseholdPointTransaction } from './household-point-transaction.entity';
 import { Redemption } from './redemption.entity';
@@ -45,6 +48,22 @@ export interface RedemptionListItem {
 }
 
 /**
+ * The customer's loyalty ledger for a redemption review (BM-014): the track, the
+ * current figure (household points balance, or commercial completed/current
+ * cycles), and the transaction history the Branch Manager verifies eligibility
+ * against before approving. Only the arrays for the row's own track are populated.
+ */
+export interface LedgerView {
+  track: RedemptionTrack;
+  customerName: string | null;
+  pointsBalance: number | null;
+  completedCycles: number | null;
+  currentCycleCount: number | null;
+  householdTransactions: HouseholdPointTransaction[];
+  commercialPurchases: CommercialPurchaseRecord[];
+}
+
+/**
  * Household loyalty redemption workflow (LPM module, household track only —
  * AGENTS.md §8a). This slice is the Branch Manager dual-authorization gate
  * (BM-US-03): read the reward catalog, seed a pending request, then approve /
@@ -68,6 +87,12 @@ export class LoyaltyService {
     private readonly accounts: Repository<HouseholdLoyaltyAccount>,
     @InjectRepository(CommercialLoyaltyAccount)
     private readonly commercialAccounts: Repository<CommercialLoyaltyAccount>,
+    @InjectRepository(CommercialPurchaseRecord)
+    private readonly commercialPurchases: Repository<CommercialPurchaseRecord>,
+    @InjectRepository(HouseholdPointTransaction)
+    private readonly ledger: Repository<HouseholdPointTransaction>,
+    @InjectRepository(Branch)
+    private readonly branches: Repository<Branch>,
     // The approval flow mutates redemption + catalog stock + account balance +
     // ledger atomically, so it needs a transaction that spans all four.
     private readonly dataSource: DataSource,
@@ -222,24 +247,48 @@ export class LoyaltyService {
     // Snapshot the reward name + cost onto the request so the queue is stable even
     // if the catalog item later changes. Points are debited on approval, not now.
     const now = new Date();
-    const redemption = this.redemptions.create({
-      branchId,
-      customerId: customer.id,
-      track: HOUSEHOLD_TRACK,
-      catalogItemId: item.id,
-      rewardDescription: item.name,
-      pointsSpent: item.pointsCost,
-      status: 'pending',
-      requestedAt: now,
-      approvedBy: null,
-      approvedAt: null,
-      rejectedReason: null,
-      fulfilledAt: null,
-      createdAt: now,
-      updatedAt: now,
-    });
+    // Dual Authorization gate (BM-013): when ON the request is filed pending for the
+    // Branch Manager to approve; when OFF the branch has delegated issuance, so we
+    // auto-approve + issue a code immediately in the SAME transaction as the insert.
+    const dualAuth = await this.isDualAuth(branchId);
 
-    return this.redemptions.save(redemption);
+    return this.dataSource.transaction(async (manager) => {
+      const redemption = await manager.save(
+        Redemption,
+        manager.create(Redemption, {
+          branchId,
+          customerId: customer.id,
+          track: HOUSEHOLD_TRACK,
+          catalogItemId: item.id,
+          rewardDescription: item.name,
+          pointsSpent: item.pointsCost,
+          status: 'pending',
+          requestedAt: now,
+          approvedBy: null,
+          approvedAt: null,
+          rejectedReason: null,
+          fulfilledAt: null,
+          redemptionCode: null,
+          createdAt: now,
+          updatedAt: now,
+        }),
+      );
+
+      if (!dualAuth) {
+        const code = await this.settleHouseholdApprovalInTx(
+          manager,
+          redemption,
+          principal.userId,
+          now,
+        );
+        redemption.status = 'approved';
+        redemption.approvedBy = principal.userId;
+        redemption.approvedAt = now;
+        redemption.redemptionCode = code;
+        redemption.updatedAt = now;
+      }
+      return redemption;
+    });
   }
 
   /**
@@ -276,102 +325,132 @@ export class LoyaltyService {
       if (!redemption) throw new NotFoundException('Redemption not found');
 
       const now = new Date();
-      const pointsSpent = redemption.pointsSpent ?? 0;
-
-      // (a) Commit the state transition first, race-safe. Only a still-pending row
-      //     in scope is updated; 0 rows => a concurrent approve/reject already won.
-      const approved = await manager
-        .createQueryBuilder()
-        .update(Redemption)
-        .set({
-          status: 'approved',
-          approvedBy: principal.userId,
-          approvedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          'id = :id AND branch_id IN (:...branchIds) AND track = :track AND status = :status',
-          { id, branchIds, track: HOUSEHOLD_TRACK, status: 'pending' },
-        )
-        .execute();
-      if (!approved.affected) {
-        throw new ConflictException('Redemption is not pending');
-      }
-
-      // (b) Re-read the account (fast, clear error). The authoritative debit guard
-      //     is the conditional UPDATE in (d).
-      const account = await manager.findOne(HouseholdLoyaltyAccount, {
-        where: { customerId: redemption.customerId, branchId: redemption.branchId },
-      });
-      if (!account) {
-        throw new ConflictException('Loyalty account not found');
-      }
-      if (account.pointsBalance < pointsSpent) {
-        throw new ConflictException('insufficient points');
-      }
-
-      // (c) Decrement stock, race-safe, only when a catalog item is linked (the
-      //     household track always links one; guard defensively). 0 rows => the
-      //     last unit was taken concurrently.
-      if (redemption.catalogItemId) {
-        const stock = await manager
-          .createQueryBuilder()
-          .update(CatalogItem)
-          .set({ stockQty: () => 'stock_qty - 1', updatedAt: now })
-          .where(
-            'id = :id AND branch_id IN (:...branchIds) AND stock_qty > 0',
-            { id: redemption.catalogItemId, branchIds },
-          )
-          .execute();
-        if (!stock.affected) {
-          throw new ConflictException('out of stock');
-        }
-      }
-
-      // (d) Debit the balance, race-safe against a concurrent approval on the same
-      //     account. pointsSpent is a trusted integer (snapshot from our own DB),
-      //     so inlining it in the SET expression carries no injection risk. 0 rows
-      //     => the balance dropped below the cost between (b) and here => 409.
-      const debited = await manager
-        .createQueryBuilder()
-        .update(HouseholdLoyaltyAccount)
-        .set({
-          pointsBalance: () => `points_balance - ${pointsSpent}`,
-          updatedAt: now,
-        })
-        .where('id = :id AND points_balance >= :spent', {
-          id: account.id,
-          spent: pointsSpent,
-        })
-        .execute();
-      if (!debited.affected) {
-        throw new ConflictException('insufficient points');
-      }
-
-      // (e) Append the immutable ledger entry recording the spend.
-      await manager.save(
-        HouseholdPointTransaction,
-        manager.create(HouseholdPointTransaction, {
-          accountId: account.id,
-          customerId: redemption.customerId,
-          branchId: redemption.branchId,
-          type: 'redeem',
-          pointsDelta: -pointsSpent,
-          sourceServiceRequestId: null,
-          redemptionId: redemption.id,
-          earnedAt: null,
-          expiresAt: null,
-          createdAt: now,
-        }),
+      const code = await this.settleHouseholdApprovalInTx(
+        manager,
+        redemption,
+        principal.userId,
+        now,
       );
 
       // Reflect the committed state back to the caller without a re-read.
       redemption.status = 'approved';
       redemption.approvedBy = principal.userId;
       redemption.approvedAt = now;
+      redemption.redemptionCode = code;
       redemption.updatedAt = now;
       return redemption;
     });
+  }
+
+  /**
+   * The household approval commit, in an existing transaction. Shared by the manual
+   * approve endpoint AND the dual-auth-OFF auto-issue path, so the debit logic lives
+   * in exactly one place. Steps, all race-safe (AGENTS.md §8a — re-validate at
+   * approval time). Generates + persists the redemption code (BM-016/017). Returns
+   * the issued code. Any thrown ConflictException rolls back the caller's transaction.
+   *  (a) pending→approved + stamp approver + persist code (0 rows => 409).
+   *  (b) re-read account; balance < spent => 409.
+   *  (c) decrement catalog stock, race-safe (0 rows => 409 out of stock).
+   *  (d) debit balance, race-safe (0 rows => 409 insufficient points).
+   *  (e) append the immutable 'redeem' ledger row.
+   */
+  private async settleHouseholdApprovalInTx(
+    manager: EntityManager,
+    redemption: Redemption,
+    userId: string,
+    now: Date,
+  ): Promise<string> {
+    const pointsSpent = redemption.pointsSpent ?? 0;
+    const code = await this.issueCode(manager);
+
+    // (a) Commit the transition + code atomically. Only a still-pending row in scope
+    //     is updated; 0 rows => a concurrent approve/reject already won.
+    const approved = await manager
+      .createQueryBuilder()
+      .update(Redemption)
+      .set({
+        status: 'approved',
+        approvedBy: userId,
+        approvedAt: now,
+        redemptionCode: code,
+        updatedAt: now,
+      })
+      .where(
+        'id = :id AND branch_id = :branchId AND track = :track AND status = :status',
+        { id: redemption.id, branchId: redemption.branchId, track: HOUSEHOLD_TRACK, status: 'pending' },
+      )
+      .execute();
+    if (!approved.affected) {
+      throw new ConflictException('Redemption is not pending');
+    }
+
+    // (b) Re-read the account (fast, clear error). The authoritative debit guard is
+    //     the conditional UPDATE in (d).
+    const account = await manager.findOne(HouseholdLoyaltyAccount, {
+      where: { customerId: redemption.customerId, branchId: redemption.branchId },
+    });
+    if (!account) {
+      throw new ConflictException('Loyalty account not found');
+    }
+    if (account.pointsBalance < pointsSpent) {
+      throw new ConflictException('insufficient points');
+    }
+
+    // (c) Decrement stock, race-safe, only when a catalog item is linked. 0 rows =>
+    //     the last unit was taken concurrently.
+    if (redemption.catalogItemId) {
+      const stock = await manager
+        .createQueryBuilder()
+        .update(CatalogItem)
+        .set({ stockQty: () => 'stock_qty - 1', updatedAt: now })
+        .where('id = :id AND branch_id = :branchId AND stock_qty > 0', {
+          id: redemption.catalogItemId,
+          branchId: redemption.branchId,
+        })
+        .execute();
+      if (!stock.affected) {
+        throw new ConflictException('out of stock');
+      }
+    }
+
+    // (d) Debit the balance, race-safe against a concurrent approval on the same
+    //     account. pointsSpent is a trusted integer (our own snapshot), so inlining
+    //     it in the SET expression carries no injection risk. 0 rows => the balance
+    //     dropped below the cost => 409.
+    const debited = await manager
+      .createQueryBuilder()
+      .update(HouseholdLoyaltyAccount)
+      .set({
+        pointsBalance: () => `points_balance - ${pointsSpent}`,
+        updatedAt: now,
+      })
+      .where('id = :id AND points_balance >= :spent', {
+        id: account.id,
+        spent: pointsSpent,
+      })
+      .execute();
+    if (!debited.affected) {
+      throw new ConflictException('insufficient points');
+    }
+
+    // (e) Append the immutable ledger entry recording the spend.
+    await manager.save(
+      HouseholdPointTransaction,
+      manager.create(HouseholdPointTransaction, {
+        accountId: account.id,
+        customerId: redemption.customerId,
+        branchId: redemption.branchId,
+        type: 'redeem',
+        pointsDelta: -pointsSpent,
+        sourceServiceRequestId: null,
+        redemptionId: redemption.id,
+        earnedAt: null,
+        expiresAt: null,
+        createdAt: now,
+      }),
+    );
+
+    return code;
   }
 
   /**
@@ -502,24 +581,47 @@ export class LoyaltyService {
     }
 
     const now = new Date();
-    const redemption = this.redemptions.create({
-      branchId,
-      customerId: customer.id,
-      track: COMMERCIAL_TRACK,
-      catalogItemId: null,
-      rewardDescription: COMMERCIAL_REWARD,
-      pointsSpent: null,
-      status: 'pending',
-      requestedAt: now,
-      approvedBy: null,
-      approvedAt: null,
-      rejectedReason: null,
-      fulfilledAt: null,
-      createdAt: now,
-      updatedAt: now,
-    });
+    // Dual Authorization gate (BM-013), same as household: ON => pending queue;
+    // OFF => auto-approve + issue a code in the same transaction as the insert.
+    const dualAuth = await this.isDualAuth(branchId);
 
-    return this.redemptions.save(redemption);
+    return this.dataSource.transaction(async (manager) => {
+      const redemption = await manager.save(
+        Redemption,
+        manager.create(Redemption, {
+          branchId,
+          customerId: customer.id,
+          track: COMMERCIAL_TRACK,
+          catalogItemId: null,
+          rewardDescription: COMMERCIAL_REWARD,
+          pointsSpent: null,
+          status: 'pending',
+          requestedAt: now,
+          approvedBy: null,
+          approvedAt: null,
+          rejectedReason: null,
+          fulfilledAt: null,
+          redemptionCode: null,
+          createdAt: now,
+          updatedAt: now,
+        }),
+      );
+
+      if (!dualAuth) {
+        const code = await this.settleCommercialApprovalInTx(
+          manager,
+          redemption,
+          principal.userId,
+          now,
+        );
+        redemption.status = 'approved';
+        redemption.approvedBy = principal.userId;
+        redemption.approvedAt = now;
+        redemption.redemptionCode = code;
+        redemption.updatedAt = now;
+      }
+      return redemption;
+    });
   }
 
   /**
@@ -552,48 +654,190 @@ export class LoyaltyService {
       if (!redemption) throw new NotFoundException('Redemption not found');
 
       const now = new Date();
-
-      // (a) Commit the state transition first, race-safe.
-      const approved = await manager
-        .createQueryBuilder()
-        .update(Redemption)
-        .set({
-          status: 'approved',
-          approvedBy: principal.userId,
-          approvedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          'id = :id AND branch_id IN (:...branchIds) AND track = :track AND status = :status',
-          { id, branchIds, track: COMMERCIAL_TRACK, status: 'pending' },
-        )
-        .execute();
-      if (!approved.affected) {
-        throw new ConflictException('Redemption is not pending');
-      }
-
-      // (b) Redeem one earned free cylinder, race-safe. 0 rows => the account has
-      //     no completed cycle left (or none exists) => 409 + rollback.
-      const debited = await manager
-        .createQueryBuilder()
-        .update(CommercialLoyaltyAccount)
-        .set({ completedCycles: () => 'completed_cycles - 1', updatedAt: now })
-        .where(
-          'customer_id = :customerId AND branch_id = :branchId AND completed_cycles >= 1',
-          { customerId: redemption.customerId, branchId: redemption.branchId },
-        )
-        .execute();
-      if (!debited.affected) {
-        throw new ConflictException('No completed cycle available to redeem');
-      }
+      const code = await this.settleCommercialApprovalInTx(
+        manager,
+        redemption,
+        principal.userId,
+        now,
+      );
 
       // Reflect the committed state back to the caller without a re-read.
       redemption.status = 'approved';
       redemption.approvedBy = principal.userId;
       redemption.approvedAt = now;
+      redemption.redemptionCode = code;
       redemption.updatedAt = now;
       return redemption;
     });
+  }
+
+  /**
+   * The commercial approval commit, in an existing transaction. Shared by the manual
+   * approve endpoint AND the dual-auth-OFF auto-issue path. Generates + persists the
+   * redemption code (BM-016/017) and redeems one earned free cylinder. Returns the
+   * code. Any ConflictException rolls back the caller's transaction. There are no
+   * points, catalog stock, or ledger on this track — the only debit is a cycle.
+   *  (a) pending→approved + stamp approver + persist code (0 rows => 409).
+   *  (b) decrement completed_cycles, race-safe (0 rows => 409 no cycle to redeem).
+   */
+  private async settleCommercialApprovalInTx(
+    manager: EntityManager,
+    redemption: Redemption,
+    userId: string,
+    now: Date,
+  ): Promise<string> {
+    const code = await this.issueCode(manager);
+
+    // (a) Commit the transition + code atomically, race-safe.
+    const approved = await manager
+      .createQueryBuilder()
+      .update(Redemption)
+      .set({
+        status: 'approved',
+        approvedBy: userId,
+        approvedAt: now,
+        redemptionCode: code,
+        updatedAt: now,
+      })
+      .where(
+        'id = :id AND branch_id = :branchId AND track = :track AND status = :status',
+        { id: redemption.id, branchId: redemption.branchId, track: COMMERCIAL_TRACK, status: 'pending' },
+      )
+      .execute();
+    if (!approved.affected) {
+      throw new ConflictException('Redemption is not pending');
+    }
+
+    // (b) Redeem one earned free cylinder, race-safe. 0 rows => the account has no
+    //     completed cycle left (or none exists) => 409 + rollback.
+    const debited = await manager
+      .createQueryBuilder()
+      .update(CommercialLoyaltyAccount)
+      .set({ completedCycles: () => 'completed_cycles - 1', updatedAt: now })
+      .where(
+        'customer_id = :customerId AND branch_id = :branchId AND completed_cycles >= 1',
+        { customerId: redemption.customerId, branchId: redemption.branchId },
+      )
+      .execute();
+    if (!debited.affected) {
+      throw new ConflictException('No completed cycle available to redeem');
+    }
+
+    return code;
+  }
+
+  /**
+   * Generate a unique redemption code (BM-017) inside the given transaction. Format
+   * RDM-XXXXXXXX in Crockford base32 (no I/L/O/U — unambiguous when read aloud or
+   * hand-written at the counter). Collisions are astronomically unlikely but the
+   * partial unique index is the real guarantee; we probe-and-retry a few times so a
+   * clash surfaces here rather than as an INSERT failure.
+   */
+  private async issueCode(manager: EntityManager): Promise<string> {
+    const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const bytes = randomBytes(8);
+      let body = '';
+      for (let i = 0; i < 8; i++) body += ALPHABET[bytes[i] % ALPHABET.length];
+      const code = `RDM-${body}`;
+      const clash = await manager.findOne(Redemption, {
+        where: { redemptionCode: code },
+        select: { id: true },
+      });
+      if (!clash) return code;
+    }
+    throw new ConflictException('Could not generate a unique redemption code');
+  }
+
+  /**
+   * The customer's loyalty ledger for a redemption review (BM-014): current figure
+   * + transaction history, so the Branch Manager can verify eligibility independently
+   * before approving. Scoped to the caller's branch(es); a redemption outside scope
+   * 404s. Only the arrays for the row's own track are populated (the two tracks are
+   * kept separate, AGENTS.md §8a).
+   */
+  async getLedger(principal: Principal, redemptionId: string): Promise<LedgerView> {
+    const branchIds = this.requireBranches(principal);
+
+    const redemption = await this.redemptions.findOne({
+      where: { id: redemptionId, branchId: In(branchIds) },
+    });
+    if (!redemption) throw new NotFoundException('Redemption not found');
+
+    const customerName =
+      (await this.customerNames(branchIds, [redemption.customerId])).get(
+        redemption.customerId,
+      ) ?? null;
+
+    if (redemption.track === COMMERCIAL_TRACK) {
+      const account = await this.commercialAccounts.findOne({
+        where: { customerId: redemption.customerId, branchId: redemption.branchId },
+      });
+      const commercialPurchases = await this.commercialPurchases.find({
+        where: { customerId: redemption.customerId, branchId: redemption.branchId },
+        order: { countedAt: 'DESC' },
+        take: 100,
+      });
+      return {
+        track: COMMERCIAL_TRACK,
+        customerName,
+        pointsBalance: null,
+        completedCycles: account?.completedCycles ?? null,
+        currentCycleCount: account?.currentCycleCount ?? null,
+        householdTransactions: [],
+        commercialPurchases,
+      };
+    }
+
+    const account = await this.accounts.findOne({
+      where: { customerId: redemption.customerId, branchId: redemption.branchId },
+    });
+    const householdTransactions = await this.ledger.find({
+      where: { customerId: redemption.customerId, branchId: redemption.branchId },
+      order: { createdAt: 'DESC' },
+      take: 100,
+    });
+    return {
+      track: HOUSEHOLD_TRACK,
+      customerName,
+      pointsBalance: account?.pointsBalance ?? null,
+      completedCycles: null,
+      currentCycleCount: null,
+      householdTransactions,
+      commercialPurchases: [],
+    };
+  }
+
+  /** The caller's branch loyalty Dual Authorization setting (BM-013). */
+  async getSettings(principal: Principal): Promise<{ branchId: string; dualAuth: boolean }> {
+    const branchId = this.requireBranch(principal);
+    const branch = await this.branches.findOne({ where: { id: branchId } });
+    if (!branch) throw new NotFoundException('Branch not found');
+    return { branchId, dualAuth: branch.loyaltyDualAuth };
+  }
+
+  /** Toggle the caller's branch loyalty Dual Authorization setting (BM-013). */
+  async updateSettings(
+    principal: Principal,
+    dualAuth: boolean,
+  ): Promise<{ branchId: string; dualAuth: boolean }> {
+    const branchId = this.requireBranch(principal);
+    const res = await this.branches.update(
+      { id: branchId },
+      { loyaltyDualAuth: dualAuth, updatedAt: new Date() },
+    );
+    if (!res.affected) throw new NotFoundException('Branch not found');
+    return { branchId, dualAuth };
+  }
+
+  /** Whether the branch requires Branch Manager dual authorization for redemptions.
+   * Fails SAFE — a missing branch defaults to requiring approval (never auto-issue). */
+  private async isDualAuth(branchId: string): Promise<boolean> {
+    const branch = await this.branches.findOne({
+      where: { id: branchId },
+      select: { id: true, loyaltyDualAuth: true },
+    });
+    return branch?.loyaltyDualAuth ?? true;
   }
 
   /**

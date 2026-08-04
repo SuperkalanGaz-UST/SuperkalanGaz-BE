@@ -78,6 +78,16 @@ export class Branch {
   @Column({ type: 'jsonb', nullable: true })
   geofence!: BranchGeofence | null;
 
+  /**
+   * Loyalty Dual Authorization setting (added in migration 0016, story BM-013).
+   * true (default) → customer redemption requests enter the Branch Manager's
+   * pending Rewards Claiming queue for manual approve/reject. false → the branch
+   * has delegated issuance: a request is auto-approved and coded immediately and
+   * never appears in the queue.
+   */
+  @Column({ name: 'loyalty_dual_auth', type: 'boolean', default: true })
+  loyaltyDualAuth!: boolean;
+
   @Column({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;
 

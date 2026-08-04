@@ -2,8 +2,10 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from '../auth/auth.module';
 import { CimModule } from '../cim/cim.module';
+import { Branch } from '../branches/branch.entity';
 import { CatalogItem } from './catalog-item.entity';
 import { CommercialLoyaltyAccount } from './commercial-loyalty-account.entity';
+import { CommercialPurchaseRecord } from './commercial-purchase-record.entity';
 import { HouseholdLoyaltyAccount } from './household-loyalty-account.entity';
 import { HouseholdPointTransaction } from './household-point-transaction.entity';
 import { Redemption } from './redemption.entity';
@@ -26,6 +28,8 @@ import { LoyaltyService } from './loyalty.service';
       HouseholdLoyaltyAccount,
       HouseholdPointTransaction,
       CommercialLoyaltyAccount,
+      CommercialPurchaseRecord,
+      Branch,
     ]),
     AuthModule,
     CimModule,

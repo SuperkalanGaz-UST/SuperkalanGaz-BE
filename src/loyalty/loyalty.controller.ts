@@ -4,6 +4,7 @@ import {
   Get,
   Param,
   ParseUUIDPipe,
+  Patch,
   Post,
   Query,
   UseGuards,
@@ -13,11 +14,14 @@ import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { CatalogItem } from './catalog-item.entity';
+import { CommercialPurchaseRecord } from './commercial-purchase-record.entity';
+import { HouseholdPointTransaction } from './household-point-transaction.entity';
 import { Redemption } from './redemption.entity';
-import { LoyaltyService, RedemptionListItem } from './loyalty.service';
+import { LedgerView, LoyaltyService, RedemptionListItem } from './loyalty.service';
 import { CreateRedemptionDto } from './dto/create-redemption.dto';
 import { CreateCommercialRedemptionDto } from './dto/create-commercial-redemption.dto';
 import { RejectRedemptionDto } from './dto/reject-redemption.dto';
+import { UpdateLoyaltySettingsDto } from './dto/update-loyalty-settings.dto';
 import { ListRedemptionsQuery } from './dto/list-redemptions.query';
 
 /**
@@ -152,6 +156,43 @@ export class LoyaltyController {
     return { redemption: this.toRedemptionRow(row) };
   }
 
+  /**
+   * The customer's loyalty ledger for a redemption review (BM-014): current figure
+   * + transaction history, so the Branch Manager verifies eligibility before
+   * approving. Track-scoped; 404 if the redemption is outside the caller's branch.
+   */
+  @Get('redemptions/:id/ledger')
+  async ledger(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<{ ledger: ReturnType<LoyaltyController['toLedgerView']> }> {
+    const view = await this.loyalty.getLedger(principal, id);
+    return { ledger: this.toLedgerView(view) };
+  }
+
+  /** The caller's branch loyalty Dual Authorization setting (BM-013). */
+  @Get('settings')
+  async settings(
+    @CurrentPrincipal() principal: Principal,
+  ): Promise<{ settings: { branch_id: string; dual_auth: boolean } }> {
+    const s = await this.loyalty.getSettings(principal);
+    return { settings: { branch_id: s.branchId, dual_auth: s.dualAuth } };
+  }
+
+  /**
+   * Toggle the caller's branch loyalty Dual Authorization (BM-013). When switched
+   * OFF, subsequent redemption requests auto-approve + issue a code instead of
+   * queuing for manual approval.
+   */
+  @Patch('settings')
+  async updateSettings(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: UpdateLoyaltySettingsDto,
+  ): Promise<{ settings: { branch_id: string; dual_auth: boolean } }> {
+    const s = await this.loyalty.updateSettings(principal, dto.dualAuth);
+    return { settings: { branch_id: s.branchId, dual_auth: s.dualAuth } };
+  }
+
   /** Snake_case redemption row, matching the precedent in the SRD controller. */
   private toRedemptionRow(r: Redemption) {
     return {
@@ -168,6 +209,7 @@ export class LoyaltyController {
       approved_at: r.approvedAt,
       rejected_reason: r.rejectedReason,
       fulfilled_at: r.fulfilledAt,
+      redemption_code: r.redemptionCode,
       created_at: r.createdAt,
       updated_at: r.updatedAt,
     };
@@ -203,6 +245,52 @@ export class LoyaltyController {
       is_active: i.isActive,
       created_at: i.createdAt,
       updated_at: i.updatedAt,
+    };
+  }
+
+  /**
+   * Snake_case ledger view (BM-014): the customer's track, current figure, and the
+   * transaction history for that track. Only the array for the row's own track is
+   * populated; the other is empty.
+   */
+  private toLedgerView(v: LedgerView) {
+    return {
+      track: v.track,
+      customer_name: v.customerName,
+      points_balance: v.pointsBalance,
+      completed_cycles: v.completedCycles,
+      current_cycle_count: v.currentCycleCount,
+      household_transactions: v.householdTransactions.map((t) =>
+        this.toHouseholdTxnRow(t),
+      ),
+      commercial_purchases: v.commercialPurchases.map((p) =>
+        this.toCommercialPurchaseRow(p),
+      ),
+    };
+  }
+
+  /** Snake_case household points-ledger entry. */
+  private toHouseholdTxnRow(t: HouseholdPointTransaction) {
+    return {
+      id: t.id,
+      type: t.type,
+      points_delta: t.pointsDelta,
+      source_service_request_id: t.sourceServiceRequestId,
+      redemption_id: t.redemptionId,
+      earned_at: t.earnedAt,
+      expires_at: t.expiresAt,
+      created_at: t.createdAt,
+    };
+  }
+
+  /** Snake_case commercial purchase record. */
+  private toCommercialPurchaseRow(p: CommercialPurchaseRecord) {
+    return {
+      id: p.id,
+      service_request_id: p.serviceRequestId,
+      cycle_number: p.cycleNumber,
+      counted_at: p.countedAt,
+      created_at: p.createdAt,
     };
   }
 }
