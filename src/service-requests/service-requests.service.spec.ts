@@ -4,6 +4,7 @@ import {
   ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
+import { describe, expect, it, jest } from '@jest/globals';
 import { Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { CimService } from '../cim/cim.service';
@@ -81,9 +82,10 @@ describe('ServiceRequestsService', () => {
 
   const makeService = (
     repo: jest.Mocked<Repository<ServiceRequest>>,
+    history: jest.Mocked<Repository<ServiceRequestStatusHistory>>,
     fleet: jest.Mocked<FleetService>,
     cim: jest.Mocked<CimService>,
-  ) => new ServiceRequestsService(repo, fleet, cim, makePrices());
+  ) => new ServiceRequestsService(repo, history, fleet, cim, makePrices());
 
   const inBranchCustomer = (): Customer =>
     ({ id: 'cust-1', branchId: 'branch-uuid-1' }) as Customer;
@@ -398,6 +400,7 @@ describe('ServiceRequestsService', () => {
         history,
         makeFleet(null),
         makeCim(null),
+        makePrices(),
       );
 
       const result = await service.edit(principal(['branch-uuid-1']), 'sr-1', {
@@ -439,6 +442,7 @@ describe('ServiceRequestsService', () => {
         history,
         makeFleet(null),
         makeCim(null),
+        makePrices(),
       );
 
       await expect(
@@ -460,6 +464,7 @@ describe('ServiceRequestsService', () => {
         history,
         makeFleet(null),
         makeCim(null),
+        makePrices(),
       );
 
       await expect(
@@ -483,6 +488,7 @@ describe('ServiceRequestsService', () => {
         history,
         makeFleet(null),
         makeCim(null),
+        makePrices(),
       );
 
       const result = await service.cancel(principal(['branch-uuid-1']), 'sr-1', {
@@ -513,6 +519,7 @@ describe('ServiceRequestsService', () => {
         history,
         makeFleet(null),
         makeCim(null),
+        makePrices(),
       );
 
       await expect(
@@ -532,6 +539,7 @@ describe('ServiceRequestsService', () => {
         history,
         makeFleet(null),
         makeCim(null),
+        makePrices(),
       );
 
       await expect(
