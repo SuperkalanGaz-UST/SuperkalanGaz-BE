@@ -6,6 +6,7 @@ import {
 import { Principal } from '../auth/principal';
 import { CreateUserDto } from './dto/create-user.dto';
 import { ListUsersQuery } from './dto/list-users.query';
+import { UpdateOwnProfileDto } from './dto/update-own-profile.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { GoTrueAdminService, GoTrueUser } from './gotrue-admin.service';
 
@@ -21,6 +22,9 @@ export interface CrmUser {
   status: 'Active' | 'Inactive';
   createdAt: Date;
 }
+
+/** Current-user projection available directly from the already verified JWT. */
+export type OwnProfile = Omit<CrmUser, 'createdAt'>;
 
 function str(v: unknown): string | null {
   return typeof v === 'string' && v !== '' ? v : null;
@@ -71,6 +75,56 @@ export class UsersService {
     const user = await this.goTrue.getUser(id);
     if (!user || isBanned(user)) throw new NotFoundException('User not found');
     return toCrmUser(user);
+  }
+
+  private ownProfileFromPrincipal(principal: Principal): OwnProfile {
+    return {
+      id: principal.userId,
+      email: principal.email ?? null,
+      username: principal.username ?? null,
+      displayName: principal.displayName ?? null,
+      role: principal.role,
+      branches: principal.branches,
+      phone: principal.phone ?? null,
+      status: principal.status ?? 'Active',
+    };
+  }
+
+  /**
+   * Updates only the authenticated caller's personal fields. Trusted tenancy
+   * claims are copied from the existing record and cannot be supplied by the
+   * client, so a profile edit cannot widen role or branch access.
+   */
+  async updateOwnProfile(
+    principal: Principal,
+    dto: UpdateOwnProfileDto,
+  ): Promise<OwnProfile> {
+    const target = this.ownProfileFromPrincipal(principal);
+    const nextMetadata: Record<string, unknown> = {
+      username: target.username,
+      display_name: dto.name ?? target.displayName,
+      role: target.role,
+      branches: target.branches,
+      phone: dto.phone !== undefined ? dto.phone : target.phone,
+      status: target.status,
+    };
+
+    await this.goTrue.updateUser(principal.userId, {
+      ...(dto.email ? { email: dto.email } : {}),
+      app_metadata: nextMetadata,
+    });
+
+    return {
+      ...target,
+      email: dto.email ?? target.email,
+      displayName: dto.name ?? target.displayName,
+      phone: dto.phone !== undefined ? dto.phone : target.phone,
+    };
+  }
+
+  /** Changes only the authenticated caller's credential; no CRM claims move. */
+  async changeOwnPassword(principal: Principal, password: string): Promise<void> {
+    await this.goTrue.updateUser(principal.userId, { password });
   }
 
   async list(principal: Principal, query: ListUsersQuery): Promise<CrmUser[]> {

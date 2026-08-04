@@ -16,9 +16,11 @@ import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { CreateUserDto } from './dto/create-user.dto';
+import { ChangeOwnPasswordDto } from './dto/change-own-password.dto';
 import { ListUsersQuery } from './dto/list-users.query';
+import { UpdateOwnProfileDto } from './dto/update-own-profile.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
-import { CrmUser, UsersService } from './users.service';
+import { CrmUser, OwnProfile, UsersService } from './users.service';
 
 /**
  * Staff-account management. Response shapes intentionally match the legacy
@@ -45,6 +47,30 @@ export class UsersController {
   ): Promise<{ user: ReturnType<UsersController['toRow']> }> {
     const profile = await this.users.findById(principal.userId);
     return { user: this.toRow(profile) };
+  }
+
+  /**
+   * The authenticated administrator or owner may maintain only their own
+   * personal fields; role, branch scope, and status never come from this payload.
+   */
+  @Patch('me')
+  @Roles('franchise-admin', 'branch-owner')
+  async updateMe(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: UpdateOwnProfileDto,
+  ): Promise<{ user: ReturnType<UsersController['toOwnProfileRow']> }> {
+    const profile = await this.users.updateOwnProfile(principal, dto);
+    return { user: this.toOwnProfileRow(profile) };
+  }
+
+  @Patch('me/password')
+  @Roles('franchise-admin', 'branch-owner')
+  async changeMyPassword(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: ChangeOwnPasswordDto,
+  ): Promise<{ ok: true }> {
+    await this.users.changeOwnPassword(principal, dto.password);
+    return { ok: true };
   }
 
   @Get()
@@ -95,6 +121,19 @@ export class UsersController {
       phone: u.phone,
       status: u.status,
       created_at: u.createdAt,
+    };
+  }
+
+  private toOwnProfileRow(u: OwnProfile) {
+    return {
+      id: u.id,
+      email: u.email,
+      username: u.username,
+      display_name: u.displayName,
+      role: u.role,
+      branches: u.branches,
+      phone: u.phone,
+      status: u.status,
     };
   }
 }
