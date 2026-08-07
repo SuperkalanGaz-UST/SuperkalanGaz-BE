@@ -4,6 +4,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from './auth/auth.module';
 import { BranchesModule } from './branches/branches.module';
 import { CimModule } from './cim/cim.module';
+import { ExpensesModule } from './expenses/expenses.module';
 import { FleetModule } from './fleet/fleet.module';
 import { LoyaltyModule } from './loyalty/loyalty.module';
 import { NotificationsModule } from './notifications/notifications.module';
@@ -38,6 +39,7 @@ import { UsersModule } from './users/users.module';
     BranchesModule,
     ReferenceModule,
     CimModule,
+    ExpensesModule,
     FleetModule,
     ServiceRequestsModule,
     LoyaltyModule,

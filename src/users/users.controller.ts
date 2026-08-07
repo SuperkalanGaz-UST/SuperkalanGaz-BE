@@ -25,7 +25,8 @@ import { CrmUser, OwnProfile, UsersService } from './users.service';
 /**
  * Staff-account management. Response shapes intentionally match the legacy
  * Next.js /api/users handlers so the web dashboard needed no contract change.
- * BM has no access: managing accounts is FA/BO territory (AGENTS.md §7).
+ * BM has no access to account management: those endpoints remain FA/BO-only.
+ * Every staff role may still maintain its own personal profile and password.
  */
 @Controller('users')
 @UseGuards(AuthGuard, RolesGuard)
@@ -50,11 +51,11 @@ export class UsersController {
   }
 
   /**
-   * The authenticated administrator or owner may maintain only their own
-   * personal fields; role, branch scope, and status never come from this payload.
+   * Every authenticated staff persona may maintain only their own personal
+   * fields; role, branch scope, and status never come from this payload.
    */
   @Patch('me')
-  @Roles('franchise-admin', 'branch-owner')
+  @Roles('franchise-admin', 'branch-owner', 'branch-manager')
   async updateMe(
     @CurrentPrincipal() principal: Principal,
     @Body() dto: UpdateOwnProfileDto,
@@ -64,7 +65,7 @@ export class UsersController {
   }
 
   @Patch('me/password')
-  @Roles('franchise-admin', 'branch-owner')
+  @Roles('franchise-admin', 'branch-owner', 'branch-manager')
   async changeMyPassword(
     @CurrentPrincipal() principal: Principal,
     @Body() dto: ChangeOwnPasswordDto,
