@@ -11,13 +11,19 @@ const decimalTransformer = {
 export type OrderSource = 'Mobile App' | 'Walk-in/Phone';
 
 /** Lifecycle state of a Service Request. Advances along the SLA chain: later
- * slices move a row Pending → Dispatched → En Route → Delivered. */
+ * slices move a row Pending → Dispatched → En Route → Delivered. 'Under Review'
+ * is a side-branch set when a Branch Manager logs a lost/undelivered cylinder
+ * complaint against a Dispatched/En Route/Delivered order (story BM-021,
+ * journey BM-US-04) — it does NOT erase or overwrite delivered_at or any of the
+ * other SLA timestamps, which stay intact for reporting. There is no DB CHECK
+ * constraint on this column (plain text), so this union is the only guard. */
 export type ServiceRequestStatus =
   | 'Pending'
   | 'Dispatched'
   | 'En Route'
   | 'Delivered'
-  | 'Cancelled';
+  | 'Cancelled'
+  | 'Under Review';
 
 /**
  * Maps srd.service_requests — one row per LPG delivery order (a "Service
