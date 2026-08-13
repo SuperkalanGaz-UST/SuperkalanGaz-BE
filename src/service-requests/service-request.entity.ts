@@ -1,5 +1,10 @@
 import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
 
+const decimalTransformer = {
+  to: (value: number | null) => value,
+  from: (value: string | null) => (value === null ? null : Number(value)),
+};
+
 /** Channel an order came through — mandatory for channel-level SLA reporting
  * (AGENTS.md §8.2). Walk-in/phone intake is staff-initiated; the mobile app is
  * customer-initiated (later slice). */
@@ -37,8 +42,18 @@ export class ServiceRequest {
   @Column({ type: 'text', default: 'Pending' })
   status!: ServiceRequestStatus;
 
-  // Customer details are denormalized onto the order for now — the CIM module
-  // (customer profiles) is not built yet, so intake captures them inline.
+  /** Optional link to the CIM customer profile this order was filed against
+   * (stories BM-029..BM-032). Null for walk-in intake with no linked customer —
+   * that path is unchanged (story BM-005). No FK by design (AGENTS.md §6); the
+   * service validates the customer is live and in the SAME branch before
+   * persisting. The denormalized customer_* fields below remain the order's
+   * point-in-time snapshot even when this is set. */
+  @Column({ name: 'customer_id', type: 'uuid', nullable: true })
+  customerId!: string | null;
+
+  // Customer details are denormalized onto the order as a point-in-time snapshot.
+  // A CIM profile may now be linked via customer_id above, but these captured
+  // values are kept as-is so the order reflects what was entered at intake.
   @Column({ name: 'customer_name', type: 'text' })
   customerName!: string;
 
@@ -48,16 +63,42 @@ export class ServiceRequest {
   @Column({ name: 'delivery_address', type: 'text' })
   deliveryAddress!: string;
 
-  /** Plain string for MVP (e.g. "11kg"); a products/pricing catalog is deferred
-   * (AGENTS.md §13). */
+  /** Canonical product key; the amount fields below preserve the price used. */
   @Column({ name: 'cylinder_size', type: 'text' })
   cylinderSize!: string;
 
   @Column({ type: 'int' })
   quantity!: number;
 
+  @Column({
+    name: 'unit_price',
+    type: 'numeric',
+    precision: 10,
+    scale: 2,
+    nullable: true,
+    transformer: decimalTransformer,
+  })
+  unitPrice!: number | null;
+
+  @Column({
+    name: 'total_amount',
+    type: 'numeric',
+    precision: 12,
+    scale: 2,
+    nullable: true,
+    transformer: decimalTransformer,
+  })
+  totalAmount!: number | null;
+
   @Column({ name: 'special_instructions', type: 'text', nullable: true })
   specialInstructions!: string | null;
+
+  /** The rider assigned on dispatch (fleet.riders id). Null until dispatched;
+   * set alongside dispatched_at + status='Dispatched'. No FK by design
+   * (AGENTS.md §6) — the service validates the rider is live, Available, and in
+   * the same branch before persisting. */
+  @Column({ name: 'rider_id', type: 'uuid', nullable: true })
+  riderId!: string | null;
 
   // Four-timestamp SLA chain (AGENTS.md §8.2). requested_at is set on create;
   // the rest stay null until the dispatch / in-transit / delivery slices land.

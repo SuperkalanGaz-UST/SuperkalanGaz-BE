@@ -1,4 +1,21 @@
-import { IsInt, IsNotEmpty, IsOptional, IsString, Min } from 'class-validator';
+import {
+  IsInt,
+  IsIn,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Matches,
+  Min,
+} from 'class-validator';
+import { CYLINDER_SIZES, CylinderSize } from '../../prices/dto/update-prices.dto';
+
+/**
+ * Canonical PH mobile in E.164: +63 then the 10-digit national number (always
+ * starting 9). No spaces/dashes, no leading 0, no doubled +63 (AGENTS.md §16).
+ * The web form masks input and submits this normalized form; the DTO enforces it.
+ */
+const PH_MOBILE_E164 = /^\+639\d{9}$/;
 
 /**
  * Payload from the branch "New service request" (walk-in / phone) intake form.
@@ -9,23 +26,36 @@ import { IsInt, IsNotEmpty, IsOptional, IsString, Min } from 'class-validator';
  * the client (AGENTS.md §5, §8.2).
  */
 export class CreateServiceRequestDto {
+  /**
+   * OPTIONAL link to an existing CIM customer profile selected at intake
+   * (stories BM-029..BM-032). Walk-in intake without a linked customer must
+   * still work exactly as before (story BM-005), so this is optional — when
+   * present it must be a UUID, and the service validates it is a live customer in
+   * the caller's own branch. The denormalized customer_* fields below stay
+   * required regardless: they are the order's snapshot.
+   */
+  @IsOptional()
+  @IsUUID()
+  customerId?: string;
+
   @IsString()
   @IsNotEmpty()
   customerName!: string;
 
   @IsString()
   @IsNotEmpty()
+  @Matches(PH_MOBILE_E164, { message: 'customerContact must be a valid PH mobile in +639XXXXXXXXX form' })
   customerContact!: string;
 
   @IsString()
   @IsNotEmpty()
   deliveryAddress!: string;
 
-  // Plain string for MVP (e.g. "11kg"); a products/pricing catalog is deferred
-  // (AGENTS.md §13), so this is free text rather than a catalog reference.
+  // Canonical shared-catalog key. The server looks up the effective database
+  // price and snapshots it onto the request; the client never supplies money.
   @IsString()
-  @IsNotEmpty()
-  cylinderSize!: string;
+  @IsIn([...CYLINDER_SIZES])
+  cylinderSize!: CylinderSize;
 
   @IsInt()
   @Min(1)

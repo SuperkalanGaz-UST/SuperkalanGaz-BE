@@ -24,7 +24,7 @@ export interface BranchGeofence {
  * mapped here — they have no home in core.branches and are deferred (geofence is
  * a later delivery-zone feature; the threshold lives per-product on
  * inventory.stock_levels). Owner identity is not stored on the branch either: it
- * is provisioned into Supabase auth + public.profiles by the service.
+ * is provisioned into Supabase Auth (CRM claims in app_metadata) by the service.
  */
 @Entity({ schema: 'core', name: 'branches' })
 export class Branch {
@@ -77,6 +77,16 @@ export class Branch {
   /** Delivery coverage polygon (added in migration 0006). Null = none set. */
   @Column({ type: 'jsonb', nullable: true })
   geofence!: BranchGeofence | null;
+
+  /**
+   * Loyalty Dual Authorization setting (added in migration 0016, story BM-013).
+   * true (default) → customer redemption requests enter the Branch Manager's
+   * pending Rewards Claiming queue for manual approve/reject. false → the branch
+   * has delegated issuance: a request is auto-approved and coded immediately and
+   * never appears in the queue.
+   */
+  @Column({ name: 'loyalty_dual_auth', type: 'boolean', default: true })
+  loyaltyDualAuth!: boolean;
 
   @Column({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;

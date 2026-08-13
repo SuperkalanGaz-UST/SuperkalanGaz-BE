@@ -26,7 +26,7 @@ constraints must never be violated.
 | ---------------------- | ------------------------- | -------------------------------- |
 | `superkalan-crm-api`   | NestJS + TypeScript       | Backend, business logic, data    |
 | `superkalan-crm-web`   | Next.js (React)           | Internal staff dashboard (FA/BO/BM) |
-| `superkalan-crm-mobile`| React Native + Expo       | **Customer-only** mobile app     |
+| `SuperkalanGaz-Mobile` | React Native + Expo      | **Customer-only** mobile app     |
 
 Sections below are tagged `[api]`, `[web]`, `[mobile]`, or `[all]` where they apply.
 
@@ -46,6 +46,9 @@ Sections below are tagged `[api]`, `[web]`, `[mobile]`, or `[all]` where they ap
 6. **Don't invent resolutions to open questions.** See §13. If a needed decision is
    unresolved, ask rather than assume.
 7. **No hallucinated ITIL practices.** Only the four in §9 are implemented.
+8. **Respect repository boundaries.** The parent workspace is only a container—never create
+   application code in a root-level `src/`, `app/`, `pages/`, or `api/` directory. Backend,
+   web, and mobile files belong only in the repositories listed in §2.
 
 ---
 
@@ -56,6 +59,13 @@ Sections below are tagged `[api]`, `[web]`, `[mobile]`, or `[all]` where they ap
   SDK or PostgREST — it would bypass the branch-scoped JWT guard system. Connect via
   standard Postgres connection + TypeORM.
 - **Web:** Next.js (React).
+- **Web maps:** **MapLibre GL JS 5.x** is the renderer; **OpenFreeMap** supplies the
+  `liberty` style and hosted vector tiles; the geographic data is derived from
+  **OpenStreetMap**. These are separate roles: OpenStreetMap is not the renderer or the
+  tile host in this stack. Do not introduce Leaflet or request production tiles directly
+  from `tile.openstreetmap.org`. The browser loads the OpenFreeMap style/tiles; the NestJS
+  API only supplies CRM-owned coordinates/geofences. Geocoding is not currently
+  implemented and must be treated as a separate future decision.
 - **Mobile:** React Native + Expo (customers only).
 - **GPS:** **SinoTrack ST-901** hardware devices → **Traccar** (self-hosted middleware) →
   ingested by the API. These are two distinct things; never conflate them (§10).
@@ -87,6 +97,19 @@ Scoping by role (see §7 for full permissions):
 ## 6. Database Conventions `[api]`
 
 - **7 schemas:** `core`, `cim`, `srd`, `fleet`, `loyalty`, `csat`, `inventory` (23 tables).
+  All application tables live in exactly one of these. `core.branches` is the branch
+  table — never `public.branches`.
+- **The `public` schema MUST stay empty — no application tables, views, or functions.**
+  Supabase auto-exposes `public` over PostgREST, which the browser's anon/publishable key
+  can call directly, bypassing the NestJS branch-scoped guards (§5). Keeping `public` empty
+  removes that side-door entirely, so no per-table RLS lockdown is needed. Keep the 7 schemas
+  above OFF the Supabase API "Exposed schemas" list too, and they stay sealed as well.
+- **Identity is owned by Supabase Auth, not a `public.profiles` table.** The one row per
+  user lives in `auth.users`; CRM claims (role, branch scope, status) are stored in that
+  user's **`app_metadata`** (service-role-only — never `user_metadata`, which the user can
+  self-edit and would allow tenancy/privilege escalation). These claims ride in the verified
+  JWT, so the guard reads them from the token (§5) and never queries a mirror table. Manage
+  them through the GoTrue Admin API, never a `public.profiles` row or PostgREST.
 - **UUID primary keys** everywhere.
 - **No foreign-key constraints in the schema.** Referential integrity is enforced in the
   **NestJS service layer**. When writing services, validate referenced records exist and
@@ -231,13 +254,13 @@ propose an in-scope alternative.
 
 ## 13. Open Decisions — DO NOT ASSUME `[api]`
 
-These are unresolved. Do not silently pick one; ask or leave a `// DECISION PENDING` marker:
+The shared pricing decision is now resolved: `srd.products` is the system-wide
+catalog, and its effective price is snapshotted onto each order at creation.
+
+These remaining items are unresolved. Do not silently pick one; ask or leave a `// DECISION PENDING` marker:
 
 - **`branch_review_log`**: separate entity vs. a status field on the `branches` table.
   (Must be settled before UAT seeding.)
-- **`srd.products` pricing**: shared catalog vs. branch-independent. Current working
-  assumption is a **shared catalog with price snapshotted onto the order at creation time** —
-  confirm before relying on it.
 - Some **Section 1.2 operational figures** (order volume, delay minutes, follow-up %) are
   pending client confirmation; do not hardcode invented numbers as if verified.
 

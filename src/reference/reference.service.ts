@@ -43,8 +43,8 @@ export class ReferenceService {
    * lookups and no join/GROUP BY.
    *
    * We reference core.branches as a raw table (not the Branch entity) on
-   * purpose: that entity is still being reconciled with the live core schema
-   * (its committed shape targets public.branches), and the reference feature
+   * purpose: that entity is still being reconciled with the live core schema,
+   * and the reference feature
    * must not depend on that unresolved work — it only needs the provenance
    * column here. TODO(branches reconciliation): once core.branches has a settled
    * soft-delete column, AND a `b.<soft-delete> IS NULL` clause to the EXISTS so a

@@ -15,7 +15,7 @@ interface SeedRecord {
 }
 
 /**
- * Seeds public.known_store_locations from the captured snapshot JSON.
+ * Seeds core.known_store_locations from the captured snapshot JSON.
  *
  * IDEMPOTENT: the upsert key is full_address. Re-running never creates
  * duplicates — existing rows are updated in place, never deleted. Input is

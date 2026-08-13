@@ -1,7 +1,7 @@
 import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
 
 /**
- * Maps public.known_store_locations — a franchise-GLOBAL reference dataset of
+ * Maps core.known_store_locations — a franchise-GLOBAL reference dataset of
  * Superkalan's known store locations, captured once as a snapshot (never a live
  * feed from superkalan.com). It feeds the branch-registration combobox so a
  * Franchise Admin can autofill address + province when provisioning a branch.

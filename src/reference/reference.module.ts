@@ -8,9 +8,9 @@ import { ReferenceService } from './reference.service';
 /**
  * Reference data module (franchise-global). Provides the read-only known
  * store-location lookup that backs the branch-registration combobox. AuthModule
- * supplies the AuthGuard (and the Profile repository it needs). The Branch
- * entity used in the already_registered join is loaded globally via
- * autoLoadEntities, so it is not re-registered here.
+ * supplies the AuthGuard (which builds the Principal from the JWT's app_metadata
+ * claims). The Branch entity used in the already_registered join is loaded
+ * globally via autoLoadEntities, so it is not re-registered here.
  */
 @Module({
   imports: [TypeOrmModule.forFeature([KnownStoreLocation]), AuthModule],
