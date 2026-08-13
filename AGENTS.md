@@ -59,6 +59,13 @@ Sections below are tagged `[api]`, `[web]`, `[mobile]`, or `[all]` where they ap
   SDK or PostgREST — it would bypass the branch-scoped JWT guard system. Connect via
   standard Postgres connection + TypeORM.
 - **Web:** Next.js (React).
+- **Web maps:** **MapLibre GL JS 5.x** is the renderer; **OpenFreeMap** supplies the
+  `liberty` style and hosted vector tiles; the geographic data is derived from
+  **OpenStreetMap**. These are separate roles: OpenStreetMap is not the renderer or the
+  tile host in this stack. Do not introduce Leaflet or request production tiles directly
+  from `tile.openstreetmap.org`. The browser loads the OpenFreeMap style/tiles; the NestJS
+  API only supplies CRM-owned coordinates/geofences. Geocoding is not currently
+  implemented and must be treated as a separate future decision.
 - **Mobile:** React Native + Expo (customers only).
 - **GPS:** **SinoTrack ST-901** hardware devices → **Traccar** (self-hosted middleware) →
   ingested by the API. These are two distinct things; never conflate them (§10).
