@@ -7,6 +7,7 @@ import { CimModule } from './cim/cim.module';
 import { ExpensesModule } from './expenses/expenses.module';
 import { FleetModule } from './fleet/fleet.module';
 import { LoyaltyModule } from './loyalty/loyalty.module';
+import { CsatModule } from './csat/csat.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { PricesModule } from './prices/prices.module';
 import { ReferenceModule } from './reference/reference.module';
@@ -43,6 +44,7 @@ import { UsersModule } from './users/users.module';
     FleetModule,
     ServiceRequestsModule,
     LoyaltyModule,
+    CsatModule,
     NotificationsModule,
     PricesModule,
   ],
