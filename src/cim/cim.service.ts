@@ -33,30 +33,39 @@ export class CimService {
   ) {}
 
   /**
-   * Search the caller's branch(es) for customers whose name OR contact_number
-   * matches the term (case-insensitive substring), excluding soft-deleted rows,
-   * ordered by name and capped at 20. The term is validated (required, >= 2
-   * chars) by SearchCustomersQuery upstream. Branch scope comes from the
-   * principal; request input can never widen it (AGENTS.md §5).
+   * List / search the caller's branch(es) for customers, excluding soft-deleted
+   * rows, ordered by name. Two modes on the same handler:
+   *  - with a term (>= 2 chars, validated upstream): the intake autocomplete —
+   *    name OR contact_number case-insensitive substring, capped at 20;
+   *  - without a term: the CIM Customers directory (BM-031) — the whole branch,
+   *    capped at 200 so it stays bounded.
+   * Branch scope comes from the principal; request input can never widen it
+   * (AGENTS.md §5).
    */
   async search(
     principal: Principal,
     query: SearchCustomersQuery,
   ): Promise<CustomerListItem[]> {
     const branchIds = this.requireBranches(principal);
-    const term = `%${query.search.trim()}%`;
-
-    // Each OR branch must carry the full scope (branch + soft-delete); an ILIKE
-    // on name in one and on contact_number in the other. TypeORM ORs the array.
+    const term = query.search?.trim();
     const scope = { branchId: In(branchIds), deletedAt: IsNull() };
-    const customers = await this.customers.find({
-      where: [
-        { ...scope, name: ILike(term) },
-        { ...scope, contactNumber: ILike(term) },
-      ],
-      order: { name: 'ASC' },
-      take: 20,
-    });
+
+    // No term → full branch directory (bounded). With a term → name/contact match.
+    // Each OR branch must carry the full scope (branch + soft-delete).
+    const customers = term
+      ? await this.customers.find({
+          where: [
+            { ...scope, name: ILike(`%${term}%`) },
+            { ...scope, contactNumber: ILike(`%${term}%`) },
+          ],
+          order: { name: 'ASC' },
+          take: 20,
+        })
+      : await this.customers.find({
+          where: scope,
+          order: { name: 'ASC' },
+          take: 200,
+        });
     if (customers.length === 0) return [];
 
     const lastOrders = await this.lastOrderDates(customers.map((c) => c.id));
