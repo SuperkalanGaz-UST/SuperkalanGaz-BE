@@ -1,17 +1,33 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, LessThanOrEqual, Repository } from 'typeorm';
+import { DataSource, In, LessThanOrEqual, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Rating } from './rating.entity';
+import { Incident } from './incident.entity';
 import { ServiceRequest } from '../service-requests/service-request.entity';
 import { Rider } from '../fleet/rider.entity';
 import { ListRatingsQuery } from './dto/list-ratings.query';
 import { ResolveRatingDto } from './dto/resolve-rating.dto';
+import { CreateIncidentDto } from './dto/create-incident.dto';
+import { ListIncidentsQuery } from './dto/list-incidents.query';
+
+/** Service Request statuses a complaint may be logged against (BM-US-04 AC1:
+ * "any closed or active Service Request"). Interpreted as Dispatched/En Route
+ * (active — a delivery is under way) or Delivered (closed — completed); Pending
+ * is excluded (nothing has been dispatched to lose yet) and Cancelled is excluded
+ * (no cylinder was ever in transit). Stated as an interpretation call in the PR. */
+const COMPLAINT_ELIGIBLE_STATUSES = ['Dispatched', 'En Route', 'Delivered'];
+
+/** The Service Request status a complaint submission sets (story BM-021,
+ * consolidated AC3's literal value — see the PR for why this was chosen over
+ * the granular story's hedged "e.g. Incident Flagged or Disputed"). */
+const UNDER_REVIEW_STATUS = 'Under Review';
 
 /** The low-CSAT band the Branch Manager follow-up queue surfaces by default
  * (story BM-038: "deliveries with 1–3 star ratings"). */
@@ -41,26 +57,48 @@ export interface CsatSummary {
 }
 
 /**
- * CSAT Feedback & Analytics module — the Branch Manager's closed-loop follow-up
- * on low-rated deliveries (journey BM-US-08). Ratings are submitted by CUSTOMERS
- * on mobile (AGENTS.md §7); this service never creates them. It reads them,
- * surfaces the low-CSAT band with delivery context, and records the BM's
- * resolution.
+ * An incident enriched for the Branch Manager's review (journey BM-US-04): the
+ * complaint plus the customer name and the associated Service Request context,
+ * the same shape RatingListItem carries for BM-039. The controller flattens this
+ * into the snake_case row.
+ */
+export interface IncidentListItem {
+  incident: Incident;
+  customerName: string | null;
+  serviceRequest: ServiceRequest | null;
+  riderName: string | null;
+}
+
+/**
+ * CSAT Feedback & Analytics module — two Branch Manager follow-up flows on the
+ * same epic:
+ *  - closed-loop follow-up on low-rated deliveries (journey BM-US-08). Ratings
+ *    are submitted by CUSTOMERS on mobile (AGENTS.md §7); this service never
+ *    creates them, only reads and resolves them.
+ *  - logging a lost/undelivered cylinder complaint against a delivery (journey
+ *    BM-US-04). Unlike ratings, incidents ARE created here — by the Branch
+ *    Manager, not the customer — and the write is transactional with flipping
+ *    the linked Service Request's status to 'Under Review'.
  *
  * All scoping derives from the verified Principal, never from request input
  * (AGENTS.md §5). Isolation is enforced here in the application layer, not by the
- * DB — a missing branch filter is a cross-tenant leak. The resolve transition
- * uses a race-safe conditional UPDATE.
+ * DB — a missing branch filter is a cross-tenant leak. State transitions use
+ * race-safe conditional UPDATEs.
  */
 @Injectable()
 export class CsatService {
   constructor(
     @InjectRepository(Rating)
     private readonly ratings: Repository<Rating>,
+    @InjectRepository(Incident)
+    private readonly incidents: Repository<Incident>,
     @InjectRepository(ServiceRequest)
     private readonly serviceRequests: Repository<ServiceRequest>,
     @InjectRepository(Rider)
     private readonly riders: Repository<Rider>,
+    // The complaint-logging transaction spans two tables (incidents + the linked
+    // Service Request's status), so it needs a transaction that covers both.
+    private readonly dataSource: DataSource,
   ) {}
 
   /**
@@ -200,6 +238,182 @@ export class CsatService {
         : null,
       totalRatings: rows.length,
     };
+  }
+
+  /**
+   * Log a complaint against a delivery (journey BM-US-04, stories BM-019/020/021
+   * combined into one atomic action). Locating the SR (BM-019) is done by the
+   * caller via the existing Orders queue — this method just validates the id it
+   * receives. The free-text description doubles as BM-020's "resolution note".
+   *
+   * TRANSACTIONAL — mutates two tables atomically:
+   *  (a) insert the csat.incidents row (status='open', priority='medium').
+   *  (b) flip the linked Service Request's status to 'Under Review' (BM-021),
+   *      race-safe: 0 rows affected (already actioned by a concurrent request,
+   *      or the SR moved out of the eligible-status set) => 409, rolls back.
+   *
+   * Integrity checks in the service layer (no FK constraints, AGENTS.md §6):
+   *  - the Service Request must exist in the caller's own branch — else 404;
+   *  - it must be Dispatched, En Route, or Delivered — "closed or active" per
+   *    BM-US-04 AC1 (interpretation call — see the PR) — else 400.
+   */
+  async createIncident(
+    principal: Principal,
+    dto: CreateIncidentDto,
+  ): Promise<Incident> {
+    const branchIds = this.requireBranches(principal);
+
+    return this.dataSource.transaction(async (manager) => {
+      const sr = await manager.findOne(ServiceRequest, {
+        where: { id: dto.serviceRequestId, branchId: In(branchIds) },
+      });
+      if (!sr) throw new NotFoundException('Service request not found');
+      if (!COMPLAINT_ELIGIBLE_STATUSES.includes(sr.status)) {
+        throw new BadRequestException(
+          `Cannot log a complaint against a service request that is ${sr.status}`,
+        );
+      }
+
+      const now = new Date();
+      const incident = await manager.save(
+        Incident,
+        manager.create(Incident, {
+          branchId: sr.branchId,
+          customerId: sr.customerId,
+          serviceRequestId: sr.id,
+          category: dto.category,
+          description: dto.description,
+          status: 'open',
+          priority: 'medium',
+          reportedAt: now,
+          firstResponseAt: null,
+          resolvedAt: null,
+          assignedTo: null,
+          resolutionNote: null,
+          escalated: false,
+          escalatedAt: null,
+          createdAt: now,
+          updatedAt: now,
+        }),
+      );
+
+      // (b) Race-safe: only flip status if the SR is still in an eligible state —
+      // re-validated at commit time, not just at the read above (AGENTS.md §8a).
+      const updated = await manager
+        .createQueryBuilder()
+        .update(ServiceRequest)
+        .set({ status: UNDER_REVIEW_STATUS, updatedAt: now })
+        .where(
+          'id = :id AND branch_id IN (:...branchIds) AND status IN (:...eligible)',
+          { id: sr.id, branchIds, eligible: COMPLAINT_ELIGIBLE_STATUSES },
+        )
+        .execute();
+      if (!updated.affected) {
+        throw new ConflictException(
+          'Service request status changed before the complaint could be logged',
+        );
+      }
+
+      return incident;
+    });
+  }
+
+  /**
+   * The Branch Manager's incident queue: complaints for the caller's branch(es),
+   * newest first, defaulting to 'open'. Each row is enriched with the customer
+   * name and the associated Service Request + rider, the same context BM-039
+   * provides for ratings.
+   */
+  async listIncidents(
+    principal: Principal,
+    query: ListIncidentsQuery,
+  ): Promise<IncidentListItem[]> {
+    const branchIds = this.requireBranches(principal);
+    const status = query.status ?? 'open';
+
+    const incidents = await this.incidents.find({
+      where: {
+        branchId: In(branchIds),
+        ...(status === 'all' ? {} : { status }),
+      },
+      order: { reportedAt: 'DESC' },
+      take: 200,
+    });
+    if (incidents.length === 0) return [];
+
+    const customerIds = [
+      ...new Set(
+        incidents.map((i) => i.customerId).filter((id): id is string => id !== null),
+      ),
+    ];
+    const serviceRequestIds = [
+      ...new Set(
+        incidents
+          .map((i) => i.serviceRequestId)
+          .filter((id): id is string => id !== null),
+      ),
+    ];
+
+    const [customerNames, serviceRequests] = await Promise.all([
+      this.customerNames(branchIds, customerIds),
+      this.serviceRequests.find({
+        where: { id: In(serviceRequestIds), branchId: In(branchIds) },
+      }),
+    ]);
+    const srById = new Map(serviceRequests.map((sr) => [sr.id, sr]));
+
+    const riderIds = [
+      ...new Set(
+        serviceRequests
+          .map((sr) => sr.riderId)
+          .filter((id): id is string => id !== null),
+      ),
+    ];
+    const riderNames = await this.riderNames(branchIds, riderIds);
+
+    return incidents.map((incident) => {
+      const sr = incident.serviceRequestId ? (srById.get(incident.serviceRequestId) ?? null) : null;
+      return {
+        incident,
+        customerName: incident.customerId ? (customerNames.get(incident.customerId) ?? null) : null,
+        serviceRequest: sr,
+        riderName: sr?.riderId ? (riderNames.get(sr.riderId) ?? null) : null,
+      };
+    });
+  }
+
+  /**
+   * Flag an incident as escalated outside the system (story BM-022). Records
+   * the flag + timestamp ONLY — no external API calls, no notifications, per the
+   * story's explicit "do not overclaim this feature" note. Race-safe: 0 rows
+   * affected (already escalated) => 409. 404 if outside the caller's branch.
+   */
+  async escalateIncident(principal: Principal, id: string): Promise<Incident> {
+    const branchIds = this.requireBranches(principal);
+
+    const incident = await this.incidents.findOne({
+      where: { id, branchId: In(branchIds) },
+    });
+    if (!incident) throw new NotFoundException('Incident not found');
+
+    const now = new Date();
+    const result = await this.incidents
+      .createQueryBuilder()
+      .update(Incident)
+      .set({ escalated: true, escalatedAt: now, updatedAt: now })
+      .where('id = :id AND branch_id IN (:...branchIds) AND escalated = false', {
+        id,
+        branchIds,
+      })
+      .execute();
+    if (!result.affected) {
+      throw new ConflictException('Incident is already escalated');
+    }
+
+    incident.escalated = true;
+    incident.escalatedAt = now;
+    incident.updatedAt = now;
+    return incident;
   }
 
   /**

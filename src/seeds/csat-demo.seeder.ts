@@ -5,7 +5,16 @@ import { AppModule } from '../app.module';
 import { Branch } from '../branches/branch.entity';
 import { Customer } from '../cim/customer.entity';
 import { Rating } from '../csat/rating.entity';
+import { Incident } from '../csat/incident.entity';
 import { ServiceRequest } from '../service-requests/service-request.entity';
+
+/**
+ * Preferred demo branch: the login the developer/reviewer actually has access
+ * to (Pedro Cruz / manager@superkalan.com is scoped to this branch). Falls back
+ * to "first active branch with a live customer" if this one doesn't exist yet —
+ * see the branch-selection logic below.
+ */
+const PREFERRED_BRANCH_NAME = 'Amadeo, Cavite';
 
 /**
  * The demo feedback set. A rating only makes sense against a COMPLETED delivery,
@@ -36,21 +45,52 @@ const DEMO_CUSTOMER = {
 };
 
 /**
- * Seeds the CSAT follow-up queue for a demo (journey BM-US-08): a handful of
- * Delivered service requests and the customer ratings of them, including three in
- * the low-CSAT band (1–3 stars) left Open so the Branch Manager's queue is
- * non-empty on first load.
+ * The demo incident set (journey BM-US-04): a lost/undelivered cylinder
+ * complaint logged against its OWN Delivered service request — deliberately
+ * separate from the FEEDBACK ratings above so the Ratings and Incidents views
+ * each show their own clean, non-overlapping demo story. Left Open and
+ * un-escalated so the Branch Manager can click through Escalate live.
+ */
+const INCIDENTS: {
+  category: 'lost_cylinder';
+  description: string;
+  cylinderSize: string;
+  quantity: number;
+  daysAgo: number;
+}[] = [
+  {
+    category: 'lost_cylinder',
+    description: 'Customer called saying the cylinder never arrived even though the rider marked the order as delivered. Following up with the rider.',
+    cylinderSize: '11kg',
+    quantity: 1,
+    daysAgo: 1,
+  },
+];
+
+/**
+ * Seeds demo data for both CSAT journeys:
+ *  - BM-US-08 (low-CSAT follow-up): a handful of Delivered service requests and
+ *    the customer ratings of them, including three in the low-CSAT band (1–3
+ *    stars) left Open so the Branch Manager's Ratings queue is non-empty.
+ *  - BM-US-04 (lost/undelivered cylinder): one complaint logged against its own
+ *    fresh Delivered service request (flipped to 'Under Review', mirroring the
+ *    real API), left Open and un-escalated so the Branch Manager's Incidents
+ *    queue is demoable and Escalate can be clicked live.
  *
  * Ratings are normally submitted by customers on mobile — this seeder stands in
- * for that client, which does not exist yet. It is the ONLY place this API writes
- * a rating (the CRM itself never creates them).
+ * for that client, which does not exist yet. Incidents are normally logged by
+ * the Branch Manager via the Orders screen's "Log Complaint" action — this
+ * seeder stands in for that click so the Incidents queue isn't empty on first
+ * load.
  *
- * IDEMPOTENT. Re-running never duplicates: each feedback entry is keyed by
- * (branch, customer, stars, comment) — an existing rating is left exactly as it
- * is, including any resolution a BM already recorded against it.
+ * IDEMPOTENT. Re-running never duplicates: each rating is keyed by (branch,
+ * customer, stars, comment); each incident is keyed by (branch, customer,
+ * description). An existing row is left exactly as-is, including any
+ * resolution/escalation a BM already recorded against it.
  *
- * Targets the first active branch that has a live customer, falling back to
- * planting one. Run standalone (no HTTP server): npm run seed:csat-demo
+ * Targets PREFERRED_BRANCH_NAME ("Amadeo, Cavite" — the branch the developer
+ * actually has a working login for), falling back to the first active branch
+ * with a live customer. Run standalone (no HTTP server): npm run seed:csat-demo
  */
 async function run(): Promise<void> {
   const app = await NestFactory.createApplicationContext(AppModule, {
@@ -61,6 +101,7 @@ async function run(): Promise<void> {
     const branches = app.get<Repository<Branch>>(getRepositoryToken(Branch));
     const customers = app.get<Repository<Customer>>(getRepositoryToken(Customer));
     const ratings = app.get<Repository<Rating>>(getRepositoryToken(Rating));
+    const incidents = app.get<Repository<Incident>>(getRepositoryToken(Incident));
     const serviceRequests = app.get<Repository<ServiceRequest>>(
       getRepositoryToken(ServiceRequest),
     );
@@ -74,19 +115,26 @@ async function run(): Promise<void> {
       return;
     }
 
-    // Prefer a branch that already has a live customer, so the demo data hangs off
-    // a real profile rather than a synthetic one.
-    let branch = activeBranches[0];
-    let customer: Customer | null = null;
-    for (const b of activeBranches) {
-      const c = await customers.findOne({
-        where: { branchId: b.id, deletedAt: IsNull() },
-        order: { createdAt: 'ASC' },
-      });
-      if (c) {
-        branch = b;
-        customer = c;
-        break;
+    // Prefer the branch the developer/reviewer can actually log into
+    // (PREFERRED_BRANCH_NAME); otherwise fall back to the first active branch
+    // that already has a live customer, so the demo data hangs off a real
+    // profile rather than a synthetic one.
+    let branch = activeBranches.find((b) => b.name === PREFERRED_BRANCH_NAME) ?? activeBranches[0];
+    let customer: Customer | null = await customers.findOne({
+      where: { branchId: branch.id, deletedAt: IsNull() },
+      order: { createdAt: 'ASC' },
+    });
+    if (!customer) {
+      for (const b of activeBranches) {
+        const c = await customers.findOne({
+          where: { branchId: b.id, deletedAt: IsNull() },
+          order: { createdAt: 'ASC' },
+        });
+        if (c) {
+          branch = b;
+          customer = c;
+          break;
+        }
       }
     }
 
@@ -186,10 +234,85 @@ async function run(): Promise<void> {
       where: { branchId: branch.id, resolutionStatus: 'Open' },
     });
 
+    // --- Incidents (journey BM-US-04): each on its OWN fresh Delivered service
+    //     request, kept separate from the rating-linked ones above. ---
+    let incidentsCreated = 0;
+    let incidentsSkipped = 0;
+
+    for (const inc of INCIDENTS) {
+      // Idempotency key: this customer + this exact description in this branch.
+      const existing = await incidents.findOne({
+        where: { branchId: branch.id, customerId: customer.id, description: inc.description },
+      });
+      if (existing) {
+        incidentsSkipped++;
+        continue;
+      }
+
+      const requestedAt = new Date(now.getTime() - inc.daysAgo * 24 * 60 * 60 * 1000);
+      const dispatchedAt = new Date(requestedAt.getTime() + 20 * 60 * 1000);
+      const inTransitAt = new Date(requestedAt.getTime() + 35 * 60 * 1000);
+      const deliveredAt = new Date(requestedAt.getTime() + 90 * 60 * 1000);
+
+      const sr = await serviceRequests.save(
+        serviceRequests.create({
+          branchId: branch.id,
+          orderSource: 'Walk-in/Phone',
+          status: 'Delivered',
+          customerId: customer.id,
+          customerName: customer.name,
+          customerContact: customer.contactNumber,
+          deliveryAddress: customer.deliveryAddress,
+          cylinderSize: inc.cylinderSize,
+          quantity: inc.quantity,
+          unitPrice: null,
+          totalAmount: null,
+          specialInstructions: null,
+          riderId: null,
+          requestedAt,
+          dispatchedAt,
+          inTransitAt,
+          deliveredAt,
+          createdAt: requestedAt,
+          updatedAt: deliveredAt,
+          deletedAt: null,
+        }),
+      );
+
+      await incidents.save(
+        incidents.create({
+          branchId: branch.id,
+          customerId: customer.id,
+          serviceRequestId: sr.id,
+          category: inc.category,
+          description: inc.description,
+          status: 'open',
+          priority: 'medium',
+          reportedAt: new Date(deliveredAt.getTime() + 45 * 60 * 1000),
+          firstResponseAt: null,
+          resolvedAt: null,
+          assignedTo: null,
+          resolutionNote: null,
+          escalated: false,
+          escalatedAt: null,
+          createdAt: new Date(deliveredAt.getTime() + 45 * 60 * 1000),
+          updatedAt: new Date(deliveredAt.getTime() + 45 * 60 * 1000),
+        }),
+      );
+      // Complaint logging flips the SR to Under Review (story BM-021) — the seed
+      // mirrors the real API's side effect so the Orders screen shows the same
+      // state a live BM-created complaint would leave behind.
+      sr.status = 'Under Review';
+      sr.updatedAt = new Date(deliveredAt.getTime() + 45 * 60 * 1000);
+      await serviceRequests.save(sr);
+      incidentsCreated++;
+    }
+
     console.log(
       `[seed] csat-demo — branch "${branch.name}", customer "${customer.name}"; ` +
         `ratings created: ${created}, already present: ${skipped}; ` +
-        `open ratings in branch: ${lowOpen}`,
+        `open ratings in branch: ${lowOpen}; ` +
+        `incidents created: ${incidentsCreated}, already present: ${incidentsSkipped}`,
     );
   } finally {
     await app.close();
