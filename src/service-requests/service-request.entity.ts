@@ -128,4 +128,27 @@ export class ServiceRequest {
 
   @Column({ name: 'deleted_at', type: 'timestamptz', nullable: true })
   deletedAt!: Date | null;
+
+  /** The Branch Manager's logged delay reason (story BM-011), a combined
+   * "category: note" display string. Null until a delay reason is logged. */
+  @Column({ name: 'delay_reason', type: 'text', nullable: true })
+  delayReason!: string | null;
+
+  /**
+   * PERSISTED SLA breach record (story BM-012). Computed once, at delivery,
+   * from the four real SLA timestamps against core.sla_configurations — see
+   * ServiceRequestsService.deliver(). Because reassignment never touches
+   * dispatched_at/in_transit_at/delivered_at, this record survives any later
+   * reassignment untouched ("the original SLA breach is not erased").
+   * sla_breach_segment is the FIRST segment found in breach, chronologically:
+   * 'request_to_dispatch' | 'dispatch_to_in_transit' | 'in_transit_to_delivery'.
+   */
+  @Column({ name: 'sla_breached', type: 'boolean', default: false })
+  slaBreached!: boolean;
+
+  @Column({ name: 'sla_breach_segment', type: 'text', nullable: true })
+  slaBreachSegment!: string | null;
+
+  @Column({ name: 'sla_breached_at', type: 'timestamptz', nullable: true })
+  slaBreachedAt!: Date | null;
 }
