@@ -68,6 +68,20 @@ export class FleetService {
   }
 
   /**
+   * Look up a rider by id, scoped to the SAME branch, regardless of their
+   * current status. Used by the SRD reassignment flow (story BM-010) to load
+   * the CURRENTLY assigned rider — who is 'On Delivery', not 'Available', so
+   * findAssignableRider (status-filtered) cannot find them. Mirrors
+   * CimService.findInBranch's naming/shape. Returns null if unknown,
+   * soft-deleted, or in another branch.
+   */
+  async findInBranch(riderId: string, branchId: string): Promise<Rider | null> {
+    return this.riders.findOne({
+      where: { id: riderId, branchId, deletedAt: IsNull() },
+    });
+  }
+
+  /**
    * Flip a rider to 'On Delivery' so they drop out of the Available list once
    * dispatched — prevents another Service Request picking the same rider. The
    * rider returns to 'Available' in the later "mark delivered" slice (Slice 3).

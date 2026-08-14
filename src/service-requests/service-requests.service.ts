@@ -15,14 +15,36 @@ import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
 import { EditServiceRequestDto } from './dto/edit-service-request.dto';
 import { CancelServiceRequestDto } from './dto/cancel-service-request.dto';
+import { ReassignServiceRequestDto } from './dto/reassign-service-request.dto';
+import { LogDelayReasonDto } from './dto/log-delay-reason.dto';
 import { ServiceRequest } from './service-request.entity';
 import { ServiceRequestStatusHistory } from './service-request-status-history.entity';
+import { SlaConfiguration, SlaSegment } from './sla-configuration.entity';
+
+/** Human labels for the delay-reason dropdown categories, used to build the
+ * single combined `delay_reason` display string (story BM-011). */
+const DELAY_REASON_LABELS: Record<string, string> = {
+  traffic: 'Traffic',
+  weather: 'Weather',
+  customer_unavailable: 'Customer unavailable',
+  vehicle_issue: 'Vehicle issue',
+  address_issue: 'Address issue',
+  other: 'Other',
+};
+
+/** Resolved SLA thresholds for one branch, keyed by segment. A missing key
+ * means no active 'all'-channel threshold is configured (branch-specific or
+ * global) for that segment — treated as "cannot breach" (fails quiet, never
+ * flags a false breach from missing configuration). */
+type ThresholdMap = Partial<Record<SlaSegment, number>>;
 
 /**
- * Service Request intake & queue (SRD module). This slice covers create
- * (walk-in / phone intake), the branch queue list, and detail lookup. Rider
- * assignment, dispatch, in-transit and delivery are later slices — they will
- * populate the trailing SLA timestamps left null here.
+ * Service Request intake & queue (SRD module). Covers create (walk-in / phone
+ * intake), the branch queue, detail lookup, dispatch/deliver, pre-dispatch
+ * edit/cancel (BM-US-07), and the delayed-delivery journey (BM-US-02):
+ * live SLA-at-risk flagging on the queue (BM-008), rider reassignment
+ * (BM-010), delay-reason logging (BM-011), and the persisted SLA breach
+ * record (BM-012).
  *
  * All scoping derives from the verified Principal, never from request
  * params/body (AGENTS.md §5). Isolation is enforced here in the application
@@ -34,9 +56,15 @@ export class ServiceRequestsService {
     @InjectRepository(ServiceRequest)
     private readonly serviceRequests: Repository<ServiceRequest>,
     // Append-only audit trail for guarded lifecycle actions (edit / cancel,
-    // BM-US-07). Maps the existing srd.service_request_status_history table.
+    // BM-US-07; reassign / delay-reason, BM-US-02). Maps the existing
+    // srd.service_request_status_history table.
     @InjectRepository(ServiceRequestStatusHistory)
     private readonly statusHistory: Repository<ServiceRequestStatusHistory>,
+    // READ-ONLY: the Franchise Administrator's configured SLA breach
+    // thresholds (BM-008's "configured breach threshold" — explicitly
+    // FA-owned per the story). This module never writes to this table.
+    @InjectRepository(SlaConfiguration)
+    private readonly slaConfigurations: Repository<SlaConfiguration>,
     // Reused to validate a rider at dispatch time and flip them to 'On Delivery'
     // — mirrors how BranchesService reuses GoTrueAdminService across modules.
     private readonly fleet: FleetService,
@@ -119,6 +147,40 @@ export class ServiceRequestsService {
     return this.serviceRequests.find({
       where: { branchId: In(branchIds), deletedAt: IsNull() },
       order: { requestedAt: 'DESC' },
+    });
+  }
+
+  /**
+   * The queue, enriched with a LIVE (non-persisted) "at risk" flag for
+   * still-in-flight requests (story BM-008: "has been Pending or En Route
+   * longer than the configured SLA threshold"). Dispatched is treated the same
+   * as En Route — the GPS/Traccar pipeline that would transition a request to
+   * 'En Route' is hardware-deferred (AGENTS.md §8), so in practice a request
+   * never leaves 'Dispatched' before delivery; excluding it would make this
+   * flag never fire (interpretation call, stated in the PR).
+   *
+   * This flag is computed fresh on every call — it is NOT the persisted
+   * sla_breached column (that is written once, at delivery, by deliver()
+   * below; see BM-012). Delivered/Cancelled/Under Review rows always read
+   * slaAtRisk=false here; their permanent record is on the row itself.
+   */
+  async listWithSlaRisk(
+    principal: Principal,
+  ): Promise<{ serviceRequest: ServiceRequest; slaAtRisk: boolean; slaAtRiskSegment: SlaSegment | null }[]> {
+    const branchIds = this.requireBranches(principal);
+    const requests = await this.list(principal);
+    if (requests.length === 0) return [];
+
+    const thresholdsByBranch = await this.resolveThresholdsForBranches(branchIds);
+    const now = new Date();
+
+    return requests.map((sr) => {
+      const { atRisk, segment } = this.computeAtRisk(
+        sr,
+        thresholdsByBranch.get(sr.branchId) ?? {},
+        now,
+      );
+      return { serviceRequest: sr, slaAtRisk: atRisk, slaAtRiskSegment: segment };
     });
   }
 
@@ -243,6 +305,13 @@ export class ServiceRequestsService {
    * PANEL-CHECK: BM-007's CSAT rating prompt to the customer is a customer MOBILE
    * concern (customers are mobile-only, AGENTS.md §7) — it is deliberately NOT
    * triggered from this backend endpoint. Out of scope for this slice.
+   *
+   * Also PERSISTS the SLA breach record here (story BM-012 — "the delivery is
+   * eventually completed"): computed once, from the four real timestamps, and
+   * written only if not already breached. Because reassign() (below) never
+   * touches these timestamps, this computation — and the record it writes —
+   * is unaffected by any reassignment that happened along the way ("the
+   * original SLA breach is not erased").
    */
   async deliver(principal: Principal, id: string): Promise<ServiceRequest> {
     const branchIds = this.requireBranches(principal);
@@ -287,6 +356,188 @@ export class ServiceRequestsService {
     // Reflect the committed state back to the caller without a re-read.
     serviceRequest.deliveredAt = now;
     serviceRequest.status = 'Delivered';
+    serviceRequest.updatedAt = now;
+
+    // 5. Persist the SLA breach record (BM-012), using the now-complete four
+    //    timestamps. Best-effort: a threshold lookup failure must never block
+    //    the delivery itself, so this runs after the commit and swallows its
+    //    own errors.
+    try {
+      const breach = await this.computeBreach(serviceRequest);
+      if (breach) {
+        await this.serviceRequests.update(
+          { id },
+          {
+            slaBreached: true,
+            slaBreachSegment: breach.segment,
+            slaBreachedAt: now,
+          },
+        );
+        serviceRequest.slaBreached = true;
+        serviceRequest.slaBreachSegment = breach.segment;
+        serviceRequest.slaBreachedAt = now;
+      }
+    } catch {
+      // Non-fatal — the delivery itself already committed successfully.
+    }
+
+    return serviceRequest;
+  }
+
+  /**
+   * Replace the assigned rider on a delayed, still-in-flight request (story
+   * BM-010). Interpretation call (stated in the PR): this does NOT touch
+   * dispatched_at / in_transit_at — it only swaps the rider and writes an
+   * audit entry. The story's bold AC title says "new dispatched_at segment
+   * logged", but its actual Given/When/Then only requires "the system logs
+   * the reassignment event with a timestamp" (which the audit row satisfies).
+   * Taking the literal, testable clause over the loose title also means the
+   * original SLA timing — and therefore the eventual persisted breach record
+   * (BM-012) — is never disturbed by a reassignment, satisfying "the original
+   * SLA breach is not erased" by construction rather than by extra logic.
+   *
+   * Order of checks (all in the service layer, AGENTS.md §5/§6):
+   *  1. Load the SR scoped to the caller's branches — 404 if missing.
+   *  2. Must be Dispatched/En Route with a currently assigned rider — else 400
+   *     (nothing to reassign: still Pending, already Delivered, or Cancelled).
+   *  3. The CURRENT rider is looked up status-agnostically (they are 'On
+   *     Delivery', not 'Available') to name them in the audit note.
+   *  4. The NEW rider must be Available, in the same branch, and different
+   *     from the current rider — else 400.
+   *  5. Commit atomically: conditional UPDATE (WHERE rider_id = the OLD rider
+   *     AND status still Dispatched/En Route). 0 rows => a concurrent
+   *     reassign/deliver already won => 409.
+   *  6. Free the old rider ('Available'), claim the new one ('On Delivery').
+   *  7. Append an audit entry naming both riders.
+   */
+  async reassign(
+    principal: Principal,
+    id: string,
+    dto: ReassignServiceRequestDto,
+  ): Promise<ServiceRequest> {
+    const branchIds = this.requireBranches(principal);
+
+    // 1. Load, scoped to the caller's branch(es).
+    const serviceRequest = await this.serviceRequests.findOne({
+      where: { id, branchId: In(branchIds), deletedAt: IsNull() },
+    });
+    if (!serviceRequest) throw new NotFoundException('Service request not found');
+
+    // 2. Must be out for delivery with a rider already assigned.
+    if (
+      !['Dispatched', 'En Route'].includes(serviceRequest.status) ||
+      !serviceRequest.riderId
+    ) {
+      throw new BadRequestException(
+        'Cannot reassign: request is not out for delivery',
+      );
+    }
+    const oldRiderId = serviceRequest.riderId;
+
+    // 3. Name the current rider for the audit note (status-agnostic lookup —
+    //    they are 'On Delivery', so findAssignableRider would not find them).
+    const oldRider = await this.fleet.findInBranch(oldRiderId, serviceRequest.branchId);
+
+    // 4. The new rider must be Available, in-branch, and a genuine change.
+    if (dto.riderId === oldRiderId) {
+      throw new BadRequestException('Request is already assigned to this rider');
+    }
+    const newRider = await this.fleet.findAssignableRider(
+      dto.riderId,
+      serviceRequest.branchId,
+    );
+    if (!newRider) throw new BadRequestException('Rider is not assignable');
+
+    // 5. Commit atomically: only a still-out-for-delivery request currently
+    //    assigned to the OLD rider is updated. 0 rows => a concurrent
+    //    reassign or deliver already won => 409.
+    const now = new Date();
+    const result = await this.serviceRequests
+      .createQueryBuilder()
+      .update(ServiceRequest)
+      .set({ riderId: newRider.id, updatedAt: now })
+      .where(
+        'id = :id AND rider_id = :oldRiderId AND status IN (:...statuses)',
+        { id, oldRiderId, statuses: ['Dispatched', 'En Route'] },
+      )
+      .execute();
+    if (!result.affected) {
+      throw new ConflictException('Request is no longer assigned to that rider');
+    }
+
+    // 6. Swap fleet availability: free the old rider, claim the new one.
+    await Promise.all([
+      this.fleet.markAvailable(oldRiderId),
+      this.fleet.markOnDelivery(newRider.id),
+    ]);
+
+    // 7. Audit the reassignment. Status is unchanged (see the interpretation
+    //    note above), so from/to are both the request's current status.
+    await this.statusHistory.save(
+      this.statusHistory.create({
+        serviceRequestId: id,
+        branchId: serviceRequest.branchId,
+        fromStatus: serviceRequest.status,
+        toStatus: serviceRequest.status,
+        changedBy: principal.userId,
+        changedAt: now,
+        note: `Reassigned from ${oldRider?.name ?? oldRiderId} to ${newRider.name}`,
+      }),
+    );
+
+    // Reflect the committed state back to the caller without a re-read.
+    serviceRequest.riderId = newRider.id;
+    serviceRequest.updatedAt = now;
+    return serviceRequest;
+  }
+
+  /**
+   * Log a delay reason (story BM-011). The dropdown category + optional
+   * free-text note are combined into the single `delay_reason` display
+   * string. No status change — this is purely documentation, available on any
+   * still-in-flight request (Pending/Dispatched/En Route); once Delivered or
+   * Cancelled the delivery outcome already speaks for itself, and once Under
+   * Review a lost-cylinder complaint (BM-US-04) already documents the issue.
+   */
+  async logDelayReason(
+    principal: Principal,
+    id: string,
+    dto: LogDelayReasonDto,
+  ): Promise<ServiceRequest> {
+    const branchIds = this.requireBranches(principal);
+
+    const serviceRequest = await this.serviceRequests.findOne({
+      where: { id, branchId: In(branchIds), deletedAt: IsNull() },
+    });
+    if (!serviceRequest) throw new NotFoundException('Service request not found');
+    if (!['Pending', 'Dispatched', 'En Route'].includes(serviceRequest.status)) {
+      throw new BadRequestException(
+        `Cannot log a delay reason on a request that is ${serviceRequest.status}`,
+      );
+    }
+
+    const label = DELAY_REASON_LABELS[dto.reasonCategory] ?? dto.reasonCategory;
+    const note = dto.note?.trim();
+    const delayReason = note ? `${label}: ${note}` : label;
+
+    const now = new Date();
+    await this.serviceRequests.update(
+      { id },
+      { delayReason, updatedAt: now },
+    );
+    await this.statusHistory.save(
+      this.statusHistory.create({
+        serviceRequestId: id,
+        branchId: serviceRequest.branchId,
+        fromStatus: serviceRequest.status,
+        toStatus: serviceRequest.status,
+        changedBy: principal.userId,
+        changedAt: now,
+        note: `Delay reason logged: ${delayReason}`,
+      }),
+    );
+
+    serviceRequest.delayReason = delayReason;
     serviceRequest.updatedAt = now;
     return serviceRequest;
   }
@@ -470,6 +721,133 @@ export class ServiceRequestsService {
     serviceRequest.status = 'Cancelled';
     serviceRequest.updatedAt = now;
     return serviceRequest;
+  }
+
+  /**
+   * Batch-resolve active 'all'-channel SLA thresholds for a set of branches,
+   * one query for branch-specific rows + one for the global (branch_id NULL)
+   * fallback — avoids an N+1 lookup per row in listWithSlaRisk. A branch with
+   * no specific override falls back to the global row per segment.
+   */
+  private async resolveThresholdsForBranches(
+    branchIds: string[],
+  ): Promise<Map<string, ThresholdMap>> {
+    const [branchRows, globalRows] = await Promise.all([
+      this.slaConfigurations.find({
+        where: { branchId: In(branchIds), orderSource: 'all', isActive: true },
+      }),
+      this.slaConfigurations.find({
+        where: { branchId: IsNull(), orderSource: 'all', isActive: true },
+      }),
+    ]);
+
+    const globalMap: ThresholdMap = {};
+    for (const row of globalRows) globalMap[row.segment] = row.thresholdMinutes;
+
+    const result = new Map<string, ThresholdMap>();
+    for (const branchId of branchIds) {
+      result.set(branchId, { ...globalMap });
+    }
+    for (const row of branchRows) {
+      const map = result.get(row.branchId as string);
+      if (map) map[row.segment] = row.thresholdMinutes;
+    }
+    return result;
+  }
+
+  /**
+   * LIVE at-risk check for one still-in-flight request (BM-008). See
+   * listWithSlaRisk's doc for the Dispatched≈En Route interpretation.
+   * Delivered/Cancelled/Under Review rows are never "at risk" — their outcome
+   * is already final; the permanent breach record (if any) lives on the row.
+   */
+  private computeAtRisk(
+    sr: ServiceRequest,
+    thresholds: ThresholdMap,
+    now: Date,
+  ): { atRisk: boolean; segment: SlaSegment | null } {
+    const minutesSince = (from: Date) => (now.getTime() - from.getTime()) / 60000;
+
+    if (sr.status === 'Pending') {
+      const threshold = thresholds.request_to_dispatch;
+      if (threshold == null) return { atRisk: false, segment: null };
+      return {
+        atRisk: minutesSince(sr.requestedAt) > threshold,
+        segment: 'request_to_dispatch',
+      };
+    }
+
+    if (sr.status === 'Dispatched' || sr.status === 'En Route') {
+      // in_transit_at is GPS-dependent and typically null in this MVP
+      // (AGENTS.md §8) — when present, check the finer in-transit segment;
+      // otherwise fall back to the coarser dispatch segment using
+      // dispatched_at, which is always set once out for delivery.
+      if (sr.inTransitAt) {
+        const threshold = thresholds.in_transit_to_delivery;
+        if (threshold == null) return { atRisk: false, segment: null };
+        return {
+          atRisk: minutesSince(sr.inTransitAt) > threshold,
+          segment: 'in_transit_to_delivery',
+        };
+      }
+      const threshold = thresholds.dispatch_to_in_transit;
+      if (threshold == null || !sr.dispatchedAt) return { atRisk: false, segment: null };
+      return {
+        atRisk: minutesSince(sr.dispatchedAt) > threshold,
+        segment: 'dispatch_to_in_transit',
+      };
+    }
+
+    return { atRisk: false, segment: null };
+  }
+
+  /**
+   * PERSISTED breach computation at delivery (BM-012), using the four real
+   * timestamps. Segment 1 (request_to_dispatch) is always measurable. When
+   * in_transit_at was never populated (typical for this MVP — GPS deferred,
+   * AGENTS.md §8), segments 2/3 cannot be individually attributed without it,
+   * so this checks the 'end_to_end' threshold (dispatched_at → delivered_at)
+   * as the honest fallback instead of guessing at segment attribution —
+   * interpretation call, stated in the PR. Returns the FIRST segment found in
+   * breach (chronological order), or null if none breached / no threshold is
+   * configured for the relevant segment(s).
+   */
+  private async computeBreach(
+    sr: ServiceRequest,
+  ): Promise<{ segment: SlaSegment } | null> {
+    const thresholds = (await this.resolveThresholdsForBranches([sr.branchId])).get(
+      sr.branchId,
+    ) ?? {};
+    const minutesBetween = (from: Date, to: Date) => (to.getTime() - from.getTime()) / 60000;
+
+    if (!sr.dispatchedAt || !sr.deliveredAt) return null;
+
+    // Segment 1: request → dispatch. Always measurable.
+    const seg1 = thresholds.request_to_dispatch;
+    if (seg1 != null && minutesBetween(sr.requestedAt, sr.dispatchedAt) > seg1) {
+      return { segment: 'request_to_dispatch' };
+    }
+
+    if (sr.inTransitAt) {
+      // GPS data present: check segments 2 and 3 individually.
+      const seg2 = thresholds.dispatch_to_in_transit;
+      if (seg2 != null && minutesBetween(sr.dispatchedAt, sr.inTransitAt) > seg2) {
+        return { segment: 'dispatch_to_in_transit' };
+      }
+      const seg3 = thresholds.in_transit_to_delivery;
+      if (seg3 != null && minutesBetween(sr.inTransitAt, sr.deliveredAt) > seg3) {
+        return { segment: 'in_transit_to_delivery' };
+      }
+      return null;
+    }
+
+    // No GPS data: fall back to the combined dispatch→delivery span against
+    // the end_to_end threshold.
+    const endToEnd = thresholds.end_to_end;
+    if (endToEnd != null && minutesBetween(sr.dispatchedAt, sr.deliveredAt) > endToEnd) {
+      return { segment: 'end_to_end' };
+    }
+    return null;
   }
 
   /** Render a nullable string for an audit note: quoted value, or (none). */

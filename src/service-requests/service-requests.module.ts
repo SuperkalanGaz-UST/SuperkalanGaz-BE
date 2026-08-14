@@ -6,6 +6,7 @@ import { FleetModule } from '../fleet/fleet.module';
 import { PricesModule } from '../prices/prices.module';
 import { ServiceRequest } from './service-request.entity';
 import { ServiceRequestStatusHistory } from './service-request-status-history.entity';
+import { SlaConfiguration } from './sla-configuration.entity';
 import { ServiceRequestsController } from './service-requests.controller';
 import { ServiceRequestsService } from './service-requests.service';
 
@@ -14,9 +15,10 @@ import { ServiceRequestsService } from './service-requests.service';
   // Delivery' at dispatch); CimModule exports CimService (validate a customer
   // when linking one onto a request at create). Both mirror BranchesModule
   // reusing the Users module's GoTrueAdminService. The dependency runs SRD → CIM
-  // only (CIM never imports SRD), so there is no module cycle.
+  // only (CIM never imports SRD), so there is no module cycle. SlaConfiguration
+  // is registered READ-ONLY (BM-US-02) — this module never writes to it.
   imports: [
-    TypeOrmModule.forFeature([ServiceRequest, ServiceRequestStatusHistory]),
+    TypeOrmModule.forFeature([ServiceRequest, ServiceRequestStatusHistory, SlaConfiguration]),
     AuthModule,
     FleetModule,
     CimModule,

@@ -16,6 +16,8 @@ import { CreateServiceRequestDto } from './dto/create-service-request.dto';
 import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
 import { EditServiceRequestDto } from './dto/edit-service-request.dto';
 import { CancelServiceRequestDto } from './dto/cancel-service-request.dto';
+import { ReassignServiceRequestDto } from './dto/reassign-service-request.dto';
+import { LogDelayReasonDto } from './dto/log-delay-reason.dto';
 import { ServiceRequest } from './service-request.entity';
 import { ServiceRequestsService } from './service-requests.service';
 
@@ -34,9 +36,9 @@ export class ServiceRequestsController {
   @Get()
   async list(
     @CurrentPrincipal() principal: Principal,
-  ): Promise<{ serviceRequests: ReturnType<ServiceRequestsController['toRow']>[] }> {
-    const rows = await this.serviceRequests.list(principal);
-    return { serviceRequests: rows.map((r) => this.toRow(r)) };
+  ): Promise<{ serviceRequests: ReturnType<ServiceRequestsController['toListRow']>[] }> {
+    const items = await this.serviceRequests.listWithSlaRisk(principal);
+    return { serviceRequests: items.map((item) => this.toListRow(item)) };
   }
 
   @Get(':id')
@@ -125,6 +127,39 @@ export class ServiceRequestsController {
     return { serviceRequest: this.toRow(row) };
   }
 
+  /**
+   * Replace the assigned rider on a delayed, out-for-delivery request (story
+   * BM-010). Body is just the new rider. 400 if the request is not out for
+   * delivery, the new rider isn't assignable, or it's the same rider already
+   * assigned; 409 if the request's rider assignment changed concurrently
+   * (race); 404 if outside the caller's branch. The updated row is returned.
+   */
+  @Post(':id/reassign')
+  async reassign(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ReassignServiceRequestDto,
+  ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
+    const row = await this.serviceRequests.reassign(principal, id, dto);
+    return { serviceRequest: this.toRow(row) };
+  }
+
+  /**
+   * Log a delay reason (story BM-011): a dropdown category plus an optional
+   * free-text note, combined into the row's delay_reason. Available on any
+   * still-in-flight request (Pending/Dispatched/En Route) — 400 otherwise;
+   * 404 if outside the caller's branch. The updated row is returned.
+   */
+  @Post(':id/delay-reason')
+  async logDelayReason(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: LogDelayReasonDto,
+  ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
+    const row = await this.serviceRequests.logDelayReason(principal, id, dto);
+    return { serviceRequest: this.toRow(row) };
+  }
+
   /** Snake_case response row, matching the precedent in UsersController.toRow. */
   private toRow(sr: ServiceRequest) {
     return {
@@ -146,7 +181,31 @@ export class ServiceRequestsController {
       dispatched_at: sr.dispatchedAt,
       in_transit_at: sr.inTransitAt,
       delivered_at: sr.deliveredAt,
+      delay_reason: sr.delayReason,
+      sla_breached: sr.slaBreached,
+      sla_breach_segment: sr.slaBreachSegment,
+      sla_breached_at: sr.slaBreachedAt,
       created_at: sr.createdAt,
+    };
+  }
+
+  /**
+   * The queue row (BM-008): the base row plus the LIVE "at risk" flag (not a
+   * column — see ServiceRequestsService.listWithSlaRisk). sla_breached (a real
+   * column) is the separate PERSISTED record from delivery time (BM-012); a
+   * row can have sla_at_risk=false and sla_breached=true simultaneously (an
+   * already-delivered request that breached, now closed and no longer "at
+   * risk" since there is nothing left to act on).
+   */
+  private toListRow(item: {
+    serviceRequest: ServiceRequest;
+    slaAtRisk: boolean;
+    slaAtRiskSegment: string | null;
+  }) {
+    return {
+      ...this.toRow(item.serviceRequest),
+      sla_at_risk: item.slaAtRisk,
+      sla_at_risk_segment: item.slaAtRiskSegment,
     };
   }
 }
