@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from '../auth/auth.module';
+import { Branch } from '../branches/branch.entity';
 import { CimModule } from '../cim/cim.module';
 import { FleetModule } from '../fleet/fleet.module';
 import { PricesModule } from '../prices/prices.module';
@@ -18,7 +19,7 @@ import { ServiceRequestsService } from './service-requests.service';
   // only (CIM never imports SRD), so there is no module cycle. SlaConfiguration
   // is registered READ-ONLY (BM-US-02) — this module never writes to it.
   imports: [
-    TypeOrmModule.forFeature([ServiceRequest, ServiceRequestStatusHistory, SlaConfiguration]),
+    TypeOrmModule.forFeature([ServiceRequest, ServiceRequestStatusHistory, SlaConfiguration, Branch]),
     AuthModule,
     FleetModule,
     CimModule,

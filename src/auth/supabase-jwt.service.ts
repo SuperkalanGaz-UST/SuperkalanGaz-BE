@@ -32,13 +32,23 @@ export class SupabaseJwtService {
   /** Returns the token payload if valid; throws 401 otherwise. */
   async verify(token: string): Promise<JWTPayload> {
     const options = { issuer: this.issuer, audience: 'authenticated' };
+
     try {
-      const { payload } = this.hsSecret
-        ? await jwtVerify(token, this.hsSecret, options)
-        : await jwtVerify(token, this.jwks, options);
+      const { payload } = await jwtVerify(token, this.jwks, options);
       return payload;
     } catch {
-      throw new UnauthorizedException('Invalid or expired access token');
+      // Supabase projects often sign tokens with ES256 and publish the public keys
+      // via JWKS. Only fall back to the legacy HS256 secret when a JWKS-based
+      // verification fails and a shared secret is explicitly configured.
+      if (!this.hsSecret) {
+        throw new UnauthorizedException('Invalid or expired access token');
+      }
+      try {
+        const { payload } = await jwtVerify(token, this.hsSecret, options);
+        return payload;
+      } catch {
+        throw new UnauthorizedException('Invalid or expired access token');
+      }
     }
   }
 }

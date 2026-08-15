@@ -36,6 +36,14 @@ export class BranchesController {
     return { branches };
   }
 
+  /** Read-only active branch list for the customer mobile order flow. */
+  @Get('public')
+  @Roles('franchise-admin', 'branch-owner', 'branch-manager', 'customer')
+  async publicList(): Promise<{ branches: BranchRow[] }> {
+    const branches = await this.branches.list();
+    return { branches: branches.filter((branch) => branch.status === 'active') };
+  }
+
   @Post()
   async create(
     @CurrentPrincipal() principal: Principal,

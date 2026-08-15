@@ -13,6 +13,7 @@ import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
+import { CreateCustomerServiceRequestDto } from './dto/create-customer-service-request.dto';
 import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
 import { EditServiceRequestDto } from './dto/edit-service-request.dto';
 import { CancelServiceRequestDto } from './dto/cancel-service-request.dto';
@@ -32,6 +33,38 @@ import { ServiceRequestsService } from './service-requests.service';
 @Roles('branch-manager')
 export class ServiceRequestsController {
   constructor(private readonly serviceRequests: ServiceRequestsService) {}
+
+  @Get('me')
+  @Roles('customer')
+  async myOrders(
+    @CurrentPrincipal() principal: Principal,
+  ): Promise<{ serviceRequests: ReturnType<ServiceRequestsController['toRow']>[] }> {
+    const items = await this.serviceRequests.listForCustomer(principal);
+    return { serviceRequests: items.map((item) => this.toRow(item)) };
+  }
+
+  @Post('customer')
+  @Roles('customer')
+  async createCustomerOrder(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: CreateCustomerServiceRequestDto,
+  ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
+    console.log('[service-requests] createCustomerOrder request', {
+      userId: principal.userId,
+      role: principal.role,
+      dto,
+      branchId: dto.branchId,
+    });
+    const row = await this.serviceRequests.createForCustomer(principal, dto);
+    console.log('[service-requests] createCustomerOrder response', {
+      userId: principal.userId,
+      id: row.id,
+      branchId: row.branchId,
+      status: row.status,
+      orderSource: row.orderSource,
+    });
+    return { serviceRequest: this.toRow(row) };
+  }
 
   @Get()
   async list(

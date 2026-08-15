@@ -82,6 +82,15 @@ export class FleetService {
   }
 
   /**
+   * Look up a rider by id globally (used for customers viewing their assigned rider).
+   */
+  async findById(riderId: string): Promise<Rider | null> {
+    return this.riders.findOne({
+      where: { id: riderId, deletedAt: IsNull() },
+    });
+  }
+
+  /**
    * Flip a rider to 'On Delivery' so they drop out of the Available list once
    * dispatched — prevents another Service Request picking the same rider. The
    * rider returns to 'Available' in the later "mark delivered" slice (Slice 3).

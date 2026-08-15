@@ -8,9 +8,11 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, IsNull, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
+import { Branch } from '../branches/branch.entity';
 import { CimService } from '../cim/cim.service';
 import { FleetService } from '../fleet/fleet.service';
 import { PricesService } from '../prices/prices.service';
+import { CreateCustomerServiceRequestDto } from './dto/create-customer-service-request.dto';
 import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
 import { EditServiceRequestDto } from './dto/edit-service-request.dto';
@@ -55,6 +57,8 @@ export class ServiceRequestsService {
   constructor(
     @InjectRepository(ServiceRequest)
     private readonly serviceRequests: Repository<ServiceRequest>,
+    @InjectRepository(Branch)
+    private readonly branches: Repository<Branch>,
     // Append-only audit trail for guarded lifecycle actions (edit / cancel,
     // BM-US-07; reassign / delay-reason, BM-US-02). Maps the existing
     // srd.service_request_status_history table.
@@ -137,6 +141,65 @@ export class ServiceRequestsService {
   }
 
   /**
+   * Customer-app order placement. The customer chooses the branch and the API
+   * stores the authenticated auth user id in customer_id so the same user can
+   * read back their order history/status later.
+   */
+  async createForCustomer(
+    principal: Principal,
+    dto: CreateCustomerServiceRequestDto,
+  ): Promise<ServiceRequest> {
+    console.log('[service-requests-service] createForCustomer input', {
+      userId: principal.userId,
+      role: principal.role,
+      branchId: dto.branchId,
+      customerName: dto.customerName,
+      quantity: dto.quantity,
+      cylinderSize: dto.cylinderSize,
+    });
+    const branch = await this.branches.findOne({
+      where: { id: dto.branchId, status: 'active' },
+    });
+    if (!branch) {
+      throw new BadRequestException('Branch not found');
+    }
+
+    const product = await this.prices.findByCylinderSize(dto.cylinderSize);
+    const now = new Date();
+    const serviceRequest = this.serviceRequests.create({
+      branchId: branch.id,
+      orderSource: 'Mobile App',
+      status: 'Pending',
+      customerId: principal.userId,
+      customerName: dto.customerName.trim(),
+      customerContact: dto.customerContact.trim(),
+      deliveryAddress: dto.deliveryAddress.trim(),
+      cylinderSize: product.cylinderSize,
+      quantity: dto.quantity,
+      unitPrice: product.unitPrice,
+      totalAmount: Number((product.unitPrice * dto.quantity).toFixed(2)),
+      specialInstructions: dto.specialInstructions?.trim() || null,
+      requestedAt: now,
+      dispatchedAt: null,
+      inTransitAt: null,
+      deliveredAt: null,
+      createdAt: now,
+      updatedAt: now,
+      deletedAt: null,
+    });
+
+    const saved = await this.serviceRequests.save(serviceRequest);
+    console.log('[service-requests-service] createForCustomer saved', {
+      id: saved.id,
+      branchId: saved.branchId,
+      status: saved.status,
+      customerId: saved.customerId,
+      orderSource: saved.orderSource,
+    });
+    return saved;
+  }
+
+  /**
    * The caller's branch queue: live requests for their own branch(es) only,
    * newest first. Branch scope comes from the principal — request input can
    * never widen it (AGENTS.md §5).
@@ -146,6 +209,14 @@ export class ServiceRequestsService {
 
     return this.serviceRequests.find({
       where: { branchId: In(branchIds), deletedAt: IsNull() },
+      order: { requestedAt: 'DESC' },
+    });
+  }
+
+  /** Customer order history, newest first. */
+  async listForCustomer(principal: Principal): Promise<ServiceRequest[]> {
+    return this.serviceRequests.find({
+      where: { customerId: principal.userId, deletedAt: IsNull() },
       order: { requestedAt: 'DESC' },
     });
   }

@@ -1,5 +1,5 @@
 /** Roles recognized by the CRM (carried in the auth user's app_metadata.role). */
-export type Role = 'franchise-admin' | 'branch-owner' | 'branch-manager';
+export type Role = 'franchise-admin' | 'branch-owner' | 'branch-manager' | 'customer';
 
 /**
  * The authenticated caller, derived entirely from the verified JWT's

@@ -44,8 +44,23 @@ export class AuthGuard implements CanActivate {
     // Role/branch scope/status come from app_metadata — written only by our
     // service-role GoTrue calls, so the client cannot widen its own access.
     const claims = (payload.app_metadata ?? {}) as Record<string, unknown>;
-    const role = claims.role;
-    if (typeof role !== 'string') {
+    const requestPath = request.originalUrl || request.url || '';
+    const isCustomerPublicBranchLookup = request.method === 'GET' && requestPath.endsWith('/api/branches/public');
+    const role = typeof claims.role === 'string'
+      ? claims.role
+      : isCustomerPublicBranchLookup
+        ? 'customer'
+        : undefined;
+
+    if (!role) {
+      console.log('[auth] denied account without CRM role', {
+        requestPath,
+        method: request.method,
+        claims: {
+          role: claims.role,
+          status: claims.status,
+        },
+      });
       throw new ForbiddenException('No CRM role for this account');
     }
     if (claims.status !== undefined && claims.status !== 'Active') {
@@ -67,6 +82,13 @@ export class AuthGuard implements CanActivate {
           select: { id: true },
         })
       : [];
+
+    console.log('[auth] resolved principal', {
+      requestPath,
+      method: request.method,
+      role,
+      userId: payload.sub,
+    });
 
     const principal: Principal = {
       userId: payload.sub,

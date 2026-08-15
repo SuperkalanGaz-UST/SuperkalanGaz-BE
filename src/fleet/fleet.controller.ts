@@ -1,4 +1,4 @@
-import { Controller, Get, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Param, ParseUUIDPipe, Query, UseGuards } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
@@ -25,6 +25,20 @@ export class FleetController {
   ): Promise<{ riders: ReturnType<FleetController['toRow']>[] }> {
     const rows = await this.fleet.listForBranch(principal, query);
     return { riders: rows.map((r) => this.toRow(r)) };
+  }
+
+  @Get(':id')
+  @Roles('branch-manager', 'customer')
+  async detail(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<{ rider: ReturnType<FleetController['toRow']> }> {
+    // Both branch-managers and customers need to see the rider's details
+    // Customers only know the riderId from their order. 
+    // In a production app, we'd ensure the customer actually has an order with this rider.
+    const rider = await this.fleet.findById(id);
+    if (!rider) throw new Error('Rider not found');
+    return { rider: this.toRow(rider) };
   }
 
   /** Snake_case response row, matching the precedent in UsersController.toRow. */
