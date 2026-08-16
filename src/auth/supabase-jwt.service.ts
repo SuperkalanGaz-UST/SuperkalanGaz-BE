@@ -1,6 +1,11 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createRemoteJWKSet, jwtVerify, JWTPayload } from 'jose';
+import {
+  createRemoteJWKSet,
+  decodeProtectedHeader,
+  jwtVerify,
+  JWTPayload,
+} from 'jose';
 
 /**
  * Verifies Supabase-issued access tokens locally (no round trip to the auth
@@ -34,21 +39,31 @@ export class SupabaseJwtService {
     const options = { issuer: this.issuer, audience: 'authenticated' };
 
     try {
-      const { payload } = await jwtVerify(token, this.jwks, options);
+      const { alg } = decodeProtectedHeader(token);
+      let payload: JWTPayload;
+
+      if (alg === 'HS256') {
+        if (!this.hsSecret) throw new Error('HS256 verification is not configured');
+        ({ payload } = await jwtVerify(token, this.hsSecret, {
+          ...options,
+          algorithms: ['HS256'],
+        }));
+      } else if (alg === 'ES256' || alg === 'RS256') {
+        // Supabase can migrate a project from the legacy shared secret to an
+        // asymmetric signing key. A leftover JWT secret must not force modern
+        // tokens down the HS256 path; select the verifier from the signed token
+        // header and still restrict it to Supabase's supported algorithms.
+        ({ payload } = await jwtVerify(token, this.jwks, {
+          ...options,
+          algorithms: [alg],
+        }));
+      } else {
+        throw new Error('Unsupported JWT signing algorithm');
+      }
+
       return payload;
     } catch {
-      // Supabase projects often sign tokens with ES256 and publish the public keys
-      // via JWKS. Only fall back to the legacy HS256 secret when a JWKS-based
-      // verification fails and a shared secret is explicitly configured.
-      if (!this.hsSecret) {
-        throw new UnauthorizedException('Invalid or expired access token');
-      }
-      try {
-        const { payload } = await jwtVerify(token, this.hsSecret, options);
-        return payload;
-      } catch {
-        throw new UnauthorizedException('Invalid or expired access token');
-      }
+      throw new UnauthorizedException('Invalid or expired access token');
     }
   }
 }

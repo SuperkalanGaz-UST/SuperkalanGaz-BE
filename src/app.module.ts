@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { resolve4 } from 'node:dns/promises';
 import { AuthModule } from './auth/auth.module';
 import { BranchesModule } from './branches/branches.module';
 import { CimModule } from './cim/cim.module';
@@ -25,15 +26,36 @@ import { UsersModule } from './users/users.module';
     ConfigModule.forRoot({ isGlobal: true }),
     TypeOrmModule.forRootAsync({
       inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        type: 'postgres',
-        url: config.getOrThrow<string>('DATABASE_URL'),
-        // Supabase requires TLS; its pooler presents a cert we don't pin here.
-        ssl: { rejectUnauthorized: false },
-        autoLoadEntities: true,
-        // Schema changes go through migrations only (AGENTS.md §6).
-        synchronize: false,
-      }),
+      useFactory: async (config: ConfigService) => {
+        const databaseUrl = new URL(config.getOrThrow<string>('DATABASE_URL'));
+
+        if (config.get<string>('DATABASE_RESOLVE_POOLER_IPV4') === 'true') {
+          if (!databaseUrl.hostname.endsWith('.pooler.supabase.com')) {
+            throw new Error(
+              'DATABASE_RESOLVE_POOLER_IPV4 requires a Supabase pooler DATABASE_URL',
+            );
+          }
+          const addresses = await resolve4(databaseUrl.hostname);
+          if (addresses.length === 0) {
+            throw new Error('The configured Supabase pooler has no IPv4 address');
+          }
+          // Some local networks stall the PostgreSQL TLS handshake when SNI is
+          // sent to Supavisor. Resolving once at startup keeps TLS enabled while
+          // preventing node-postgres from sending SNI for an IP-literal host.
+          databaseUrl.hostname = addresses[0];
+        }
+
+        return {
+          type: 'postgres' as const,
+          url: databaseUrl.toString(),
+          // Supabase requires TLS; its pooler presents a cert we don't pin here.
+          ssl: { rejectUnauthorized: false },
+          connectTimeoutMS: 5_000,
+          autoLoadEntities: true,
+          // Schema changes go through migrations only (AGENTS.md §6).
+          synchronize: false,
+        };
+      },
     }),
     AuthModule,
     UsersModule,

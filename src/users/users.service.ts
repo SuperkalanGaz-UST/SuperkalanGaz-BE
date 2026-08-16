@@ -143,6 +143,9 @@ export class UsersService {
     const users = (await this.goTrue.listUsers())
       .filter((u) => !isBanned(u)) // soft-deleted accounts drop out of the list
       .map(toCrmUser)
+      // This module is the staff-account directory. Customer identities are
+      // managed through CIM and must never appear as branch account records.
+      .filter((u) => u.role !== 'customer')
       .filter((u) => {
         if (role && u.role !== role) return false;
         if (query.branch) return u.branches.includes(query.branch);
@@ -255,6 +258,10 @@ export class UsersService {
     const user = await this.goTrue.getUser(id);
     if (!user || isBanned(user)) throw new NotFoundException('User not found');
     const target = toCrmUser(user);
+
+    if (target.role === 'customer') {
+      throw new NotFoundException('User not found');
+    }
 
     if (target.role === 'franchise-admin') {
       throw new ForbiddenException('Franchise Administrator accounts cannot be managed here');

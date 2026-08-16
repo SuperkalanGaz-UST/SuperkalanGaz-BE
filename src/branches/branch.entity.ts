@@ -20,10 +20,9 @@ export interface BranchGeofence {
  * hard-delete). `status` is guarded by a CHECK constraint in the DB, so its
  * union type below must stay in sync with it.
  *
- * NOTE: geofence, curfew, and the low-stock threshold are intentionally NOT
- * mapped here — they have no home in core.branches and are deferred (geofence is
- * a later delivery-zone feature; the threshold lives per-product on
- * inventory.stock_levels). Owner identity is not stored on the branch either: it
+ * The Franchise Administrator-assigned geofence is stored on this branch row.
+ * Curfew is still deferred, while low-stock thresholds live per product on
+ * inventory.stock_levels. Owner identity is not stored on the branch either: it
  * is provisioned into Supabase Auth (CRM claims in app_metadata) by the service.
  */
 @Entity({ schema: 'core', name: 'branches' })

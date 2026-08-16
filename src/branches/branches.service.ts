@@ -1,11 +1,12 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { randomBytes } from 'crypto';
-import { QueryFailedError, Repository } from 'typeorm';
+import { In, QueryFailedError, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { GoTrueAdminService } from '../users/gotrue-admin.service';
 import { Branch, BranchGeofence } from './branch.entity';
@@ -42,6 +43,13 @@ export interface BranchRow {
   geofence: BranchGeofence | null;
   source_store_location_id: string | null;
   created_at: Date;
+}
+
+/** Branch configuration visible to a Branch Owner for an assigned branch. */
+export interface AssignedBranchRow {
+  id: string;
+  name: string;
+  geofence: BranchGeofence | null;
 }
 
 /** URL-safe temp password; 16 chars easily clears Supabase's default policy. */
@@ -203,6 +211,29 @@ export class BranchesService {
   async list(): Promise<BranchRow[]> {
     const rows = await this.branches.find({ order: { createdAt: 'DESC' } });
     return rows.map((b) => this.toRow(b));
+  }
+
+  /**
+   * Returns only active branches already resolved into the authenticated Branch
+   * Owner's scope by AuthGuard. The client may choose among these rows for its
+   * branch selector, but it cannot supply or widen the authorization scope.
+   */
+  async listAssigned(principal: Principal): Promise<AssignedBranchRow[]> {
+    if (principal.branchIds.length === 0) {
+      throw new ForbiddenException('No active branch is assigned to this account');
+    }
+
+    const rows = await this.branches.find({
+      where: { id: In(principal.branchIds), status: 'active' },
+      select: { id: true, name: true, geofence: true },
+      order: { name: 'ASC' },
+    });
+
+    return rows.map((branch) => ({
+      id: branch.id,
+      name: branch.name,
+      geofence: branch.geofence,
+    }));
   }
 
   /**
