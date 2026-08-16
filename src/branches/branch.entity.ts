@@ -88,6 +88,14 @@ export class Branch {
   @Column({ name: 'loyalty_dual_auth', type: 'boolean', default: true })
   loyaltyDualAuth!: boolean;
 
+  /**
+   * PMS interval in km (added in migration 0021, story BM-US-09): a vehicle is
+   * flagged 'maintenance' once its odometer advances this far past its last
+   * logged service. No config UI in this slice — DB default (3000) only.
+   */
+  @Column({ name: 'maintenance_threshold_km', type: 'int', default: 3000 })
+  maintenanceThresholdKm!: number;
+
   @Column({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;
 
