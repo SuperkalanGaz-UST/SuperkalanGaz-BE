@@ -65,6 +65,19 @@ export class VehiclesController {
     };
   }
 
+  @Post(':id/retry-gps-provisioning')
+  async retryGpsProvisioning(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<{ vehicle: ReturnType<VehiclesController['toRow']> }> {
+    const vehicle = await this.fleet.retryVehicleProvisioning(principal, id);
+    const [riderNames, thresholds] = await Promise.all([
+      this.fleet.riderNamesFor(this.assignedRiderIds([vehicle])),
+      this.fleet.maintenanceThresholdsForBranches([vehicle.branchId]),
+    ]);
+    return { vehicle: this.toRow(vehicle, riderNames, thresholds) };
+  }
+
   @Post(':id/mileage')
   async logMileage(
     @CurrentPrincipal() principal: Principal,
@@ -114,6 +127,9 @@ export class VehiclesController {
         ? (riderNames.get(vehicle.assignedRiderId) ?? null)
         : null,
       status: vehicle.status,
+      gps_provisioning_status: vehicle.traccarProvisioningStatus,
+      gps_provisioning_error: vehicle.traccarProvisioningError,
+      gps_provisioned_at: vehicle.traccarProvisionedAt,
       current_odometer_km: vehicle.currentOdometerKm,
       last_pms_odometer_km: vehicle.lastPmsOdometerKm,
       km_since_last_pms: vehicle.currentOdometerKm - vehicle.lastPmsOdometerKm,

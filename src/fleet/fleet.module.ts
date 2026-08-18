@@ -8,6 +8,7 @@ import { Rider } from './rider.entity';
 import { Vehicle } from './vehicle.entity';
 import { VehicleMaintenanceLog } from './vehicle-maintenance-log.entity';
 import { VehiclesController } from './vehicles.controller';
+import { TraccarClient } from './traccar/traccar.client';
 
 /**
  * Fleet module (rider roster + dispatch validation, and vehicle mileage/PMS
@@ -21,7 +22,7 @@ import { VehiclesController } from './vehicles.controller';
     AuthModule,
   ],
   controllers: [FleetController, VehiclesController],
-  providers: [FleetService],
+  providers: [FleetService, TraccarClient],
   exports: [FleetService],
 })
 export class FleetModule {}

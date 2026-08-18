@@ -4,6 +4,11 @@ import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
  * automatically when current_odometer_km - last_pms_odometer_km reaches the
  * branch's maintenance_threshold_km (story BM-US-09); cleared by a PMS reset. */
 export type VehicleStatus = 'active' | 'maintenance' | 'inactive';
+export type TraccarProvisioningStatus =
+  | 'unconfigured'
+  | 'pending'
+  | 'provisioned'
+  | 'failed';
 
 /**
  * Maps fleet.vehicles — one row per branch motorcycle, separate from the rider
@@ -31,6 +36,29 @@ export class Vehicle {
 
   @Column({ type: 'text', default: 'active' })
   status!: VehicleStatus;
+
+  /** Identifier broadcast by the physical SinoTrack ST-901. This is not the
+   * CRM vehicle UUID and not Traccar's database id. */
+  @Column({ name: 'hardware_unique_id', type: 'text', nullable: true })
+  hardwareUniqueId!: string | null;
+
+  /** Traccar uses a bigint id. TypeORM returns PostgreSQL bigint values as
+   * strings so precision is not silently lost in JavaScript. */
+  @Column({ name: 'traccar_device_id', type: 'bigint', nullable: true })
+  traccarDeviceId!: string | null;
+
+  @Column({
+    name: 'traccar_provisioning_status',
+    type: 'text',
+    default: 'unconfigured',
+  })
+  traccarProvisioningStatus!: TraccarProvisioningStatus;
+
+  @Column({ name: 'traccar_provisioning_error', type: 'text', nullable: true })
+  traccarProvisioningError!: string | null;
+
+  @Column({ name: 'traccar_provisioned_at', type: 'timestamptz', nullable: true })
+  traccarProvisionedAt!: Date | null;
 
   /** Latest logged odometer reading. Advances only via logMileage's race-safe
    * conditional update — never decreases. */

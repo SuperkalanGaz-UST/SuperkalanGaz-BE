@@ -15,17 +15,19 @@ import { LogMileageDto } from './dto/log-mileage.dto';
 import { Rider } from './rider.entity';
 import { Vehicle } from './vehicle.entity';
 import { VehicleMaintenanceLog } from './vehicle-maintenance-log.entity';
+import { TraccarClient } from './traccar/traccar.client';
 
 /**
  * Fleet roster (Fleet module). This slice is minimal: list the caller's branch
- * riders for the dispatch dropdown, and an internal lookup the SRD service reuses
- * to validate a rider at dispatch time. No rider CRUD (riders are seeded
- * manually for now) and no GPS/Traccar — that is hardware-dependent and deferred
- * (AGENTS.md §8/§11).
+ * riders for the dispatch dropdown, an internal lookup the SRD service reuses
+ * to validate a rider at dispatch time, and server-side Traccar provisioning
+ * during vehicle registration. Live position ingestion remains a separate,
+ * hardware-dependent Fleet slice.
  *
  * All scoping derives from the verified Principal, never from request input
  * (AGENTS.md §5). Isolation is enforced here in the application layer, not by the
- * DB — a missing branch filter is a cross-tenant leak.
+ * DB — a missing branch filter is a cross-tenant leak. Vehicle registration
+ * also provisions the physical device in Traccar through a server-only adapter.
  */
 @Injectable()
 export class FleetService {
@@ -38,6 +40,7 @@ export class FleetService {
     private readonly maintenanceLogs: Repository<VehicleMaintenanceLog>,
     @InjectRepository(Branch)
     private readonly branches: Repository<Branch>,
+    private readonly traccar: TraccarClient,
   ) {}
 
   /**
@@ -155,6 +158,7 @@ export class FleetService {
   ): Promise<Vehicle> {
     const branchId = this.requireSingleBranch(principal);
     const plateNumber = dto.plateNumber.trim().toUpperCase().replace(/\s+/g, ' ');
+    const hardwareUniqueId = dto.hardwareUniqueId.trim();
     const branch = await this.branches.findOne({ where: { id: branchId } });
     if (!branch) throw new ForbiddenException('Caller has no active branch');
 
@@ -163,6 +167,13 @@ export class FleetService {
     });
     if (existingPlate) {
       throw new ConflictException('A vehicle with this plate number is already registered');
+    }
+
+    const existingHardware = await this.vehicles.findOne({
+      where: { branchId, hardwareUniqueId },
+    });
+    if (existingHardware) {
+      throw new ConflictException('This GPS hardware identifier is already registered');
     }
 
     if (dto.assignedRiderId) {
@@ -192,25 +203,55 @@ export class FleetService {
       vehicleType: 'motorcycle',
       assignedRiderId: dto.assignedRiderId ?? null,
       status: 'active',
+      hardwareUniqueId,
+      traccarDeviceId: null,
+      traccarProvisioningStatus: 'pending',
+      traccarProvisioningError: null,
+      traccarProvisionedAt: null,
       currentOdometerKm: dto.initialOdometerKm,
       lastPmsOdometerKm: dto.initialOdometerKm,
       createdAt: now,
       updatedAt: now,
     });
 
+    let saved: Vehicle;
     try {
-      return await this.vehicles.save(vehicle);
+      saved = await this.vehicles.save(vehicle);
     } catch (error) {
       if (
         error instanceof QueryFailedError &&
         (error as { code?: string }).code === '23505'
       ) {
         throw new ConflictException(
-          'The plate number or assigned rider is already registered',
+          'The plate number, rider, or GPS hardware identifier is already registered',
         );
       }
       throw error;
     }
+
+    return this.provisionVehicle(saved);
+  }
+
+  /** Re-attempt a failed/pending provisioning operation without accepting a
+   * branch or hardware id from the client. The vehicle lookup is branch-scoped
+   * and an already-provisioned vehicle is returned idempotently. */
+  async retryVehicleProvisioning(
+    principal: Principal,
+    vehicleId: string,
+  ): Promise<Vehicle> {
+    const vehicle = await this.getVehicle(principal, vehicleId);
+    if (vehicle.traccarProvisioningStatus === 'provisioned') return vehicle;
+    if (!vehicle.hardwareUniqueId) {
+      throw new BadRequestException(
+        'This existing vehicle has no SinoTrack hardware identifier',
+      );
+    }
+
+    vehicle.traccarProvisioningStatus = 'pending';
+    vehicle.traccarProvisioningError = null;
+    vehicle.updatedAt = new Date();
+    const pending = await this.vehicles.save(vehicle);
+    return this.provisionVehicle(pending);
   }
 
   /** The caller's branch vehicle roster (story BM-042), plate order. */
@@ -220,6 +261,37 @@ export class FleetService {
       where: { branchId: In(branchIds) },
       order: { plateNumber: 'ASC' },
     });
+  }
+
+  private async provisionVehicle(vehicle: Vehicle): Promise<Vehicle> {
+    if (!vehicle.hardwareUniqueId) {
+      throw new BadRequestException('Vehicle has no SinoTrack hardware identifier');
+    }
+
+    try {
+      const traccarDevice = await this.traccar.provisionDevice(
+        vehicle.plateNumber,
+        vehicle.hardwareUniqueId,
+      );
+      vehicle.traccarDeviceId = String(traccarDevice.id);
+      vehicle.traccarProvisioningStatus = 'provisioned';
+      vehicle.traccarProvisioningError = null;
+      vehicle.traccarProvisionedAt = new Date();
+    } catch (error) {
+      vehicle.traccarDeviceId = null;
+      vehicle.traccarProvisioningStatus = 'failed';
+      vehicle.traccarProvisioningError = this.provisioningErrorMessage(error);
+      vehicle.traccarProvisionedAt = null;
+    }
+    vehicle.updatedAt = new Date();
+    return this.vehicles.save(vehicle);
+  }
+
+  private provisioningErrorMessage(error: unknown): string {
+    return (error instanceof Error
+      ? error.message
+      : 'Traccar provisioning failed'
+    ).slice(0, 500);
   }
 
   /** A single vehicle, scoped to the caller's branch(es). 404 if unknown or
