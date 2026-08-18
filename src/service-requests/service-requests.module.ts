@@ -10,6 +10,9 @@ import { ServiceRequestStatusHistory } from './service-request-status-history.en
 import { SlaConfiguration } from './sla-configuration.entity';
 import { ServiceRequestsController } from './service-requests.controller';
 import { ServiceRequestsService } from './service-requests.service';
+import { PayMongoController } from './paymongo.controller';
+import { PayMongoService } from './paymongo.service';
+import { ServiceRequestPaymentsService } from './service-request-payments.service';
 
 @Module({
   // FleetModule exports FleetService (validate a rider and flip them to 'On
@@ -25,7 +28,7 @@ import { ServiceRequestsService } from './service-requests.service';
     CimModule,
     PricesModule,
   ],
-  controllers: [ServiceRequestsController],
-  providers: [ServiceRequestsService],
+  controllers: [ServiceRequestsController, PayMongoController],
+  providers: [ServiceRequestsService, ServiceRequestPaymentsService, PayMongoService],
 })
 export class ServiceRequestsModule {}

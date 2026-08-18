@@ -10,6 +10,9 @@ const decimalTransformer = {
  * customer-initiated (later slice). */
 export type OrderSource = 'Mobile App' | 'Walk-in/Phone';
 
+export type PaymentMethod = 'Cash on Delivery' | 'PayMongo';
+export type PaymentStatus = 'Unpaid' | 'Pending' | 'Paid';
+
 /** Lifecycle state of a Service Request. Advances along the SLA chain: later
  * slices move a row Pending → Dispatched → En Route → Delivered. 'Under Review'
  * is a side-branch set when a Branch Manager logs a lost/undelivered cylinder
@@ -95,6 +98,32 @@ export class ServiceRequest {
     transformer: decimalTransformer,
   })
   totalAmount!: number | null;
+
+  /** CU-017 payment state. Provider secrets never enter this entity; only the
+   * identifiers needed to reconcile a signed PayMongo callback are retained. */
+  @Column({ name: 'payment_method', type: 'text', default: 'Cash on Delivery' })
+  paymentMethod!: PaymentMethod;
+
+  @Column({ name: 'payment_status', type: 'text', default: 'Unpaid' })
+  paymentStatus!: PaymentStatus;
+
+  @Column({ name: 'paymongo_checkout_session_id', type: 'text', nullable: true })
+  paymongoCheckoutSessionId!: string | null;
+
+  @Column({ name: 'paymongo_checkout_url', type: 'text', nullable: true })
+  paymongoCheckoutUrl!: string | null;
+
+  @Column({ name: 'paymongo_reference', type: 'text', nullable: true })
+  paymongoReference!: string | null;
+
+  @Column({ name: 'paymongo_payment_id', type: 'text', nullable: true })
+  paymongoPaymentId!: string | null;
+
+  @Column({ name: 'paymongo_webhook_event_id', type: 'text', nullable: true })
+  paymongoWebhookEventId!: string | null;
+
+  @Column({ name: 'payment_paid_at', type: 'timestamptz', nullable: true })
+  paymentPaidAt!: Date | null;
 
   @Column({ name: 'special_instructions', type: 'text', nullable: true })
   specialInstructions!: string | null;

@@ -3,7 +3,10 @@ import { ValidationPipe } from '@nestjs/common';
 import { AppModule } from './app.module';
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule);
+  // PayMongo signs the exact webhook bytes. Nest keeps that buffer alongside
+  // the parsed JSON body so signature verification never hashes re-serialized
+  // data (CU-017 AC4).
+  const app = await NestFactory.create(AppModule, { rawBody: true });
 
   // The web dashboard calls us cross-origin with a Bearer token (no cookies).
   const webOrigins = (process.env.WEB_ORIGIN ?? 'http://localhost:3000')

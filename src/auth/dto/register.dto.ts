@@ -1,4 +1,11 @@
-import { IsIn, IsNotEmpty, IsOptional, IsString, MinLength } from 'class-validator';
+import {
+  IsIn,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  Matches,
+  MinLength,
+} from 'class-validator';
 
 /** Payload from the mobile customer registration form. */
 export class RegisterDto {
@@ -12,6 +19,9 @@ export class RegisterDto {
    */
   @IsString()
   @IsNotEmpty()
+  @Matches(/^(?:[^\s@]+@[^\s@]+\.[^\s@]+|\+639\d{9})$/, {
+    message: 'identifier must be a valid email or canonical PH mobile number',
+  })
   identifier!: string;
 
   @IsString()
@@ -36,5 +46,6 @@ export class RegisterDto {
   /** Optional contact number collected at sign-up (stored in user_metadata). */
   @IsOptional()
   @IsString()
+  @Matches(/^\+639\d{9}$/, { message: 'Enter a valid PH mobile number' })
   contactNumber?: string;
 }

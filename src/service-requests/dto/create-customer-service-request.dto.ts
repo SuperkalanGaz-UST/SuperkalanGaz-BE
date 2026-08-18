@@ -2,12 +2,14 @@ import {
   IsInt,
   IsNotEmpty,
   IsOptional,
+  IsIn,
   IsString,
   IsUUID,
   Matches,
   Min,
 } from 'class-validator';
 import { CylinderSize } from '../../prices/dto/update-prices.dto';
+import { PaymentMethod } from '../service-request.entity';
 
 const PH_MOBILE_E164 = /^\+639\d{9}$/;
 
@@ -40,6 +42,9 @@ export class CreateCustomerServiceRequestDto {
   @IsInt()
   @Min(1)
   quantity!: number;
+
+  @IsIn(['Cash on Delivery', 'PayMongo'])
+  paymentMethod!: PaymentMethod;
 
   @IsOptional()
   @IsString()

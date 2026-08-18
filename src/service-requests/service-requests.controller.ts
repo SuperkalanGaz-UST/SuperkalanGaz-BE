@@ -21,6 +21,11 @@ import { ReassignServiceRequestDto } from './dto/reassign-service-request.dto';
 import { LogDelayReasonDto } from './dto/log-delay-reason.dto';
 import { ServiceRequest } from './service-request.entity';
 import { ServiceRequestsService } from './service-requests.service';
+import {
+  CheckoutView,
+  PaymentView,
+  ServiceRequestPaymentsService,
+} from './service-request-payments.service';
 
 /**
  * Service Request intake & queue (SRD module). Creating and processing daily
@@ -32,7 +37,10 @@ import { ServiceRequestsService } from './service-requests.service';
 @UseGuards(AuthGuard, RolesGuard)
 @Roles('branch-manager')
 export class ServiceRequestsController {
-  constructor(private readonly serviceRequests: ServiceRequestsService) {}
+  constructor(
+    private readonly serviceRequests: ServiceRequestsService,
+    private readonly payments: ServiceRequestPaymentsService,
+  ) {}
 
   @Get('me')
   @Roles('customer')
@@ -64,6 +72,24 @@ export class ServiceRequestsController {
       orderSource: row.orderSource,
     });
     return { serviceRequest: this.toRow(row) };
+  }
+
+  @Post(':id/payment/checkout')
+  @Roles('customer')
+  async createPaymentCheckout(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<{ payment: CheckoutView }> {
+    return { payment: await this.payments.createCheckout(principal, id) };
+  }
+
+  @Get(':id/payment')
+  @Roles('customer')
+  async paymentStatus(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<{ payment: PaymentView }> {
+    return { payment: await this.payments.status(principal, id) };
   }
 
   @Get()
@@ -208,6 +234,9 @@ export class ServiceRequestsController {
       quantity: sr.quantity,
       unit_price: sr.unitPrice,
       total_amount: sr.totalAmount,
+      payment_method: sr.paymentMethod,
+      payment_status: sr.paymentStatus,
+      payment_paid_at: sr.paymentPaidAt,
       special_instructions: sr.specialInstructions,
       rider_id: sr.riderId,
       requested_at: sr.requestedAt,

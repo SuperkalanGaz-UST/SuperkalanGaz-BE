@@ -22,6 +22,7 @@ import { LogDelayReasonDto } from './dto/log-delay-reason.dto';
 import { ServiceRequest } from './service-request.entity';
 import { ServiceRequestStatusHistory } from './service-request-status-history.entity';
 import { SlaConfiguration, SlaSegment } from './sla-configuration.entity';
+import { PayMongoService } from './paymongo.service';
 
 /** Human labels for the delay-reason dropdown categories, used to build the
  * single combined `delay_reason` display string (story BM-011). */
@@ -78,6 +79,7 @@ export class ServiceRequestsService {
     // Shared catalog lookup. Money is resolved server-side and snapshotted so
     // staff clients cannot submit a forged price.
     private readonly prices: PricesService,
+    private readonly payMongo: PayMongoService,
   ) {}
 
   /**
@@ -126,6 +128,14 @@ export class ServiceRequestsService {
       quantity: dto.quantity,
       unitPrice: product.unitPrice,
       totalAmount: Number((product.unitPrice * dto.quantity).toFixed(2)),
+      paymentMethod: 'Cash on Delivery',
+      paymentStatus: 'Unpaid',
+      paymongoCheckoutSessionId: null,
+      paymongoCheckoutUrl: null,
+      paymongoReference: null,
+      paymongoPaymentId: null,
+      paymongoWebhookEventId: null,
+      paymentPaidAt: null,
       specialInstructions: dto.specialInstructions?.trim() || null,
       // requested_at opens the SLA chain now; the rest fill in on later slices.
       requestedAt: now,
@@ -187,6 +197,14 @@ export class ServiceRequestsService {
       quantity: dto.quantity,
       unitPrice: product.unitPrice,
       totalAmount: Number((product.unitPrice * dto.quantity).toFixed(2)),
+      paymentMethod: dto.paymentMethod,
+      paymentStatus: 'Unpaid',
+      paymongoCheckoutSessionId: null,
+      paymongoCheckoutUrl: null,
+      paymongoReference: null,
+      paymongoPaymentId: null,
+      paymongoWebhookEventId: null,
+      paymentPaidAt: null,
       specialInstructions: dto.specialInstructions?.trim() || null,
       requestedAt: now,
       dispatchedAt: null,
@@ -326,6 +344,12 @@ export class ServiceRequestsService {
     if (serviceRequest.dispatchedAt !== null || serviceRequest.status !== 'Pending') {
       throw new ConflictException('Service request already dispatched');
     }
+    if (
+      serviceRequest.paymentMethod === 'PayMongo' &&
+      serviceRequest.paymentStatus !== 'Paid'
+    ) {
+      throw new ConflictException('PayMongo payment is required before dispatch');
+    }
 
     // 3. Rider must be live, Available, and in the SAME branch as the request.
     const rider = await this.fleet.findAssignableRider(
@@ -348,10 +372,20 @@ export class ServiceRequestsService {
         status: 'Dispatched',
         updatedAt: now,
       })
-      .where('id = :id AND dispatched_at IS NULL AND status = :status', {
-        id,
-        status: 'Pending',
-      })
+      .where(
+        `id = :id
+          AND branch_id = :branchId
+          AND dispatched_at IS NULL
+          AND status = :status
+          AND (payment_method <> :paymongo OR payment_status = :paid)`,
+        {
+          id,
+          branchId: serviceRequest.branchId,
+          status: 'Pending',
+          paymongo: 'PayMongo',
+          paid: 'Paid',
+        },
+      )
       .execute();
     if (!result.affected) {
       throw new ConflictException('Service request already dispatched');
@@ -414,17 +448,27 @@ export class ServiceRequestsService {
     //    Cancelled) — or a concurrent deliver already won — so treat it as the
     //    conflict, mirroring the dispatch race guard (AGENTS.md §8.2).
     const now = new Date();
+    const deliverySet: Partial<ServiceRequest> = {
+      deliveredAt: now,
+      status: 'Delivered',
+      updatedAt: now,
+    };
+    if (serviceRequest.paymentMethod === 'Cash on Delivery') {
+      // Same-row UPDATE makes delivery confirmation and Cash receipt one
+      // atomic database transition (CU-017 AC6).
+      deliverySet.paymentStatus = 'Paid';
+      deliverySet.paymentPaidAt = now;
+    }
     const result = await this.serviceRequests
       .createQueryBuilder()
       .update(ServiceRequest)
-      .set({
-        deliveredAt: now,
-        status: 'Delivered',
-        updatedAt: now,
-      })
+      .set(deliverySet)
       .where(
-        'id = :id AND dispatched_at IS NOT NULL AND delivered_at IS NULL',
-        { id },
+        `id = :id
+          AND branch_id = :branchId
+          AND dispatched_at IS NOT NULL
+          AND delivered_at IS NULL`,
+        { id, branchId: serviceRequest.branchId },
       )
       .execute();
     if (!result.affected) {
@@ -442,6 +486,10 @@ export class ServiceRequestsService {
     serviceRequest.deliveredAt = now;
     serviceRequest.status = 'Delivered';
     serviceRequest.updatedAt = now;
+    if (serviceRequest.paymentMethod === 'Cash on Delivery') {
+      serviceRequest.paymentStatus = 'Paid';
+      serviceRequest.paymentPaidAt = now;
+    }
 
     // 5. Persist the SLA breach record (BM-012), using the now-complete four
     //    timestamps. Best-effort: a threshold lookup failure must never block
@@ -595,6 +643,7 @@ export class ServiceRequestsService {
       where: { id, branchId: In(branchIds), deletedAt: IsNull() },
     });
     if (!serviceRequest) throw new NotFoundException('Service request not found');
+
     if (!['Pending', 'Dispatched', 'En Route'].includes(serviceRequest.status)) {
       throw new BadRequestException(
         `Cannot log a delay reason on a request that is ${serviceRequest.status}`,
@@ -661,6 +710,13 @@ export class ServiceRequestsService {
       where: { id, branchId: In(branchIds), deletedAt: IsNull() },
     });
     if (!serviceRequest) throw new NotFoundException('Service request not found');
+
+    if (
+      serviceRequest.paymentMethod === 'PayMongo' &&
+      serviceRequest.paymongoCheckoutSessionId
+    ) {
+      throw new ConflictException('Cannot edit after PayMongo checkout has started');
+    }
 
     // 2. Diff against the OLD values. Only changed fields land in `set` (the
     //    UPDATE) and `changes` (the human-readable audit note). specialInstructions
@@ -772,6 +828,19 @@ export class ServiceRequestsService {
     });
     if (!serviceRequest) throw new NotFoundException('Service request not found');
 
+    if (
+      serviceRequest.paymentMethod === 'PayMongo' &&
+      serviceRequest.paymentStatus === 'Paid'
+    ) {
+      throw new ConflictException('Paid PayMongo Service Requests cannot be cancelled');
+    }
+    if (
+      serviceRequest.paymentMethod === 'PayMongo' &&
+      serviceRequest.paymongoCheckoutSessionId
+    ) {
+      await this.payMongo.expireCheckout(serviceRequest.paymongoCheckoutSessionId);
+    }
+
     // 2. Commit atomically under the pre-dispatch guard. 0 rows affected means
     //    the request was dispatched (or already cancelled/deleted) between load
     //    and write — treat as the conflict, mirroring dispatch/deliver.
@@ -781,8 +850,18 @@ export class ServiceRequestsService {
       .update(ServiceRequest)
       .set({ status: 'Cancelled', updatedAt: now })
       .where(
-        'id = :id AND dispatched_at IS NULL AND status = :status AND deleted_at IS NULL',
-        { id, status: 'Pending' },
+        `id = :id
+          AND branch_id = :branchId
+          AND dispatched_at IS NULL
+          AND status = :status
+          AND deleted_at IS NULL
+          AND payment_status <> :paid`,
+        {
+          id,
+          branchId: serviceRequest.branchId,
+          status: 'Pending',
+          paid: 'Paid',
+        },
       )
       .execute();
     if (!result.affected) {

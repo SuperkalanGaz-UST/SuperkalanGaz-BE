@@ -13,6 +13,7 @@ import { Customer } from '../cim/customer.entity';
 import { FleetService } from '../fleet/fleet.service';
 import { Rider } from '../fleet/rider.entity';
 import { PricesService } from '../prices/prices.service';
+import { PayMongoService } from './paymongo.service';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
 import { ServiceRequest } from './service-request.entity';
 import { ServiceRequestStatusHistory } from './service-request-status-history.entity';
@@ -110,6 +111,11 @@ describe('ServiceRequestsService', () => {
       ),
     }) as unknown as jest.Mocked<PricesService>;
 
+  const makePayMongo = () =>
+    ({
+      expireCheckout: jest.fn(() => Promise.resolve()),
+    }) as unknown as jest.Mocked<PayMongoService>;
+
   // sla defaults to "no thresholds configured" so every pre-existing call site
   // (which only ever passed the first four args) is unaffected — appended at
   // the END of this helper's own params, even though the real constructor
@@ -129,6 +135,7 @@ describe('ServiceRequestsService', () => {
     fleet,
     cim,
     makePrices(),
+    makePayMongo(),
   );
 
   const inBranchCustomer = (): Customer =>
@@ -146,6 +153,9 @@ describe('ServiceRequestsService', () => {
       id: 'sr-1',
       branchId: 'branch-uuid-1',
       status: 'Pending',
+      paymentMethod: 'Cash on Delivery',
+      paymentStatus: 'Unpaid',
+      paymentPaidAt: null,
       dispatchedAt: null,
       riderId: null,
     }) as ServiceRequest;
@@ -157,6 +167,9 @@ describe('ServiceRequestsService', () => {
       id: 'sr-1',
       branchId: 'branch-uuid-1',
       status: 'Dispatched',
+      paymentMethod: 'Cash on Delivery',
+      paymentStatus: 'Unpaid',
+      paymentPaidAt: null,
       dispatchedAt: new Date(),
       inTransitAt: null,
       deliveredAt: null,
@@ -273,6 +286,7 @@ describe('ServiceRequestsService', () => {
       deliveryAddress: 'Las Pinas',
       cylinderSize: '2.7kg',
       quantity: 1,
+      paymentMethod: 'Cash on Delivery',
     });
 
     expect(cim.upsertSelfRegisteredInBranch).toHaveBeenCalledWith({
@@ -396,6 +410,23 @@ describe('ServiceRequestsService', () => {
       expect(qb.execute).not.toHaveBeenCalled();
     });
 
+    it('409s an unpaid PayMongo request before assigning a rider', async () => {
+      const { repo, qb } = makeRepo();
+      repo.findOne = jest.fn(() => Promise.resolve({
+        ...pendingSr(),
+        paymentMethod: 'PayMongo',
+        paymentStatus: 'Pending',
+      } as ServiceRequest)) as never;
+      const fleet = makeFleet(availableRider());
+      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
+
+      await expect(
+        service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-1' }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(fleet.findAssignableRider).not.toHaveBeenCalled();
+      expect(qb.execute).not.toHaveBeenCalled();
+    });
+
     it('409s when a concurrent dispatch won the race (0 rows affected)', async () => {
       // Row still looks Pending on load, but the conditional UPDATE touches 0
       // rows because another dispatch committed first (AGENTS.md §8.2).
@@ -454,10 +485,15 @@ describe('ServiceRequestsService', () => {
       expect(result.deliveredAt).toBeInstanceOf(Date);
       expect(result.status).toBe('Delivered');
       expect(result.updatedAt).toBeInstanceOf(Date);
+      expect(result.paymentStatus).toBe('Paid');
+      expect(result.paymentPaidAt).toBeInstanceOf(Date);
       // in_transit_at is not backfilled — the En Route leg is deferred (§8).
       expect(result.inTransitAt).toBeNull();
       // Committed via the conditional UPDATE (the race guard), not a plain save.
       expect(qb.execute).toHaveBeenCalledTimes(1);
+      expect(qb.set).toHaveBeenCalledWith(
+        expect.objectContaining({ paymentStatus: 'Paid' }),
+      );
       // The assigned rider goes back on the roster.
       expect(fleet.markAvailable).toHaveBeenCalledWith('rider-1');
     });
@@ -522,6 +558,7 @@ describe('ServiceRequestsService', () => {
         makeFleet(null),
         makeCim(null),
         makePrices(),
+        makePayMongo(),
       );
 
       const result = await service.edit(principal(['branch-uuid-1']), 'sr-1', {
@@ -566,6 +603,7 @@ describe('ServiceRequestsService', () => {
         makeFleet(null),
         makeCim(null),
         makePrices(),
+        makePayMongo(),
       );
 
       await expect(
@@ -590,6 +628,7 @@ describe('ServiceRequestsService', () => {
         makeFleet(null),
         makeCim(null),
         makePrices(),
+        makePayMongo(),
       );
 
       await expect(
@@ -616,6 +655,7 @@ describe('ServiceRequestsService', () => {
         makeFleet(null),
         makeCim(null),
         makePrices(),
+        makePayMongo(),
       );
 
       const result = await service.cancel(principal(['branch-uuid-1']), 'sr-1', {
@@ -637,6 +677,47 @@ describe('ServiceRequestsService', () => {
       expect(saved.note).toBe('Customer changed their mind');
     });
 
+    it('blocks cancellation after PayMongo payment is confirmed', async () => {
+      const { repo, qb } = makeRepo();
+      repo.findOne = jest.fn(() => Promise.resolve({
+        ...editablePendingSr(),
+        paymentMethod: 'PayMongo',
+        paymentStatus: 'Paid',
+      } as ServiceRequest)) as never;
+      const history = makeHistory();
+      const service = makeService(repo, history, makeFleet(null), makeCim(null));
+
+      await expect(
+        service.cancel(principal(['branch-uuid-1']), 'sr-1', { reason: 'cancel' }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(qb.execute).not.toHaveBeenCalled();
+      expect(history.save).not.toHaveBeenCalled();
+    });
+
+    it('expires an active unpaid PayMongo checkout before cancellation', async () => {
+      const { repo } = makeRepo(1);
+      repo.findOne = jest.fn(() => Promise.resolve({
+        ...editablePendingSr(),
+        paymentMethod: 'PayMongo',
+        paymentStatus: 'Pending',
+        paymongoCheckoutSessionId: 'cs_test_1',
+      } as ServiceRequest)) as never;
+      const payMongo = makePayMongo();
+      const service = new ServiceRequestsService(
+        repo,
+        makeBranches(),
+        makeHistory(),
+        makeSlaConfig(),
+        makeFleet(null),
+        makeCim(null),
+        makePrices(),
+        payMongo,
+      );
+
+      await service.cancel(principal(['branch-uuid-1']), 'sr-1', { reason: 'cancel' });
+      expect(payMongo.expireCheckout).toHaveBeenCalledWith('cs_test_1');
+    });
+
     it('409s when already dispatched (0 rows affected) and writes no history', async () => {
       const { repo, qb } = makeRepo(0);
       repo.findOne = jest.fn(() => Promise.resolve(editablePendingSr())) as never;
@@ -649,6 +730,7 @@ describe('ServiceRequestsService', () => {
         makeFleet(null),
         makeCim(null),
         makePrices(),
+        makePayMongo(),
       );
 
       await expect(
@@ -671,6 +753,7 @@ describe('ServiceRequestsService', () => {
         makeFleet(null),
         makeCim(null),
         makePrices(),
+        makePayMongo(),
       );
 
       await expect(
@@ -697,6 +780,7 @@ describe('ServiceRequestsService', () => {
         fleet,
         makeCim(null),
         makePrices(),
+        makePayMongo(),
       );
 
       const result = await service.reassign(principal(['branch-uuid-1']), 'sr-1', {
@@ -778,6 +862,7 @@ describe('ServiceRequestsService', () => {
         fleet,
         makeCim(null),
         makePrices(),
+        makePayMongo(),
       );
 
       await expect(

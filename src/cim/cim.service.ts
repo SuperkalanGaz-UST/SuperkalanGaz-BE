@@ -1,14 +1,14 @@
 import { ForbiddenException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { ILike, In, IsNull, Repository } from 'typeorm';
+import { IsNull, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Customer } from './customer.entity';
 import { CreateCustomerDto } from './dto/create-customer.dto';
 import { SearchCustomersQuery } from './dto/search-customers.query';
 
 /** A matched customer plus their most recent order date (MAX requested_at across
- * their non-deleted Service Requests), or null when they have no linked orders.
- * The controller flattens this into the snake_case CustomerRow. */
+ * their non-deleted Service Requests). The search query only returns customers
+ * with an order in the same branch, so this is non-null for persisted results. */
 export interface CustomerListItem {
   customer: Customer;
   lastOrderDate: Date | null;
@@ -33,8 +33,10 @@ export class CimService {
   ) {}
 
   /**
-   * List / search the caller's branch(es) for customers, excluding soft-deleted
-   * rows, ordered by name. Two modes on the same handler:
+   * List / search the caller's branch(es) for customers who have at least one
+   * linked, non-deleted Service Request in that same branch. This prevents a
+   * profile created for another branch—or an abandoned inline registration—from
+   * appearing in the caller's directory. Two modes on the same handler:
    *  - with a term (>= 2 chars, validated upstream): the intake autocomplete —
    *    name OR contact_number case-insensitive substring, capped at 20;
    *  - without a term: the CIM Customers directory (BM-031) — the whole branch,
@@ -48,27 +50,38 @@ export class CimService {
   ): Promise<CustomerListItem[]> {
     const branchIds = this.requireBranches(principal);
     const term = query.search?.trim();
-    const scope = { branchId: In(branchIds), deletedAt: IsNull() };
 
-    // No term → full branch directory (bounded). With a term → name/contact match.
-    // Each OR branch must carry the full scope (branch + soft-delete).
-    const customers = term
-      ? await this.customers.find({
-          where: [
-            { ...scope, name: ILike(`%${term}%`) },
-            { ...scope, contactNumber: ILike(`%${term}%`) },
-          ],
-          order: { name: 'ASC' },
-          take: 20,
-        })
-      : await this.customers.find({
-          where: scope,
-          order: { name: 'ASC' },
-          take: 200,
-        });
+    const customerQuery = this.customers
+      .createQueryBuilder('customer')
+      .where('customer.branch_id IN (:...branchIds)', { branchIds })
+      .andWhere('customer.deleted_at IS NULL')
+      .andWhere(
+        `EXISTS (
+          SELECT 1
+          FROM srd.service_requests service_request
+          WHERE service_request.customer_id = customer.id
+            AND service_request.branch_id = customer.branch_id
+            AND service_request.deleted_at IS NULL
+        )`,
+      );
+
+    if (term) {
+      customerQuery.andWhere(
+        '(customer.name ILIKE :term OR customer.contact_number ILIKE :term)',
+        { term: `%${term}%` },
+      );
+    }
+
+    const customers = await customerQuery
+      .orderBy('customer.name', 'ASC')
+      .take(term ? 20 : 200)
+      .getMany();
     if (customers.length === 0) return [];
 
-    const lastOrders = await this.lastOrderDates(customers.map((c) => c.id));
+    const lastOrders = await this.lastOrderDates(
+      customers.map((c) => c.id),
+      branchIds,
+    );
     return customers.map((customer) => ({
       customer,
       lastOrderDate: lastOrders.get(customer.id) ?? null,
@@ -185,6 +198,7 @@ export class CimService {
    */
   private async lastOrderDates(
     customerIds: string[],
+    branchIds: string[],
   ): Promise<Map<string, Date>> {
     const rows = await this.customers.manager
       .createQueryBuilder()
@@ -192,6 +206,7 @@ export class CimService {
       .addSelect('MAX(sr.requested_at)', 'last_order_date')
       .from('srd.service_requests', 'sr')
       .where('sr.customer_id IN (:...customerIds)', { customerIds })
+      .andWhere('sr.branch_id IN (:...branchIds)', { branchIds })
       .andWhere('sr.deleted_at IS NULL')
       .groupBy('sr.customer_id')
       .getRawMany<{ customer_id: string; last_order_date: Date }>();
