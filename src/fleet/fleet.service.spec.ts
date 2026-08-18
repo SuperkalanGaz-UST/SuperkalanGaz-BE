@@ -40,6 +40,7 @@ describe('FleetService', () => {
       findOne: jest.fn(() => Promise.resolve(vehicle)),
       update: jest.fn(() => Promise.resolve({ affected: 1 })),
       create: jest.fn((v) => v),
+      save: jest.fn((v) => Promise.resolve({ id: 'vehicle-new', ...v })),
       __vehicle: vehicle,
     } as unknown as jest.Mocked<Repository<Vehicle>> & { __vehicle: Vehicle };
   };
@@ -158,6 +159,84 @@ describe('FleetService', () => {
 
     const [, patch] = riderRepo.update.mock.calls[0];
     expect((patch as Partial<Rider>).status).toBe('Maintenance Due');
+  });
+
+  it('registers a vehicle in the JWT-derived branch and starts PMS tracking at its odometer', async () => {
+    const riderRepo = makeRiderRepo();
+    riderRepo.findOne.mockResolvedValueOnce({
+      id: '550e8400-e29b-41d4-a716-446655440000',
+      branchId: 'branch-uuid-1',
+      deletedAt: null,
+    } as Rider);
+    const vehicleRepo = makeVehicleRepo();
+    vehicleRepo.findOne
+      .mockResolvedValueOnce(null) // plate is free
+      .mockResolvedValueOnce(null); // rider is not assigned elsewhere
+    const service = makeService(riderRepo, vehicleRepo);
+
+    const registered = await service.registerVehicle(principal(['branch-uuid-1']), {
+      plateNumber: '  abc-1234  ',
+      initialOdometerKm: 4250,
+      assignedRiderId: '550e8400-e29b-41d4-a716-446655440000',
+    });
+
+    expect(vehicleRepo.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        branchId: 'branch-uuid-1',
+        plateNumber: 'ABC-1234',
+        vehicleType: 'motorcycle',
+        assignedRiderId: '550e8400-e29b-41d4-a716-446655440000',
+        status: 'active',
+        currentOdometerKm: 4250,
+        lastPmsOdometerKm: 4250,
+      }),
+    );
+    expect(registered.id).toBe('vehicle-new');
+  });
+
+  it('rejects registration when the plate already exists in the manager branch', async () => {
+    const vehicleRepo = makeVehicleRepo();
+    const service = makeService(makeRiderRepo(), vehicleRepo);
+
+    await expect(
+      service.registerVehicle(principal(['branch-uuid-1']), {
+        plateNumber: 'NBH-1234',
+        initialOdometerKm: 0,
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+
+    expect(vehicleRepo.save).not.toHaveBeenCalled();
+  });
+
+  it('rejects registration when a rider is outside the manager branch', async () => {
+    const riderRepo = makeRiderRepo();
+    const vehicleRepo = makeVehicleRepo();
+    vehicleRepo.findOne.mockResolvedValueOnce(null);
+    const service = makeService(riderRepo, vehicleRepo);
+
+    await expect(
+      service.registerVehicle(principal(['branch-uuid-1']), {
+        plateNumber: 'ABC-1234',
+        initialOdometerKm: 0,
+        assignedRiderId: '550e8400-e29b-41d4-a716-446655440000',
+      }),
+    ).rejects.toThrow('Assigned rider was not found in this branch');
+
+    expect(vehicleRepo.save).not.toHaveBeenCalled();
+  });
+
+  it('fails closed instead of choosing a client branch for vehicle registration', async () => {
+    const vehicleRepo = makeVehicleRepo();
+    const service = makeService(makeRiderRepo(), vehicleRepo);
+
+    await expect(
+      service.registerVehicle(principal(['branch-uuid-1', 'branch-uuid-2']), {
+        plateNumber: 'ABC-1234',
+        initialOdometerKm: 0,
+      }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+
+    expect(vehicleRepo.save).not.toHaveBeenCalled();
   });
 
   it('logMileage flags the vehicle for maintenance once the branch threshold is reached', async () => {

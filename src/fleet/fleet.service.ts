@@ -6,9 +6,10 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, IsNull, LessThanOrEqual, Repository } from 'typeorm';
+import { In, IsNull, LessThanOrEqual, QueryFailedError, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
+import { CreateVehicleDto } from './dto/create-vehicle.dto';
 import { ListRidersQuery } from './dto/list-riders.query';
 import { LogMileageDto } from './dto/log-mileage.dto';
 import { Rider } from './rider.entity';
@@ -140,6 +141,76 @@ export class FleetService {
         updatedAt: new Date(),
       },
     );
+  }
+
+  /**
+   * Register a delivery motorcycle in the authenticated Branch Manager's sole
+   * branch. No branch identifier is accepted from the client. The starting
+   * odometer is also the initial PMS baseline, so maintenance distance begins
+   * accumulating from the point the vehicle enters the CRM roster.
+   */
+  async registerVehicle(
+    principal: Principal,
+    dto: CreateVehicleDto,
+  ): Promise<Vehicle> {
+    const branchId = this.requireSingleBranch(principal);
+    const plateNumber = dto.plateNumber.trim().toUpperCase().replace(/\s+/g, ' ');
+    const branch = await this.branches.findOne({ where: { id: branchId } });
+    if (!branch) throw new ForbiddenException('Caller has no active branch');
+
+    const existingPlate = await this.vehicles.findOne({
+      where: { branchId, plateNumber },
+    });
+    if (existingPlate) {
+      throw new ConflictException('A vehicle with this plate number is already registered');
+    }
+
+    if (dto.assignedRiderId) {
+      const rider = await this.riders.findOne({
+        where: {
+          id: dto.assignedRiderId,
+          branchId,
+          deletedAt: IsNull(),
+        },
+      });
+      if (!rider) {
+        throw new BadRequestException('Assigned rider was not found in this branch');
+      }
+
+      const assignedVehicle = await this.vehicles.findOne({
+        where: { branchId, assignedRiderId: rider.id },
+      });
+      if (assignedVehicle) {
+        throw new ConflictException('This rider is already assigned to another vehicle');
+      }
+    }
+
+    const now = new Date();
+    const vehicle = this.vehicles.create({
+      branchId,
+      plateNumber,
+      vehicleType: 'motorcycle',
+      assignedRiderId: dto.assignedRiderId ?? null,
+      status: 'active',
+      currentOdometerKm: dto.initialOdometerKm,
+      lastPmsOdometerKm: dto.initialOdometerKm,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    try {
+      return await this.vehicles.save(vehicle);
+    } catch (error) {
+      if (
+        error instanceof QueryFailedError &&
+        (error as { code?: string }).code === '23505'
+      ) {
+        throw new ConflictException(
+          'The plate number or assigned rider is already registered',
+        );
+      }
+      throw error;
+    }
   }
 
   /** The caller's branch vehicle roster (story BM-042), plate order. */
@@ -310,5 +381,13 @@ export class FleetService {
       throw new ForbiddenException('Caller has no active branch');
     }
     return principal.branchIds;
+  }
+
+  /** A Branch Manager owns one branch. Fail closed if token metadata drifts. */
+  private requireSingleBranch(principal: Principal): string {
+    if (principal.branchIds.length !== 1) {
+      throw new ForbiddenException('Caller must have exactly one active branch');
+    }
+    return principal.branchIds[0];
   }
 }

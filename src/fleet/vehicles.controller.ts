@@ -3,6 +3,7 @@ import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
+import { CreateVehicleDto } from './dto/create-vehicle.dto';
 import { LogMileageDto } from './dto/log-mileage.dto';
 import { FleetService } from './fleet.service';
 import { Vehicle } from './vehicle.entity';
@@ -18,6 +19,19 @@ import { VehicleMaintenanceLog } from './vehicle-maintenance-log.entity';
 @Roles('branch-manager')
 export class VehiclesController {
   constructor(private readonly fleet: FleetService) {}
+
+  @Post()
+  async create(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: CreateVehicleDto,
+  ): Promise<{ vehicle: ReturnType<VehiclesController['toRow']> }> {
+    const vehicle = await this.fleet.registerVehicle(principal, dto);
+    const [riderNames, thresholds] = await Promise.all([
+      this.fleet.riderNamesFor(this.assignedRiderIds([vehicle])),
+      this.fleet.maintenanceThresholdsForBranches([vehicle.branchId]),
+    ]);
+    return { vehicle: this.toRow(vehicle, riderNames, thresholds) };
+  }
 
   @Get()
   async list(
