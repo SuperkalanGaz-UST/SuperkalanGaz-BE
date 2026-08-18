@@ -5,8 +5,9 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { describe, expect, it, jest } from '@jest/globals';
-import { Repository } from 'typeorm';
+import { FindOperator, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
+import { Branch } from '../branches/branch.entity';
 import { CimService } from '../cim/cim.service';
 import { Customer } from '../cim/customer.entity';
 import { FleetService } from '../fleet/fleet.service';
@@ -77,7 +78,21 @@ describe('ServiceRequestsService', () => {
   const makeCim = (customer: Customer | null) =>
     ({
       findInBranch: jest.fn(() => Promise.resolve(customer)),
+      upsertSelfRegisteredInBranch: jest.fn(() =>
+        Promise.resolve(
+          customer ??
+            ({ id: 'mobile-cust-1', branchId: 'branch-uuid-1' } as Customer),
+        ),
+      ),
+      profileIdsForAuthUser: jest.fn(() =>
+        Promise.resolve(customer ? [customer.id] : []),
+      ),
     }) as unknown as jest.Mocked<CimService>;
+
+  const makeBranches = (branch: Branch | null = null) =>
+    ({
+      findOne: jest.fn(() => Promise.resolve(branch)),
+    }) as unknown as jest.Mocked<Repository<Branch>>;
 
   // Fake status-history repo: `create` echoes its input (as the real one does),
   // `save` is a spy. Edit/cancel tests inspect these to assert an audit row was
@@ -105,7 +120,16 @@ describe('ServiceRequestsService', () => {
     fleet: jest.Mocked<FleetService>,
     cim: jest.Mocked<CimService>,
     sla: jest.Mocked<Repository<SlaConfiguration>> = makeSlaConfig(),
-  ) => new ServiceRequestsService(repo, history, sla, fleet, cim, makePrices());
+    branches: jest.Mocked<Repository<Branch>> = makeBranches(),
+  ) => new ServiceRequestsService(
+    repo,
+    branches,
+    history,
+    sla,
+    fleet,
+    cim,
+    makePrices(),
+  );
 
   const inBranchCustomer = (): Customer =>
     ({ id: 'cust-1', branchId: 'branch-uuid-1' }) as Customer;
@@ -213,6 +237,74 @@ describe('ServiceRequestsService', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
     // Rejected before persisting the order.
     expect(repo.save).not.toHaveBeenCalled();
+  });
+
+  it('upserts a mobile customer into branch CIM and links the order to that profile', async () => {
+    const { repo } = makeRepo();
+    const customer = {
+      id: 'mobile-cust-1',
+      branchId: 'branch-uuid-1',
+      authUserId: 'auth-user-1',
+    } as Customer;
+    const cim = makeCim(customer);
+    const branches = makeBranches({
+      id: 'branch-uuid-1',
+      status: 'active',
+    } as Branch);
+    const service = makeService(
+      repo,
+      makeHistory(),
+      makeFleet(null),
+      cim,
+      makeSlaConfig(),
+      branches,
+    );
+    const mobilePrincipal: Principal = {
+      userId: 'auth-user-1',
+      role: 'customer',
+      branches: [],
+      branchIds: [],
+    };
+
+    const result = await service.createForCustomer(mobilePrincipal, {
+      branchId: 'branch-uuid-1',
+      customerName: 'Shoti Go',
+      customerContact: '+639399168168',
+      deliveryAddress: 'Las Pinas',
+      cylinderSize: '2.7kg',
+      quantity: 1,
+    });
+
+    expect(cim.upsertSelfRegisteredInBranch).toHaveBeenCalledWith({
+      authUserId: 'auth-user-1',
+      branchId: 'branch-uuid-1',
+      name: 'Shoti Go',
+      contactNumber: '+639399168168',
+      deliveryAddress: 'Las Pinas',
+    });
+    expect(result.customerId).toBe('mobile-cust-1');
+    expect(result.orderSource).toBe('Mobile App');
+    expect(repo.save).toHaveBeenCalledTimes(1);
+  });
+
+  it('loads customer history through owned CIM profile ids with a legacy fallback', async () => {
+    const { repo } = makeRepo();
+    const cim = makeCim(inBranchCustomer());
+    const service = makeService(repo, makeHistory(), makeFleet(null), cim);
+    const mobilePrincipal: Principal = {
+      userId: 'auth-user-1',
+      role: 'customer',
+      branches: [],
+      branchIds: [],
+    };
+
+    await service.listForCustomer(mobilePrincipal);
+
+    expect(cim.profileIdsForAuthUser).toHaveBeenCalledWith('auth-user-1');
+    const where = repo.find.mock.calls[0][0]?.where as {
+      customerId: FindOperator<string>;
+    };
+    expect(where.customerId.value).toEqual(['auth-user-1', 'cust-1']);
   });
 
   it('fails closed when the caller has no active branch', async () => {
@@ -424,6 +516,7 @@ describe('ServiceRequestsService', () => {
       const history = makeHistory();
       const service = new ServiceRequestsService(
         repo,
+        makeBranches(),
         history,
         makeSlaConfig(),
         makeFleet(null),
@@ -467,6 +560,7 @@ describe('ServiceRequestsService', () => {
       const history = makeHistory();
       const service = new ServiceRequestsService(
         repo,
+        makeBranches(),
         history,
         makeSlaConfig(),
         makeFleet(null),
@@ -490,6 +584,7 @@ describe('ServiceRequestsService', () => {
       const history = makeHistory();
       const service = new ServiceRequestsService(
         repo,
+        makeBranches(),
         history,
         makeSlaConfig(),
         makeFleet(null),
@@ -515,6 +610,7 @@ describe('ServiceRequestsService', () => {
       const history = makeHistory();
       const service = new ServiceRequestsService(
         repo,
+        makeBranches(),
         history,
         makeSlaConfig(),
         makeFleet(null),
@@ -547,6 +643,7 @@ describe('ServiceRequestsService', () => {
       const history = makeHistory();
       const service = new ServiceRequestsService(
         repo,
+        makeBranches(),
         history,
         makeSlaConfig(),
         makeFleet(null),
@@ -568,6 +665,7 @@ describe('ServiceRequestsService', () => {
       const history = makeHistory();
       const service = new ServiceRequestsService(
         repo,
+        makeBranches(),
         history,
         makeSlaConfig(),
         makeFleet(null),
@@ -593,6 +691,7 @@ describe('ServiceRequestsService', () => {
       const fleet = makeFleet(newAssignableRider(), currentAssignedRider());
       const service = new ServiceRequestsService(
         repo,
+        makeBranches(),
         history,
         makeSlaConfig(),
         fleet,
@@ -673,6 +772,7 @@ describe('ServiceRequestsService', () => {
       const fleet = makeFleet(newAssignableRider(), currentAssignedRider());
       const service = new ServiceRequestsService(
         repo,
+        makeBranches(),
         history,
         makeSlaConfig(),
         fleet,

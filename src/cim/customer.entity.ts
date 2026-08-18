@@ -2,9 +2,8 @@ import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
 
 /** How a customer profile came to exist. 'staff-created' is a Branch Manager
  * registering the customer during intake (story BM-031). 'self-registered' is
- * customer mobile self-registration — a valid value, but no code path writes it
- * yet (the customer mobile client is not built). Only 'staff-created' is emitted
- * by this API today. */
+ * an authenticated mobile customer materialized into the branch-owned CIM
+ * directory when they first place an order with that branch. */
 export type RegistrationSource = 'staff-created' | 'self-registered';
 
 /**
@@ -28,6 +27,12 @@ export class Customer {
   @Column({ name: 'branch_id', type: 'uuid' })
   branchId!: string;
 
+  /** Logical reference to auth.users.id for mobile self-registered customers.
+   * It is null for staff-created profiles. A customer can order from more than
+   * one branch, so each branch gets its own CIM profile for the same auth user. */
+  @Column({ name: 'auth_user_id', type: 'uuid', nullable: true })
+  authUserId!: string | null;
+
   @Column({ type: 'text' })
   name!: string;
 
@@ -37,8 +42,7 @@ export class Customer {
   @Column({ name: 'delivery_address', type: 'text' })
   deliveryAddress!: string;
 
-  /** 'staff-created' | 'self-registered'. Only 'staff-created' is written here
-   * (see RegistrationSource). */
+  /** 'staff-created' | 'self-registered' (see RegistrationSource). */
   @Column({ name: 'registration_source', type: 'text' })
   registrationSource!: RegistrationSource;
 

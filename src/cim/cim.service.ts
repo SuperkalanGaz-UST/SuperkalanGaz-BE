@@ -86,6 +86,7 @@ export class CimService {
     const now = new Date();
     const customer = this.customers.create({
       branchId,
+      authUserId: null,
       name: dto.name.trim(),
       contactNumber: dto.contactNumber.trim(),
       deliveryAddress: dto.deliveryAddress.trim(),
@@ -98,6 +99,62 @@ export class CimService {
     });
 
     return this.customers.save(customer);
+  }
+
+  /**
+   * Materialize an authenticated mobile customer into the selected branch's
+   * CIM directory when they place an order. Registration itself cannot create
+   * this row because a mobile account is global and has no branch until an
+   * order is addressed to one.
+   *
+   * The unique (branch_id, auth_user_id) index makes this an idempotent,
+   * race-safe upsert. Only server-verified identity and the already-validated
+   * order branch reach this method; neither value comes from an editable
+   * customer profile field.
+   */
+  async upsertSelfRegisteredInBranch(input: {
+    authUserId: string;
+    branchId: string;
+    name: string;
+    contactNumber: string;
+    deliveryAddress: string;
+  }): Promise<Customer> {
+    const now = new Date();
+    await this.customers.upsert(
+      {
+        branchId: input.branchId,
+        authUserId: input.authUserId,
+        name: input.name.trim(),
+        contactNumber: input.contactNumber.trim(),
+        deliveryAddress: input.deliveryAddress.trim(),
+        registrationSource: 'self-registered',
+        // created_at is omitted so the DB default handles inserts and repeat
+        // orders never rewrite the profile's original creation timestamp.
+        updatedAt: now,
+        deletedAt: null,
+      },
+      {
+        conflictPaths: ['branchId', 'authUserId'],
+        skipUpdateIfNoValuesChanged: true,
+      },
+    );
+
+    return this.customers.findOneByOrFail({
+      branchId: input.branchId,
+      authUserId: input.authUserId,
+      deletedAt: IsNull(),
+    });
+  }
+
+  /** Resolve every live branch-owned CIM profile belonging to one authenticated
+   * mobile customer. Used only for that customer's own order history. */
+  async profileIdsForAuthUser(authUserId: string): Promise<string[]> {
+    const profiles = await this.customers.find({
+      where: { authUserId, deletedAt: IsNull() },
+      select: { id: true },
+      take: 200,
+    });
+    return profiles.map((profile) => profile.id);
   }
 
   /**

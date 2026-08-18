@@ -142,8 +142,9 @@ export class ServiceRequestsService {
 
   /**
    * Customer-app order placement. The customer chooses the branch and the API
-   * stores the authenticated auth user id in customer_id so the same user can
-   * read back their order history/status later.
+   * materializes their authenticated identity into that branch's CIM directory.
+   * The order links to the resulting CIM profile; the profile retains the
+   * auth.users reference needed to read the customer's own history.
    */
   async createForCustomer(
     principal: Principal,
@@ -164,13 +165,21 @@ export class ServiceRequestsService {
       throw new BadRequestException('Branch not found');
     }
 
+    const customer = await this.cim.upsertSelfRegisteredInBranch({
+      authUserId: principal.userId,
+      branchId: branch.id,
+      name: dto.customerName,
+      contactNumber: dto.customerContact,
+      deliveryAddress: dto.deliveryAddress,
+    });
+
     const product = await this.prices.findByCylinderSize(dto.cylinderSize);
     const now = new Date();
     const serviceRequest = this.serviceRequests.create({
       branchId: branch.id,
       orderSource: 'Mobile App',
       status: 'Pending',
-      customerId: principal.userId,
+      customerId: customer.id,
       customerName: dto.customerName.trim(),
       customerContact: dto.customerContact.trim(),
       deliveryAddress: dto.deliveryAddress.trim(),
@@ -215,8 +224,13 @@ export class ServiceRequestsService {
 
   /** Customer order history, newest first. */
   async listForCustomer(principal: Principal): Promise<ServiceRequest[]> {
+    const profileIds = await this.cim.profileIdsForAuthUser(principal.userId);
+    // Include the auth subject for legacy mobile orders written before mobile
+    // customers were materialized into CIM. Migration 0025 rewrites those rows,
+    // but this fallback keeps history readable during a rolling deployment.
+    const ownedCustomerIds = [...new Set([principal.userId, ...profileIds])];
     return this.serviceRequests.find({
-      where: { customerId: principal.userId, deletedAt: IsNull() },
+      where: { customerId: In(ownedCustomerIds), deletedAt: IsNull() },
       order: { requestedAt: 'DESC' },
     });
   }

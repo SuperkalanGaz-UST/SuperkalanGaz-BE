@@ -18,7 +18,11 @@ describe('CimService', () => {
   // Fake repo. `find` returns the seeded matches; `manager.createQueryBuilder`
   // yields a chainable builder whose `getRawMany` reports the per-customer
   // last-order aggregate. `create` echoes input; `save` resolves it with an id.
-  const makeRepo = (opts?: { found?: Customer[]; rawOrders?: unknown[] }) => {
+  const makeRepo = (opts?: {
+    found?: Customer[];
+    rawOrders?: unknown[];
+    selfRegistered?: Customer;
+  }) => {
     const getRawMany = jest.fn(() => Promise.resolve(opts?.rawOrders ?? []));
     const qb = {
       select: jest.fn().mockReturnThis(),
@@ -32,8 +36,15 @@ describe('CimService', () => {
     const repo = {
       create: jest.fn((v: Partial<Customer>) => v as Customer),
       save: jest.fn((v: Customer) => Promise.resolve({ ...v, id: 'cust-1' })),
+      upsert: jest.fn(() => Promise.resolve({ identifiers: [], generatedMaps: [], raw: [] })),
       find: jest.fn(() => Promise.resolve(opts?.found ?? [])),
       findOne: jest.fn(() => Promise.resolve(null)),
+      findOneByOrFail: jest.fn(() =>
+        Promise.resolve(
+          opts?.selfRegistered ??
+            ({ id: 'mobile-cust-1', branchId: 'branch-uuid-1' } as Customer),
+        ),
+      ),
       manager: { createQueryBuilder: jest.fn(() => qb) },
     } as unknown as jest.Mocked<Repository<Customer>>;
     return { repo, qb };
@@ -165,6 +176,66 @@ describe('CimService', () => {
     });
   });
 
+  describe('mobile customer projection', () => {
+    it('upserts a self-registered profile using auth identity plus branch', async () => {
+      const selfRegistered = {
+        id: 'mobile-cust-1',
+        branchId: 'branch-uuid-1',
+        authUserId: 'auth-user-1',
+      } as Customer;
+      const { repo } = makeRepo({ selfRegistered });
+      const service = new CimService(repo);
+
+      const result = await service.upsertSelfRegisteredInBranch({
+        authUserId: 'auth-user-1',
+        branchId: 'branch-uuid-1',
+        name: '  Shoti Go ',
+        contactNumber: ' +639399168168 ',
+        deliveryAddress: '  Las Pinas ',
+      });
+
+      expect(repo.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branchId: 'branch-uuid-1',
+          authUserId: 'auth-user-1',
+          name: 'Shoti Go',
+          contactNumber: '+639399168168',
+          deliveryAddress: 'Las Pinas',
+          registrationSource: 'self-registered',
+          deletedAt: null,
+        }),
+        expect.objectContaining({
+          conflictPaths: ['branchId', 'authUserId'],
+        }),
+      );
+      expect(repo.findOneByOrFail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branchId: 'branch-uuid-1',
+          authUserId: 'auth-user-1',
+        }),
+      );
+      expect(result).toBe(selfRegistered);
+    });
+
+    it('resolves profile ids by authenticated owner for customer history', async () => {
+      const { repo } = makeRepo({
+        found: [customer('cust-1'), customer('cust-2')],
+      });
+      const service = new CimService(repo);
+
+      await expect(service.profileIdsForAuthUser('auth-user-1')).resolves.toEqual([
+        'cust-1',
+        'cust-2',
+      ]);
+      expect(repo.find).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ authUserId: 'auth-user-1' }),
+          select: { id: true },
+        }),
+      );
+    });
+  });
+
   // The min-2-char / required rule is enforced by the query DTO (ValidationPipe
   // → 400), not the service, so it is covered here at the DTO level.
   describe('SearchCustomersQuery validation', () => {
@@ -181,8 +252,8 @@ describe('CimService', () => {
       expect((await validateSearch(' a ')).length).toBeGreaterThan(0);
     });
 
-    it('rejects a missing term', async () => {
-      expect((await validateSearch(undefined)).length).toBeGreaterThan(0);
+    it('accepts a missing term for the bounded customer directory listing', async () => {
+      expect(await validateSearch(undefined)).toHaveLength(0);
     });
   });
 });
