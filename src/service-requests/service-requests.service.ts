@@ -11,6 +11,7 @@ import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
 import { CimService } from '../cim/cim.service';
 import { FleetService } from '../fleet/fleet.service';
+import { LoyaltyService } from '../loyalty/loyalty.service';
 import { PricesService } from '../prices/prices.service';
 import { CreateCustomerServiceRequestDto } from './dto/create-customer-service-request.dto';
 import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
@@ -80,6 +81,7 @@ export class ServiceRequestsService {
     // staff clients cannot submit a forged price.
     private readonly prices: PricesService,
     private readonly payMongo: PayMongoService,
+    private readonly loyalty: LoyaltyService,
   ) {}
 
   /**
@@ -477,9 +479,15 @@ export class ServiceRequestsService {
 
     // 4. Return the assigned rider to the Available roster (inverse of dispatch's
     //    markOnDelivery). rider_id is always set on an out-for-delivery request,
-    //    but guard defensively in case of legacy data.
+    //    but guard defensively in case of legacy data. Best-effort: a vehicle
+    //    lookup failure must never block the delivery itself — the rider can be
+    //    reset manually or on the next deliver attempt.
     if (serviceRequest.riderId) {
-      await this.fleet.markAvailable(serviceRequest.riderId);
+      try {
+        await this.fleet.markAvailable(serviceRequest.riderId);
+      } catch {
+        // Non-fatal — the delivery committed; the rider may need a manual reset.
+      }
     }
 
     // Reflect the committed state back to the caller without a re-read.
@@ -512,6 +520,17 @@ export class ServiceRequestsService {
       }
     } catch {
       // Non-fatal — the delivery itself already committed successfully.
+    }
+
+    // 6. Record household points for the completed delivery if the order is linked to a customer
+    if (serviceRequest.customerId) {
+      await this.loyalty.recordHouseholdEarn(
+        serviceRequest.customerId,
+        serviceRequest.branchId,
+        serviceRequest.id,
+        serviceRequest.cylinderSize,
+        serviceRequest.quantity,
+      );
     }
 
     return serviceRequest;
@@ -599,10 +618,14 @@ export class ServiceRequestsService {
     }
 
     // 6. Swap fleet availability: free the old rider, claim the new one.
-    await Promise.all([
-      this.fleet.markAvailable(oldRiderId),
-      this.fleet.markOnDelivery(newRider.id),
-    ]);
+    //    markAvailable is best-effort — a vehicle-lookup failure must not prevent
+    //    the new rider from being claimed (the old rider can be reset manually).
+    try {
+      await this.fleet.markAvailable(oldRiderId);
+    } catch {
+      // Non-fatal — the old rider may remain On Delivery; manual reset possible.
+    }
+    await this.fleet.markOnDelivery(newRider.id);
 
     // 7. Audit the reassignment. Status is unchanged (see the interpretation
     //    note above), so from/to are both the request's current status.

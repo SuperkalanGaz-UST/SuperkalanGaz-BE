@@ -12,14 +12,15 @@ import { Redemption } from '../loyalty/redemption.entity';
 /** The household reward catalog planted for the demo branch. Keyed by name within
  * the branch (name is the idempotency handle — re-running updates in place). */
 const CATALOG: { name: string; description: string; pointsCost: number; stockQty: number }[] = [
-  { name: 'BBQ Grill Lighter', description: 'Refillable long-neck lighter', pointsCost: 150, stockQty: 25 },
-  { name: '₱100 Refill Voucher', description: 'Discount on next cylinder refill', pointsCost: 300, stockQty: 40 },
-  { name: 'Gas Stove Cleaning Kit', description: 'Brush + degreaser set', pointsCost: 500, stockQty: 10 },
+  { name: 'Notebook and Pen', description: 'Superkalan Gaz branded notebook and pen set', pointsCost: 10, stockQty: 25 },
+  { name: 'Desk Calendar', description: 'Superkalan Gaz desk calendar', pointsCost: 20, stockQty: 20 },
+  { name: 'Umbrella', description: 'Compact foldable umbrella', pointsCost: 30, stockQty: 15 },
+  { name: 'Mug', description: 'Ceramic coffee mug', pointsCost: 40, stockQty: 20 },
 ];
 
 /** Starting balance for the demo household account — enough to cover any single
  * catalog item so the approve flow is demoable end to end. */
-const DEMO_POINTS_BALANCE = 500;
+const DEMO_POINTS_BALANCE = 50;
 
 /** Demo commercial "30+1" account state: one earned-but-unredeemed free cylinder
  * (completed_cycles) and partway through the next cycle (current_cycle_count, 0–30)
@@ -73,30 +74,32 @@ async function run(): Promise<void> {
     );
     const redemptions = app.get<Repository<Redemption>>(getRepositoryToken(Redemption));
 
-    // Pick a demo branch: the first active branch that has a live customer to
-    // redeem against. Fall back to any active branch for catalog-only seeding.
-    const activeBranches = await branches.find({
-      where: { status: 'active' },
-      order: { name: 'ASC' },
-    });
-    if (activeBranches.length === 0) {
-      console.warn('[seed] no active branch found — nothing seeded');
+    // Pick the Amadeo, Cavite branch specifically for catalog seeding.
+    const PREFERRED_BRANCH_NAME = 'Amadeo, Cavite';
+    let branch = await branches.findOne({ where: { name: PREFERRED_BRANCH_NAME } });
+    if (!branch) {
+      // Fall back to the first active branch if the preferred one doesn't exist
+      const activeBranches = await branches.find({
+        where: { status: 'active' },
+        order: { name: 'ASC' },
+      });
+      if (activeBranches.length === 0) {
+        console.warn('[seed] no active branch found — nothing seeded');
+        return;
+      }
+      branch = activeBranches[0];
+    }
+
+    if (!branch) {
+      console.warn('[seed] no branch resolved — nothing seeded');
       return;
     }
 
-    let branch = activeBranches[0];
-    let customer: Customer | null = null;
-    for (const b of activeBranches) {
-      const c = await customers.findOne({
-        where: { branchId: b.id, deletedAt: IsNull() },
-        order: { createdAt: 'ASC' },
-      });
-      if (c) {
-        branch = b;
-        customer = c;
-        break;
-      }
-    }
+    // Look for an existing customer in this branch
+    let customer: Customer | null = await customers.findOne({
+      where: { branchId: branch.id, deletedAt: IsNull() },
+      order: { createdAt: 'ASC' },
+    });
 
     const now = new Date();
 
@@ -120,14 +123,20 @@ async function run(): Promise<void> {
             deletedAt: null,
           }),
         );
-      } else {
-        // Reuse the existing demo profile; align the working branch to it so the
-        // account + redemption below are consistent with the catalog we seed.
-        branch = activeBranches.find((b) => b.id === customer!.branchId) ?? branch;
       }
     }
 
-    // --- Catalog: upsert by (branch_id, name) ---
+    // --- Retire ALL active catalog items first (clean slate) ---
+    const allItems = await catalog.find({ where: { isActive: true } });
+    let catRetired = 0;
+    for (const item of allItems) {
+      item.isActive = false;
+      item.updatedAt = now;
+      await catalog.save(item);
+      catRetired++;
+    }
+
+    // --- Catalog: upsert the 4 demo items into the target branch ---
     let catInserted = 0;
     let catUpdated = 0;
     const seededItems: CatalogItem[] = [];
@@ -168,7 +177,7 @@ async function run(): Promise<void> {
     if (!customer) {
       console.warn(
         `[seed] loyalty-demo — catalog seeded for branch "${branch.name}" ` +
-          `(inserted: ${catInserted}, updated: ${catUpdated}); ` +
+          `(inserted: ${catInserted}, updated: ${catUpdated}, retired: ${catRetired}); ` +
           'no live customer in any active branch, so no account/redemption seeded',
       );
       return;
@@ -291,7 +300,7 @@ async function run(): Promise<void> {
 
     console.log(
       `[seed] loyalty-demo — branch "${branch.name}", customer "${customer.name}"; ` +
-        `catalog inserted: ${catInserted}, updated: ${catUpdated}; ` +
+        `catalog inserted: ${catInserted}, updated: ${catUpdated}, retired: ${catRetired}; ` +
         `account balance: ${account.pointsBalance} pts; ${redemptionNote}; ` +
         `commercial cycles: ${commercial.completedCycles} completed / ${commercial.currentCycleCount} in progress; ${commercialNote}`,
     );

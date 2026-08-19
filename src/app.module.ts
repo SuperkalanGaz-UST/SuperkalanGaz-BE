@@ -48,9 +48,15 @@ import { UsersModule } from './users/users.module';
         return {
           type: 'postgres' as const,
           url: databaseUrl.toString(),
-          // Supabase requires TLS; its pooler presents a cert we don't pin here.
           ssl: { rejectUnauthorized: false },
-          connectTimeoutMS: 5_000,
+          connectTimeoutMS: 30_000,
+          poolSize: 5,
+          extra: {
+            connectionTimeoutMillis: 30_000,
+            idleTimeoutMillis: 15_000,
+            keepAlive: true,
+            max: 5,
+          },
           autoLoadEntities: true,
           // Schema changes go through migrations only (AGENTS.md §6).
           synchronize: false,

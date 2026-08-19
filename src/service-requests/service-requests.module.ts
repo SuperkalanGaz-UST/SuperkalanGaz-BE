@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from '../auth/auth.module';
 import { Branch } from '../branches/branch.entity';
 import { CimModule } from '../cim/cim.module';
+import { LoyaltyModule } from '../loyalty/loyalty.module';
 import { FleetModule } from '../fleet/fleet.module';
 import { PricesModule } from '../prices/prices.module';
 import { ServiceRequest } from './service-request.entity';
@@ -24,6 +25,7 @@ import { ServiceRequestPaymentsService } from './service-request-payments.servic
   imports: [
     TypeOrmModule.forFeature([ServiceRequest, ServiceRequestStatusHistory, SlaConfiguration, Branch]),
     AuthModule,
+    LoyaltyModule,
     FleetModule,
     CimModule,
     PricesModule,

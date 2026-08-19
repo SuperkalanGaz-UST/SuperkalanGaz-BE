@@ -36,5 +36,6 @@ import { LoyaltyService } from './loyalty.service';
   ],
   controllers: [LoyaltyController],
   providers: [LoyaltyService],
+  exports: [LoyaltyService],
 })
 export class LoyaltyModule {}

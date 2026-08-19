@@ -23,6 +23,7 @@ import { CreateCommercialRedemptionDto } from './dto/create-commercial-redemptio
 import { RejectRedemptionDto } from './dto/reject-redemption.dto';
 import { UpdateLoyaltySettingsDto } from './dto/update-loyalty-settings.dto';
 import { ListRedemptionsQuery } from './dto/list-redemptions.query';
+import { UpdateCatalogStockDto } from './dto/update-catalog-stock.dto';
 
 /**
  * Household loyalty redemption workflow (LPM module, household track only —
@@ -33,7 +34,6 @@ import { ListRedemptionsQuery } from './dto/list-redemptions.query';
  */
 @Controller('loyalty')
 @UseGuards(AuthGuard, RolesGuard)
-@Roles('branch-manager')
 export class LoyaltyController {
   constructor(private readonly loyalty: LoyaltyService) {}
 
@@ -42,11 +42,32 @@ export class LoyaltyController {
    * to build a redemption request and to render reward names.
    */
   @Get('catalog')
+  @Roles('branch-manager', 'customer')
   async catalog(
     @CurrentPrincipal() principal: Principal,
   ): Promise<{ catalogItems: ReturnType<LoyaltyController['toCatalogRow']>[] }> {
-    const items = await this.loyalty.getCatalog(principal);
+    // Customers have no branchIds on their principal — use the customer-aware
+    // catalog lookup that resolves branches from CIM profiles instead.
+    const items =
+      principal.role === 'customer'
+        ? await this.loyalty.getCustomerCatalog(principal)
+        : await this.loyalty.getCatalog(principal);
     return { catalogItems: items.map((i) => this.toCatalogRow(i)) };
+  }
+
+  /**
+   * Update the stock quantity for a catalog item in the caller's branch.
+   * Used by the BM "Manage Reward Items" screen.
+   */
+  @Patch('catalog/:id/stock')
+  @Roles('branch-manager')
+  async updateCatalogStock(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateCatalogStockDto,
+  ): Promise<{ catalogItem: ReturnType<LoyaltyController['toCatalogRow']> }> {
+    const item = await this.loyalty.updateCatalogStock(principal, id, dto.stockQty);
+    return { catalogItem: this.toCatalogRow(item) };
   }
 
   /**
@@ -56,6 +77,7 @@ export class LoyaltyController {
    * current points_balance for the queue UI.
    */
   @Get('redemptions')
+  @Roles('branch-manager')
   async list(
     @CurrentPrincipal() principal: Principal,
     @Query() query: ListRedemptionsQuery,
@@ -65,12 +87,28 @@ export class LoyaltyController {
   }
 
   /**
+   * Verify a redemption by code: the BM types or pastes the code a customer
+   * shows at the counter. Returns the enriched redemption row (same shape as
+   * the queue list) or 404 if the code is not found in the caller's branch.
+   */
+  @Get('redemptions/verify/:code')
+  @Roles('branch-manager')
+  async verifyByCode(
+    @CurrentPrincipal() principal: Principal,
+    @Param('code') code: string,
+  ): Promise<{ redemption: ReturnType<LoyaltyController['toRedemptionListRow']> }> {
+    const item = await this.loyalty.verifyByCode(principal, code);
+    return { redemption: this.toRedemptionListRow(item) };
+  }
+
+  /**
    * Seed a PENDING household redemption into the queue (BM-US-03). Validates the
    * customer (in-branch, live), the catalog item (in-branch, active, in stock),
    * and that a household account exists — 400/404 otherwise (see the service). No
    * points are debited here. Returns the created row (201).
    */
   @Post('redemptions')
+  @Roles('branch-manager')
   async create(
     @CurrentPrincipal() principal: Principal,
     @Body() dto: CreateRedemptionDto,
@@ -86,6 +124,7 @@ export class LoyaltyController {
    * of stock; 404 if outside the caller's branch. Returns the approved row.
    */
   @Post('redemptions/:id/approve')
+  @Roles('branch-manager')
   async approve(
     @CurrentPrincipal() principal: Principal,
     @Param('id', ParseUUIDPipe) id: string,
@@ -101,6 +140,7 @@ export class LoyaltyController {
    * Returns the rejected row.
    */
   @Post('redemptions/:id/reject')
+  @Roles('branch-manager')
   async reject(
     @CurrentPrincipal() principal: Principal,
     @Param('id', ParseUUIDPipe) id: string,
@@ -116,6 +156,7 @@ export class LoyaltyController {
    * caller's branch. Returns the fulfilled row.
    */
   @Post('redemptions/:id/fulfill')
+  @Roles('branch-manager')
   async fulfill(
     @CurrentPrincipal() principal: Principal,
     @Param('id', ParseUUIDPipe) id: string,
@@ -131,6 +172,7 @@ export class LoyaltyController {
    * at least one completed cycle — 400 otherwise (see the service). Returns 201.
    */
   @Post('commercial/redemptions')
+  @Roles('branch-manager')
   async createCommercial(
     @CurrentPrincipal() principal: Principal,
     @Body() dto: CreateCommercialRedemptionDto,
@@ -148,6 +190,7 @@ export class LoyaltyController {
    * track (POST redemptions/:id/reject|fulfill). Returns the approved row.
    */
   @Post('commercial/redemptions/:id/approve')
+  @Roles('branch-manager')
   async approveCommercial(
     @CurrentPrincipal() principal: Principal,
     @Param('id', ParseUUIDPipe) id: string,
@@ -162,6 +205,7 @@ export class LoyaltyController {
    * approving. Track-scoped; 404 if the redemption is outside the caller's branch.
    */
   @Get('redemptions/:id/ledger')
+  @Roles('branch-manager')
   async ledger(
     @CurrentPrincipal() principal: Principal,
     @Param('id', ParseUUIDPipe) id: string,
@@ -172,6 +216,7 @@ export class LoyaltyController {
 
   /** The caller's branch loyalty Dual Authorization setting (BM-013). */
   @Get('settings')
+  @Roles('branch-manager')
   async settings(
     @CurrentPrincipal() principal: Principal,
   ): Promise<{ settings: { branch_id: string; dual_auth: boolean } }> {
@@ -185,12 +230,46 @@ export class LoyaltyController {
    * queuing for manual approval.
    */
   @Patch('settings')
+  @Roles('branch-manager')
   async updateSettings(
     @CurrentPrincipal() principal: Principal,
     @Body() dto: UpdateLoyaltySettingsDto,
   ): Promise<{ settings: { branch_id: string; dual_auth: boolean } }> {
     const s = await this.loyalty.updateSettings(principal, dto.dualAuth);
     return { settings: { branch_id: s.branchId, dual_auth: s.dualAuth } };
+  }
+
+  // --- Customer / Mobile App Endpoints ---
+
+  @Get('me')
+  @Roles('customer')
+  async myLedger(@CurrentPrincipal() principal: Principal): Promise<{
+    pointsBalance: number;
+    householdTransactions: any[];
+    activeRedemptions: any[];
+  }> {
+    const data = await this.loyalty.getCustomerLedger(principal);
+    return {
+      pointsBalance: data.pointsBalance,
+      householdTransactions: data.householdTransactions.map((tx) => ({
+        id: tx.id,
+        type: tx.type,
+        points_delta: tx.pointsDelta,
+        earned_at: tx.earnedAt ? tx.earnedAt.toISOString() : null,
+        created_at: tx.createdAt.toISOString(),
+      })),
+      activeRedemptions: data.activeRedemptions.map((r) => this.toRedemptionRow(r)),
+    };
+  }
+
+  @Post('me/redemptions')
+  @Roles('customer')
+  async createMyRedemption(
+    @CurrentPrincipal() principal: Principal,
+    @Body('catalogItemId') catalogItemId: string,
+  ): Promise<{ redemption: ReturnType<LoyaltyController['toRedemptionRow']> }> {
+    const row = await this.loyalty.createCustomerRedemption(principal, catalogItemId);
+    return { redemption: this.toRedemptionRow(row) };
   }
 
   /** Snake_case redemption row, matching the precedent in the SRD controller. */
@@ -201,6 +280,7 @@ export class LoyaltyController {
       customer_id: r.customerId,
       track: r.track,
       catalog_item_id: r.catalogItemId,
+      catalog_item_name: r.rewardDescription ?? null,
       reward_description: r.rewardDescription,
       points_spent: r.pointsSpent,
       status: r.status,
