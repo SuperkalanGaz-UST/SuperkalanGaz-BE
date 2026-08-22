@@ -88,6 +88,7 @@ describe('AuthRegistrationService', () => {
             role: 'customer',
             branches: [],
             status: 'Active',
+            account_type: 'household',
           },
         }),
       }),

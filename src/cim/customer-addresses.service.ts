@@ -27,12 +27,18 @@ export class CustomerAddressesService {
       throw new BadRequestException('This account is not a customer account');
     }
 
+    const rawAccountType = user.app_metadata?.account_type ?? user.user_metadata?.account_type;
+    if (rawAccountType !== 'household' && rawAccountType !== 'commercial') {
+      throw new BadRequestException('Customer account type is missing or invalid');
+    }
+
     await this.goTrue.updateUser(principal.userId, {
       app_metadata: {
         ...(user.app_metadata ?? {}),
         role: 'customer',
         branches: [],
         status: 'Active',
+        account_type: rawAccountType,
       },
     });
   }

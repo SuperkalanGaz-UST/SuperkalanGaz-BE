@@ -63,6 +63,7 @@ export class CimController {
       contact_number: customer.contactNumber,
       delivery_address: customer.deliveryAddress,
       registration_source: customer.registrationSource,
+      account_type: customer.accountType,
       last_order_date: lastOrderDate,
       created_at: customer.createdAt,
     };

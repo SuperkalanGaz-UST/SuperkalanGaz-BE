@@ -44,6 +44,10 @@ export class CustomerBootstrapGuard implements CanActivate {
       email: typeof payload.email === 'string' ? payload.email : null,
       phone: typeof payload.phone === 'string' ? payload.phone : null,
       status: 'Active',
+      accountType:
+        claims.account_type === 'household' || claims.account_type === 'commercial'
+          ? claims.account_type
+          : undefined,
       branches: [],
       branchIds: [],
     };

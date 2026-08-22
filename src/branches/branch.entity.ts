@@ -10,6 +10,14 @@ export interface BranchGeofence {
   points: [number, number][];
 }
 
+export interface LoyaltyPointRates {
+  '2.7kg': number;
+  '5kg': number;
+  '11kg': number;
+  '22kg': number;
+  '50kg': number;
+}
+
 /**
  * Maps core.branches — one row per registered franchise branch, created by the
  * Franchise Admin "Register new branch account" flow. Lives in the `core` schema
@@ -86,6 +94,10 @@ export class Branch {
    */
   @Column({ name: 'loyalty_dual_auth', type: 'boolean', default: true })
   loyaltyDualAuth!: boolean;
+
+  /** Branch Owner-configured household points earned per delivered cylinder. */
+  @Column({ name: 'loyalty_point_rates', type: 'jsonb' })
+  loyaltyPointRates!: LoyaltyPointRates;
 
   /**
    * PMS interval in km (added in migration 0021, story BM-US-09): a vehicle is

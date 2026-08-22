@@ -1,4 +1,4 @@
-import { IsNotEmpty, IsString, Matches } from 'class-validator';
+import { IsIn, IsNotEmpty, IsString, Matches } from 'class-validator';
 
 /**
  * Canonical PH mobile in E.164: +63 then the 10-digit national number (always
@@ -11,11 +11,11 @@ const PH_MOBILE_E164 = /^\+639\d{9}$/;
 /**
  * Payload from the "Register new customer" inline intake form (stories
  * BM-029/BM-030). The ValidationPipe (whitelist: true) strips anything not
- * declared here, so the service only ever sees these three fields (AGENTS.md
+ * declared here, so the service only ever sees these fields (AGENTS.md
  * §12). Note what is NOT here and is set by the server instead: branch_id (from
  * the verified principal) and registration_source ('staff-created', story
  * BM-031) — never trusted from the client (AGENTS.md §5). MVP fields only (§3.5):
- * loyalty / preferences / account-type from BM-030 are out of scope this slice.
+ * accountType is required because delivery must credit exactly one loyalty track.
  */
 export class CreateCustomerDto {
   @IsString()
@@ -30,4 +30,7 @@ export class CreateCustomerDto {
   @IsString()
   @IsNotEmpty()
   deliveryAddress!: string;
+
+  @IsIn(['household', 'commercial'])
+  accountType!: 'household' | 'commercial';
 }

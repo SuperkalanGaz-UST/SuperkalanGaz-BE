@@ -13,8 +13,8 @@ import { LoyaltyController } from './loyalty.controller';
 import { LoyaltyService } from './loyalty.service';
 
 /**
- * LPM module — household loyalty redemption (BM-US-03, household track only,
- * AGENTS.md §8a). CimModule exports CimService, reused here to validate the
+ * LPM module — two separate loyalty tracks (household points and commercial
+ * 30+1, AGENTS.md §8a). CimModule exports CimService, reused here to validate the
  * customer link when a redemption request is filed — mirroring how the SRD module
  * reuses CimService/FleetService. The dependency runs LPM → CIM only (CIM never
  * imports LPM), so there is no module cycle; the bulk customer-name lookup in the

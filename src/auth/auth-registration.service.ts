@@ -65,6 +65,7 @@ export class AuthRegistrationService {
           role: 'customer',
           branches: [],
           status: 'Active',
+          account_type: dto.accountType,
         },
       });
     } catch {

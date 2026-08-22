@@ -14,6 +14,7 @@ import { PricesModule } from './prices/prices.module';
 import { ReferenceModule } from './reference/reference.module';
 import { ServiceRequestsModule } from './service-requests/service-requests.module';
 import { UsersModule } from './users/users.module';
+import { GovernanceModule } from './governance/governance.module';
 
 /**
  * Modular monolith root (AGENTS.md §4). Supabase is used as managed Postgres ONLY:
@@ -75,6 +76,7 @@ import { UsersModule } from './users/users.module';
     CsatModule,
     NotificationsModule,
     PricesModule,
+    GovernanceModule,
   ],
 })
 export class AppModule {}

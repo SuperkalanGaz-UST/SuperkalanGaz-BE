@@ -10,5 +10,6 @@ import { UsersService } from './users.service';
   imports: [AuthModule],
   controllers: [UsersController],
   providers: [UsersService, GoTrueAdminService],
+  exports: [GoTrueAdminService],
 })
 export class UsersModule {}

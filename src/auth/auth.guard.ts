@@ -9,7 +9,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Request } from 'express';
 import { In, Repository } from 'typeorm';
 import { Branch } from '../branches/branch.entity';
-import { Principal, REQUEST_PRINCIPAL, Role } from './principal';
+import { isRole, Principal, REQUEST_PRINCIPAL } from './principal';
 import { SupabaseJwtService } from './supabase-jwt.service';
 
 /**
@@ -46,13 +46,13 @@ export class AuthGuard implements CanActivate {
     const claims = (payload.app_metadata ?? {}) as Record<string, unknown>;
     const requestPath = request.originalUrl || request.url || '';
     const isCustomerPublicBranchLookup = request.method === 'GET' && requestPath.endsWith('/api/branches/public');
-    const role = typeof claims.role === 'string'
+    const claimedRole = typeof claims.role === 'string'
       ? claims.role
       : isCustomerPublicBranchLookup
         ? 'customer'
         : undefined;
 
-    if (!role) {
+    if (!isRole(claimedRole)) {
       console.log('[auth] denied account without CRM role', {
         requestPath,
         method: request.method,
@@ -86,19 +86,23 @@ export class AuthGuard implements CanActivate {
     console.log('[auth] resolved principal', {
       requestPath,
       method: request.method,
-      role,
+      role: claimedRole,
       userId: payload.sub,
     });
 
     const principal: Principal = {
       userId: payload.sub,
-      role: role as Role,
+      role: claimedRole,
       email: typeof payload.email === 'string' ? payload.email : null,
       username: typeof claims.username === 'string' ? claims.username : null,
       displayName: typeof claims.display_name === 'string' ? claims.display_name : null,
       phone: typeof claims.phone === 'string' ? claims.phone : null,
       // Inactive accounts were rejected above, so every constructed principal is active.
       status: 'Active',
+      accountType:
+        claims.account_type === 'household' || claims.account_type === 'commercial'
+          ? claims.account_type
+          : undefined,
       branches: names,
       branchIds: liveBranches.map((b) => b.id),
     };

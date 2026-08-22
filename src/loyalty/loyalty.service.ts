@@ -10,7 +10,7 @@ import { randomBytes } from 'crypto';
 import { DataSource, EntityManager, In, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { CimService } from '../cim/cim.service';
-import { Branch } from '../branches/branch.entity';
+import { Branch, LoyaltyPointRates } from '../branches/branch.entity';
 import { CatalogItem } from './catalog-item.entity';
 import { CommercialLoyaltyAccount } from './commercial-loyalty-account.entity';
 import { CommercialPurchaseRecord } from './commercial-purchase-record.entity';
@@ -21,7 +21,7 @@ import { CreateRedemptionDto } from './dto/create-redemption.dto';
 import { CreateCommercialRedemptionDto } from './dto/create-commercial-redemption.dto';
 import { RejectRedemptionDto } from './dto/reject-redemption.dto';
 import { ListRedemptionsQuery, RedemptionTrack } from './dto/list-redemptions.query';
-import { CYLINDER_POINTS } from './loyalty.constants';
+import { DEFAULT_CYLINDER_POINTS } from './loyalty.constants';
 
 /** The two loyalty tracks (AGENTS.md §8a) — kept strictly separate, never merged
  * in one query. Values must match the DB CHECK constraint redemptions_track_check.
@@ -64,12 +64,27 @@ export interface LedgerView {
   commercialPurchases: CommercialPurchaseRecord[];
 }
 
+export interface CustomerCommercialAccountView {
+  branchId: string;
+  branchName: string | null;
+  currentCycleCount: number;
+  completedCycles: number;
+}
+
+export interface CustomerLedgerView {
+  track: RedemptionTrack;
+  pointsBalance: number;
+  householdTransactions: HouseholdPointTransaction[];
+  householdAccounts: Array<{ branchId: string; pointsBalance: number }>;
+  commercialAccounts: CustomerCommercialAccountView[];
+  commercialPurchases: CommercialPurchaseRecord[];
+  activeRedemptions: Redemption[];
+}
+
 /**
- * Household loyalty redemption workflow (LPM module, household track only —
- * AGENTS.md §8a). This slice is the Branch Manager dual-authorization gate
- * (BM-US-03): read the reward catalog, seed a pending request, then approve /
- * reject / fulfill it. The commercial track (30+1 free cylinder) is a separate
- * slice and is never read or written here.
+ * Loyalty Program Monitoring service (AGENTS.md §8a). Household points and
+ * commercial 30+1 use separate accounts and immutable ledgers; only the shared
+ * redemption lifecycle is represented by the common Redemption entity.
  *
  * All scoping derives from the verified Principal, never from request input
  * (AGENTS.md §5). Isolation is enforced here in the application layer, not by the
@@ -196,17 +211,14 @@ export class LoyaltyService {
    * Used by the mobile customer app where the principal has no branchIds.
    */
   async getCustomerCatalog(principal: Principal): Promise<CatalogItem[]> {
-    const all = await this.catalogItems.find({
-      where: { isActive: true },
+    if (principal.accountType !== 'household') return [];
+    const profiles = await this.cim.profilesForAuthUser(principal.userId);
+    const branchIds = [...new Set(profiles.map((profile) => profile.branchId))];
+    if (branchIds.length === 0) return [];
+
+    return this.catalogItems.find({
+      where: { branchId: In(branchIds), isActive: true },
       order: { pointsCost: 'ASC' },
-    });
-    // Deduplicate by name — keep only one item per reward name (lowest cost wins
-    // from the ASC order) so the mobile catalog shows exactly 4 distinct items.
-    const seen = new Set<string>();
-    return all.filter((item) => {
-      if (seen.has(item.name)) return false;
-      seen.add(item.name);
-      return true;
     });
   }
 
@@ -498,10 +510,12 @@ export class LoyaltyService {
     //     the conditional UPDATE in (d).
     const account = await manager.findOne(HouseholdLoyaltyAccount, {
       where: { customerId: redemption.customerId, branchId: redemption.branchId },
+      lock: { mode: 'pessimistic_write' },
     });
     if (!account) {
       throw new ConflictException('Loyalty account not found');
     }
+    await this.expireHouseholdPointsInTx(manager, account, now);
     if (account.pointsBalance < pointsSpent) {
       throw new ConflictException('insufficient points');
     }
@@ -554,6 +568,7 @@ export class LoyaltyService {
         pointsDelta: -pointsSpent,
         sourceServiceRequestId: null,
         redemptionId: redemption.id,
+        sourcePointTransactionId: null,
         earnedAt: null,
         expiresAt: null,
         createdAt: now,
@@ -902,6 +917,10 @@ export class LoyaltyService {
     const account = await this.accounts.findOne({
       where: { customerId: redemption.customerId, branchId: redemption.branchId },
     });
+    if (account) await this.expireHouseholdAccount(account.id);
+    const currentAccount = account
+      ? await this.accounts.findOne({ where: { id: account.id } })
+      : null;
     const householdTransactions = await this.ledger.find({
       where: { customerId: redemption.customerId, branchId: redemption.branchId },
       order: { createdAt: 'DESC' },
@@ -910,7 +929,7 @@ export class LoyaltyService {
     return {
       track: HOUSEHOLD_TRACK,
       customerName,
-      pointsBalance: account?.pointsBalance ?? null,
+      pointsBalance: currentAccount?.pointsBalance ?? null,
       completedCycles: null,
       currentCycleCount: null,
       householdTransactions,
@@ -919,25 +938,38 @@ export class LoyaltyService {
   }
 
   /** The caller's branch loyalty Dual Authorization setting (BM-013). */
-  async getSettings(principal: Principal): Promise<{ branchId: string; dualAuth: boolean }> {
+  async getSettings(principal: Principal): Promise<{
+    branchId: string;
+    dualAuth: boolean;
+    pointRates: LoyaltyPointRates;
+  }> {
     const branchId = this.requireBranch(principal);
     const branch = await this.branches.findOne({ where: { id: branchId } });
     if (!branch) throw new NotFoundException('Branch not found');
-    return { branchId, dualAuth: branch.loyaltyDualAuth };
+    return {
+      branchId,
+      dualAuth: branch.loyaltyDualAuth,
+      pointRates: branch.loyaltyPointRates ?? { ...DEFAULT_CYLINDER_POINTS },
+    };
   }
 
   /** Toggle the caller's branch loyalty Dual Authorization setting (BM-013). */
   async updateSettings(
     principal: Principal,
-    dualAuth: boolean,
-  ): Promise<{ branchId: string; dualAuth: boolean }> {
+    input: { dualAuth?: boolean; pointRates?: LoyaltyPointRates },
+  ): Promise<{ branchId: string; dualAuth: boolean; pointRates: LoyaltyPointRates }> {
     const branchId = this.requireBranch(principal);
-    const res = await this.branches.update(
-      { id: branchId },
-      { loyaltyDualAuth: dualAuth, updatedAt: new Date() },
-    );
-    if (!res.affected) throw new NotFoundException('Branch not found');
-    return { branchId, dualAuth };
+    const branch = await this.branches.findOne({ where: { id: branchId } });
+    if (!branch) throw new NotFoundException('Branch not found');
+    if (input.dualAuth !== undefined) branch.loyaltyDualAuth = input.dualAuth;
+    if (input.pointRates !== undefined) branch.loyaltyPointRates = input.pointRates;
+    branch.updatedAt = new Date();
+    const saved = await this.branches.save(branch);
+    return {
+      branchId,
+      dualAuth: saved.loyaltyDualAuth,
+      pointRates: saved.loyaltyPointRates,
+    };
   }
 
   /** Whether the branch requires Branch Manager dual authorization for redemptions.
@@ -1003,8 +1035,12 @@ export class LoyaltyService {
     const accounts = await this.accounts.find({
       where: { customerId: In(customerIds), branchId: In(branchIds) },
     });
+    for (const account of accounts) await this.expireHouseholdAccount(account.id);
+    const currentAccounts = await this.accounts.find({
+      where: { customerId: In(customerIds), branchId: In(branchIds) },
+    });
     return new Map(
-      accounts.map((a) => [this.accountKey(a.customerId, a.branchId), a.pointsBalance]),
+      currentAccounts.map((a) => [this.accountKey(a.customerId, a.branchId), a.pointsBalance]),
     );
   }
 
@@ -1050,62 +1086,71 @@ export class LoyaltyService {
     return this.requireBranches(principal)[0];
   }
 
-  // --- Customer / Mobile App Endpoints ---
+  // --- Delivery earning + Customer / Mobile App Endpoints ---
 
-  /**
-   * Earn household points on a completed order (BM-US-03 / Earning Points).
-   * Called automatically by ServiceRequestsService during deliver().
-   */
+  /** Credit exactly one loyalty track from the server-owned CIM classification. */
+  async recordDeliveredPurchase(
+    customerId: string,
+    branchId: string,
+    serviceRequestId: string,
+    cylinderSize: string,
+    quantity = 1,
+  ): Promise<void> {
+    const customer = await this.cim.findInBranch(customerId, branchId);
+    if (!customer) throw new BadRequestException('Customer not found in this branch');
+
+    if (customer.accountType === 'commercial') {
+      await this.recordCommercialPurchase(customerId, branchId, serviceRequestId);
+      return;
+    }
+    await this.recordHouseholdEarn(
+      customerId,
+      branchId,
+      serviceRequestId,
+      cylinderSize,
+      quantity,
+    );
+  }
+
+  /** Idempotently earn household points for one delivered Service Request. */
   async recordHouseholdEarn(
     customerId: string,
     branchId: string,
     serviceRequestId: string,
     cylinderSize: string,
-    quantity: number = 1,
+    quantity = 1,
   ): Promise<void> {
-    const pointsPerUnit = CYLINDER_POINTS[cylinderSize];
-    if (!pointsPerUnit) return; // Not eligible for points
-    const points = pointsPerUnit * quantity;
-
     const now = new Date();
-    // Expiry is 12 months after earned
-    const expiresAt = new Date(now.getFullYear() + 1, now.getMonth(), now.getDate());
+    const expiresAt = new Date(now);
+    expiresAt.setUTCFullYear(expiresAt.getUTCFullYear() + 1);
 
     await this.dataSource.transaction(async (manager) => {
-      // Upsert the HouseholdLoyaltyAccount (insert if missing, update if exists)
-      let account = await manager.findOne(HouseholdLoyaltyAccount, {
+      const branch = await manager.findOne(Branch, { where: { id: branchId } });
+      if (!branch) throw new BadRequestException('Branch not found');
+      const rates = branch.loyaltyPointRates ?? DEFAULT_CYLINDER_POINTS;
+      const pointsPerUnit = rates[cylinderSize as keyof LoyaltyPointRates];
+      if (!Number.isInteger(pointsPerUnit) || pointsPerUnit <= 0) return;
+      const points = pointsPerUnit * quantity;
+
+      await manager
+        .createQueryBuilder()
+        .insert()
+        .into(HouseholdLoyaltyAccount)
+        .values({ customerId, branchId, pointsBalance: 0, createdAt: now, updatedAt: now })
+        .orIgnore()
+        .execute();
+      const account = await manager.findOneOrFail(HouseholdLoyaltyAccount, {
         where: { customerId, branchId },
+        lock: { mode: 'pessimistic_write' },
       });
 
-      if (!account) {
-        account = manager.create(HouseholdLoyaltyAccount, {
-          customerId,
-          branchId,
-          pointsBalance: points,
-          createdAt: now,
-          updatedAt: now,
-        });
-        await manager.save(HouseholdLoyaltyAccount, account);
-      } else {
-        await manager
-          .createQueryBuilder()
-          .update(HouseholdLoyaltyAccount)
-          .set({
-            pointsBalance: () => `points_balance + ${points}`,
-            updatedAt: now,
-          })
-          .where('id = :id', { id: account.id })
-          .execute();
-      }
+      await this.expireHouseholdPointsInTx(manager, account, now);
+      const existing = await manager.findOne(HouseholdPointTransaction, {
+        where: { sourceServiceRequestId: serviceRequestId, type: 'earn' },
+        select: { id: true },
+      });
+      if (existing) return;
 
-      // Load the account again to get its ID if it was newly created
-      if (!account.id) {
-        account = await manager.findOneOrFail(HouseholdLoyaltyAccount, {
-          where: { customerId, branchId },
-        });
-      }
-
-      // Insert the immutable ledger row
       await manager.save(
         HouseholdPointTransaction,
         manager.create(HouseholdPointTransaction, {
@@ -1116,117 +1161,210 @@ export class LoyaltyService {
           pointsDelta: points,
           sourceServiceRequestId: serviceRequestId,
           redemptionId: null,
+          sourcePointTransactionId: null,
           earnedAt: now,
           expiresAt,
           createdAt: now,
         }),
       );
+      await manager
+        .createQueryBuilder()
+        .update(HouseholdLoyaltyAccount)
+        .set({ pointsBalance: () => `points_balance + ${points}`, updatedAt: now })
+        .where('id = :id', { id: account.id })
+        .execute();
     });
   }
 
-  /**
-   * Customer's global points ledger across all their branch profiles.
-   */
-  async getCustomerLedger(principal: Principal): Promise<{
-    pointsBalance: number;
-    householdTransactions: HouseholdPointTransaction[];
-    activeRedemptions: Redemption[];
-  }> {
-    const profileIds = await this.cim.profileIdsForAuthUser(principal.userId);
-    const ownedCustomerIds = [...new Set([principal.userId, ...profileIds])];
+  /** Idempotently count one delivered commercial order toward the 30+1 cycle. */
+  async recordCommercialPurchase(
+    customerId: string,
+    branchId: string,
+    serviceRequestId: string,
+  ): Promise<void> {
+    const now = new Date();
+    await this.dataSource.transaction(async (manager) => {
+      await manager
+        .createQueryBuilder()
+        .insert()
+        .into(CommercialLoyaltyAccount)
+        .values({
+          customerId,
+          branchId,
+          currentCycleCount: 0,
+          completedCycles: 0,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .orIgnore()
+        .execute();
+      const account = await manager.findOneOrFail(CommercialLoyaltyAccount, {
+        where: { customerId, branchId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      const existing = await manager.findOne(CommercialPurchaseRecord, {
+        where: { serviceRequestId },
+        select: { id: true },
+      });
+      if (existing) return;
 
-    if (ownedCustomerIds.length === 0) {
-      return { pointsBalance: 0, householdTransactions: [], activeRedemptions: [] };
+      const latest = await manager.findOne(CommercialPurchaseRecord, {
+        where: { accountId: account.id },
+        order: { countedAt: 'DESC' },
+      });
+      const completesCycle = account.currentCycleCount + 1 >= 30;
+      const cycleNumber = latest
+        ? account.currentCycleCount === 0
+          ? latest.cycleNumber + 1
+          : latest.cycleNumber
+        : 1;
+      await manager.save(
+        CommercialPurchaseRecord,
+        manager.create(CommercialPurchaseRecord, {
+          accountId: account.id,
+          customerId,
+          branchId,
+          serviceRequestId,
+          cycleNumber,
+          countedAt: now,
+          createdAt: now,
+        }),
+      );
+      await manager.update(
+        CommercialLoyaltyAccount,
+        { id: account.id },
+        {
+          currentCycleCount: completesCycle ? 0 : account.currentCycleCount + 1,
+          completedCycles: account.completedCycles + (completesCycle ? 1 : 0),
+          updatedAt: now,
+        },
+      );
+    });
+  }
+
+  /** Customer-owned view. Only the authenticated customer's selected track is populated. */
+  async getCustomerLedger(principal: Principal): Promise<CustomerLedgerView> {
+    if (!principal.accountType) {
+      throw new ForbiddenException('Customer account type is missing');
     }
-
-    const accounts = await this.accounts.find({
-      where: { customerId: In(ownedCustomerIds) },
-    });
-
-    const pointsBalance = accounts.reduce((sum, acc) => sum + acc.pointsBalance, 0);
-
-    const householdTransactions = await this.ledger.find({
-      where: { customerId: In(ownedCustomerIds) },
-      order: { createdAt: 'DESC' },
-      take: 100,
-    });
+    const profiles = await this.cim.profilesForAuthUser(principal.userId);
+    const matchingProfiles = profiles.filter(
+      (profile) => profile.accountType === principal.accountType,
+    );
+    const ownedCustomerIds = [...new Set(matchingProfiles.map((profile) => profile.id))];
+    const track: RedemptionTrack =
+      principal.accountType === 'commercial' ? COMMERCIAL_TRACK : HOUSEHOLD_TRACK;
+    if (ownedCustomerIds.length === 0) {
+      return {
+        track,
+        pointsBalance: 0,
+        householdTransactions: [],
+        householdAccounts: [],
+        commercialAccounts: [],
+        commercialPurchases: [],
+        activeRedemptions: [],
+      };
+    }
 
     const activeRedemptions = await this.redemptions.find({
       where: {
         customerId: In(ownedCustomerIds),
-        track: HOUSEHOLD_TRACK,
+        track,
         status: In(['pending', 'approved']),
       },
       order: { requestedAt: 'DESC' },
     });
 
+    if (track === COMMERCIAL_TRACK) {
+      const [commercialAccounts, commercialPurchases] = await Promise.all([
+        this.commercialAccounts.find({ where: { customerId: In(ownedCustomerIds) } }),
+        this.commercialPurchases.find({
+          where: { customerId: In(ownedCustomerIds) },
+          order: { countedAt: 'DESC' },
+          take: 100,
+        }),
+      ]);
+      const branchIds = [...new Set(commercialAccounts.map((account) => account.branchId))];
+      const branches = branchIds.length
+        ? await this.branches.find({ where: { id: In(branchIds), status: 'active' } })
+        : [];
+      const branchNames = new Map(branches.map((branch) => [branch.id, branch.name]));
+      return {
+        track,
+        pointsBalance: 0,
+        householdTransactions: [],
+        householdAccounts: [],
+        commercialAccounts: commercialAccounts.map((account) => ({
+          branchId: account.branchId,
+          branchName: branchNames.get(account.branchId) ?? null,
+          currentCycleCount: account.currentCycleCount,
+          completedCycles: account.completedCycles,
+        })),
+        commercialPurchases,
+        activeRedemptions,
+      };
+    }
+
+    const accounts = await this.accounts.find({ where: { customerId: In(ownedCustomerIds) } });
+    for (const account of accounts) await this.expireHouseholdAccount(account.id);
+    const currentAccounts = await this.accounts.find({
+      where: { customerId: In(ownedCustomerIds) },
+    });
+    const householdTransactions = await this.ledger.find({
+      where: { customerId: In(ownedCustomerIds) },
+      order: { createdAt: 'DESC' },
+      take: 100,
+    });
     return {
-      pointsBalance,
+      track,
+      pointsBalance: currentAccounts.reduce((sum, account) => sum + account.pointsBalance, 0),
       householdTransactions,
+      householdAccounts: currentAccounts.map((account) => ({
+        branchId: account.branchId,
+        pointsBalance: account.pointsBalance,
+      })),
+      commercialAccounts: [],
+      commercialPurchases: [],
       activeRedemptions,
     };
   }
 
-  /**
-   * Customer-initiated redemption. Finds the customer profile in the chosen branch
-   * (or highest balance branch) to deduct points from.
-   */
+  /** Customer household redemption, constrained to the catalog item's own branch. */
   async createCustomerRedemption(
     principal: Principal,
     catalogItemId: string,
   ): Promise<Redemption> {
-    const profileIds = await this.cim.profileIdsForAuthUser(principal.userId);
-    const ownedCustomerIds = [...new Set([principal.userId, ...profileIds])];
-
-    if (ownedCustomerIds.length === 0) {
-      throw new BadRequestException('No customer profile found');
+    if (principal.accountType !== 'household') {
+      throw new ForbiddenException('This account does not use household points');
     }
-
-    const item = await this.catalogItems.findOne({
-      where: { id: catalogItemId },
-    });
+    const item = await this.catalogItems.findOne({ where: { id: catalogItemId } });
     if (!item) throw new NotFoundException('Catalog item not found');
     if (!item.isActive) throw new BadRequestException('Catalog item is not active');
     if (item.stockQty <= 0) throw new BadRequestException('Catalog item is out of stock');
 
-    // Find the customer's account with the highest balance across all branches
-    const allAccounts = await this.accounts.find({
-      where: { customerId: In(ownedCustomerIds) },
+    const profiles = await this.cim.profilesForAuthUser(principal.userId);
+    const profile = profiles.find(
+      (candidate) => candidate.branchId === item.branchId && candidate.accountType === 'household',
+    );
+    if (!profile) throw new NotFoundException('Catalog item not found');
+    const account = await this.accounts.findOne({
+      where: { customerId: profile.id, branchId: item.branchId },
     });
-
-    if (allAccounts.length === 0) {
-      const now = new Date();
-      var account = await this.accounts.save(
-        this.accounts.create({
-          customerId: ownedCustomerIds[0],
-          branchId: item.branchId,
-          pointsBalance: 0,
-          createdAt: now,
-          updatedAt: now,
-        }),
-      );
-    } else {
-      var account = allAccounts.reduce((best, cur) =>
-        cur.pointsBalance > best.pointsBalance ? cur : best,
-      );
-    }
-
-    if (account.pointsBalance < item.pointsCost) {
+    if (!account) throw new BadRequestException('Insufficient points.');
+    await this.expireHouseholdAccount(account.id);
+    const current = await this.accounts.findOneOrFail({ where: { id: account.id } });
+    if (current.pointsBalance < item.pointsCost) {
       throw new BadRequestException('Insufficient points.');
     }
 
     const now = new Date();
     const dualAuth = await this.isDualAuth(item.branchId);
-
     return this.dataSource.transaction(async (manager) => {
-      // Always generate a code upfront so the customer sees it immediately.
-      const code = await this.issueCode(manager);
-
       const redemption = await manager.save(
         Redemption,
         manager.create(Redemption, {
-          branchId: account.branchId,
-          customerId: account.customerId,
+          branchId: item.branchId,
+          customerId: profile.id,
           track: HOUSEHOLD_TRACK,
           catalogItemId: item.id,
           rewardDescription: item.name,
@@ -1237,26 +1375,185 @@ export class LoyaltyService {
           approvedAt: null,
           rejectedReason: null,
           fulfilledAt: null,
-          redemptionCode: code,
+          redemptionCode: null,
           createdAt: now,
           updatedAt: now,
         }),
       );
-
       if (!dualAuth) {
-        await this.settleHouseholdApprovalInTx(
+        const code = await this.settleHouseholdApprovalInTx(
           manager,
           redemption,
-          'SYSTEM_AUTO',
+          principal.userId,
           now,
           item.branchId,
         );
         redemption.status = 'approved';
-        redemption.approvedBy = 'SYSTEM_AUTO';
+        redemption.approvedBy = principal.userId;
         redemption.approvedAt = now;
+        redemption.redemptionCode = code;
         redemption.updatedAt = now;
       }
       return redemption;
     });
+  }
+
+  /** Customer commercial redemption for one owned branch account. */
+  async createCustomerCommercialRedemption(
+    principal: Principal,
+    branchId: string,
+  ): Promise<Redemption> {
+    if (principal.accountType !== 'commercial') {
+      throw new ForbiddenException('This account does not use commercial rewards');
+    }
+    const profiles = await this.cim.profilesForAuthUser(principal.userId);
+    const profile = profiles.find(
+      (candidate) => candidate.branchId === branchId && candidate.accountType === 'commercial',
+    );
+    if (!profile) throw new NotFoundException('Commercial loyalty account not found');
+    const account = await this.commercialAccounts.findOne({
+      where: { customerId: profile.id, branchId },
+    });
+    if (!account || account.completedCycles < 1) {
+      throw new BadRequestException('No completed cycle available to redeem yet');
+    }
+
+    const now = new Date();
+    const dualAuth = await this.isDualAuth(branchId);
+    return this.dataSource.transaction(async (manager) => {
+      const redemption = await manager.save(
+        Redemption,
+        manager.create(Redemption, {
+          branchId,
+          customerId: profile.id,
+          track: COMMERCIAL_TRACK,
+          catalogItemId: null,
+          rewardDescription: COMMERCIAL_REWARD,
+          pointsSpent: null,
+          status: 'pending',
+          requestedAt: now,
+          approvedBy: null,
+          approvedAt: null,
+          rejectedReason: null,
+          fulfilledAt: null,
+          redemptionCode: null,
+          createdAt: now,
+          updatedAt: now,
+        }),
+      );
+      if (!dualAuth) {
+        const code = await this.settleCommercialApprovalInTx(
+          manager,
+          redemption,
+          principal.userId,
+          now,
+        );
+        redemption.status = 'approved';
+        redemption.approvedBy = principal.userId;
+        redemption.approvedAt = now;
+        redemption.redemptionCode = code;
+        redemption.updatedAt = now;
+      }
+      return redemption;
+    });
+  }
+
+  private async expireHouseholdAccount(accountId: string): Promise<void> {
+    await this.dataSource.transaction(async (manager) => {
+      const account = await manager.findOne(HouseholdLoyaltyAccount, {
+        where: { id: accountId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (account) await this.expireHouseholdPointsInTx(manager, account, new Date());
+    });
+  }
+
+  /** Apply due expiry once per earn row. Redemptions consume the oldest earn lots
+   * first; positive legacy adjustments remain non-expiring. */
+  private async expireHouseholdPointsInTx(
+    manager: EntityManager,
+    account: HouseholdLoyaltyAccount,
+    now: Date,
+  ): Promise<void> {
+    const transactions = await manager.find(HouseholdPointTransaction, {
+      where: { accountId: account.id },
+      order: { createdAt: 'ASC' },
+    });
+    const lots: Array<{
+      id: string;
+      remaining: number;
+      expiresAt: Date | null;
+      expired: boolean;
+    }> = [];
+
+    for (const transaction of transactions) {
+      if (transaction.type === 'earn' && transaction.pointsDelta > 0) {
+        lots.push({
+          id: transaction.id,
+          remaining: transaction.pointsDelta,
+          expiresAt: transaction.expiresAt,
+          expired: false,
+        });
+        continue;
+      }
+      if (transaction.type === 'expire' && transaction.sourcePointTransactionId) {
+        const source = lots.find((lot) => lot.id === transaction.sourcePointTransactionId);
+        if (source) {
+          source.remaining = 0;
+          source.expired = true;
+        }
+        continue;
+      }
+      if (transaction.pointsDelta >= 0) continue;
+      let debit = -transaction.pointsDelta;
+      for (const lot of lots) {
+        if (debit === 0) break;
+        const consumed = Math.min(lot.remaining, debit);
+        lot.remaining -= consumed;
+        debit -= consumed;
+      }
+    }
+
+    let availableToExpire = account.pointsBalance;
+    let expiredTotal = 0;
+    for (const lot of lots) {
+      if (
+        lot.expired ||
+        lot.remaining <= 0 ||
+        !lot.expiresAt ||
+        lot.expiresAt.getTime() > now.getTime() ||
+        availableToExpire <= 0
+      ) {
+        continue;
+      }
+      const amount = Math.min(lot.remaining, availableToExpire);
+      await manager.save(
+        HouseholdPointTransaction,
+        manager.create(HouseholdPointTransaction, {
+          accountId: account.id,
+          customerId: account.customerId,
+          branchId: account.branchId,
+          type: 'expire',
+          pointsDelta: -amount,
+          sourceServiceRequestId: null,
+          redemptionId: null,
+          sourcePointTransactionId: lot.id,
+          earnedAt: null,
+          expiresAt: null,
+          createdAt: now,
+        }),
+      );
+      availableToExpire -= amount;
+      expiredTotal += amount;
+    }
+    if (expiredTotal === 0) return;
+
+    await manager.update(
+      HouseholdLoyaltyAccount,
+      { id: account.id },
+      { pointsBalance: account.pointsBalance - expiredTotal, updatedAt: now },
+    );
+    account.pointsBalance -= expiredTotal;
+    account.updatedAt = now;
   }
 }

@@ -3,11 +3,13 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { randomBytes } from 'crypto';
 import { In, QueryFailedError, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
+import { GovernanceAuditService } from '../governance/governance-audit.service';
 import { GoTrueAdminService } from '../users/gotrue-admin.service';
 import { Branch, BranchGeofence } from './branch.entity';
 import { CreateBranchDto } from './dto/create-branch.dto';
@@ -86,9 +88,11 @@ export class BranchesService {
     @InjectRepository(Branch)
     private readonly branches: Repository<Branch>,
     private readonly goTrue: GoTrueAdminService,
+    @Optional()
+    private readonly governanceAudit?: GovernanceAuditService,
   ) {}
 
-  async create(_principal: Principal, dto: CreateBranchDto): Promise<CreateBranchResult> {
+  async create(principal: Principal, dto: CreateBranchDto): Promise<CreateBranchResult> {
     const name = dto.name.trim();
 
     // "New owner" path: create a real Branch Owner login. Role + branch
@@ -166,8 +170,29 @@ export class BranchesService {
     // branch". (The "new owner" path already seeded its branch via GoTrue
     // metadata above.) Kept out of the retry loop so a link failure never trips
     // the branch-code re-roll.
-    if (dto.ownerType === 'existing') {
-      await this.linkExistingOwner(dto, saved.name);
+    const linkedOwner =
+      dto.ownerType === 'existing'
+        ? await this.linkExistingOwner(dto, saved.name)
+        : owner
+          ? { id: owner.id, email: owner.email }
+          : null;
+
+    if (linkedOwner && this.governanceAudit) {
+      await this.governanceAudit.record({
+        category: 'branch-owner-change',
+        action: 'branch-owner-initial-assignment',
+        actor: principal,
+        affectedRecordType: 'branch-owner-assignment',
+        affectedRecordId: saved.id,
+        branchId: saved.id,
+        beforeState: null,
+        afterState: {
+          branch: saved.name,
+          ownerId: linkedOwner.id,
+          ownerEmail: linkedOwner.email,
+        },
+        reason: 'Initial Branch Owner assignment during branch registration',
+      });
     }
 
     return { id: saved.id, code: saved.code, owner };
@@ -184,23 +209,24 @@ export class BranchesService {
   private async linkExistingOwner(
     dto: CreateBranchDto,
     branchName: string,
-  ): Promise<void> {
+  ): Promise<{ id: string; email: string | null } | null> {
     const owner = dto.ownerId
       ? await this.goTrue.getUser(dto.ownerId)
       : dto.ownerEmail
         ? await this.goTrue.findByEmail(dto.ownerEmail)
         : null;
-    if (!owner) return; // nothing to match on / owner not found — leave auth untouched
+    if (!owner) return null; // nothing to match on / owner not found — leave auth untouched
 
     const meta = owner.app_metadata ?? {};
     const branches = Array.isArray(meta.branches)
       ? (meta.branches as unknown[]).filter((b): b is string => typeof b === 'string')
       : [];
-    if (branches.includes(branchName)) return; // idempotent
+    if (branches.includes(branchName)) return { id: owner.id, email: owner.email }; // idempotent
 
     await this.goTrue.updateUser(owner.id, {
       app_metadata: { ...meta, branches: [...branches, branchName] },
     });
+    return { id: owner.id, email: owner.email };
   }
 
   /**

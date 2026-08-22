@@ -101,7 +101,7 @@ describe('CustomerAddressesService', () => {
       id: principal.userId,
       email: 'customer@example.com',
       app_metadata: { locale: 'en' },
-      user_metadata: {},
+      user_metadata: { account_type: 'household' },
       banned_until: null,
       created_at: '2026-08-15T00:00:00.000Z',
     } satisfies GoTrueUser;
@@ -115,6 +115,7 @@ describe('CustomerAddressesService', () => {
         role: 'customer',
         branches: [],
         status: 'Active',
+        account_type: 'household',
       },
     });
   });

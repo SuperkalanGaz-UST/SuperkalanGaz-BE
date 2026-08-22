@@ -106,6 +106,7 @@ export class CimService {
       // BM-created profiles are always staff-created (story BM-031); the client
       // never gets to set this.
       registrationSource: 'staff-created',
+      accountType: dto.accountType,
       createdAt: now,
       updatedAt: now,
       deletedAt: null,
@@ -131,6 +132,7 @@ export class CimService {
     name: string;
     contactNumber: string;
     deliveryAddress: string;
+    accountType: 'household' | 'commercial';
   }): Promise<Customer> {
     const now = new Date();
     await this.customers.upsert(
@@ -141,6 +143,7 @@ export class CimService {
         contactNumber: input.contactNumber.trim(),
         deliveryAddress: input.deliveryAddress.trim(),
         registrationSource: 'self-registered',
+        accountType: input.accountType,
         // created_at is omitted so the DB default handles inserts and repeat
         // orders never rewrite the profile's original creation timestamp.
         updatedAt: now,
@@ -168,6 +171,18 @@ export class CimService {
       take: 200,
     });
     return profiles.map((profile) => profile.id);
+  }
+
+  /** Live branch projections for one authenticated mobile customer. Loyalty uses
+   * both id and branch id so catalog/redemption reads never cross branch scope. */
+  async profilesForAuthUser(
+    authUserId: string,
+  ): Promise<Pick<Customer, 'id' | 'branchId' | 'accountType'>[]> {
+    return this.customers.find({
+      where: { authUserId, deletedAt: IsNull() },
+      select: { id: true, branchId: true, accountType: true },
+      take: 200,
+    });
   }
 
   /**

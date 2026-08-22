@@ -14,6 +14,7 @@
     "seed:sla-demo": "nest build && node dist/seeds/sla-demo.seeder",
     "seed:fleet-rider-demo": "nest build && node dist/seeds/fleet-rider-demo.seeder",
     "seed:fleet-vehicles-demo": "nest build && node dist/seeds/fleet-vehicles-demo.seeder",
+    "seed:super-admin": "nest build && node dist/seeds/super-admin.seeder",
     "lint": "eslint \"src/**/*.ts\"",
     "test": "jest --passWithNoTests",
     "test:e2e": "jest --config ./test/jest-e2e.json --passWithNoTests"

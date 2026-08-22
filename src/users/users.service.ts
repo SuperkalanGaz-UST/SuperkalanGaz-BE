@@ -145,7 +145,7 @@ export class UsersService {
       .map(toCrmUser)
       // This module is the staff-account directory. Customer identities are
       // managed through CIM and must never appear as branch account records.
-      .filter((u) => u.role !== 'customer')
+      .filter((u) => u.role !== 'customer' && u.role !== 'super-admin')
       .filter((u) => {
         if (role && u.role !== role) return false;
         if (query.branch) return u.branches.includes(query.branch);
@@ -188,6 +188,19 @@ export class UsersService {
 
   async update(principal: Principal, id: string, dto: UpdateUserDto): Promise<void> {
     const target = await this.findManageable(principal, id);
+
+    // Assigning or removing an existing Branch Owner changes branch governance.
+    // It must pass through the Super Administrator queue so the old/new owner,
+    // reason, reviewer, and timestamp are captured in one immutable audit event.
+    const changesBranchOwnerAssignment =
+      (target.role === 'branch-owner' && dto.branches !== undefined) ||
+      (dto.role !== undefined && dto.role !== target.role &&
+        (dto.role === 'branch-owner' || target.role === 'branch-owner'));
+    if (changesBranchOwnerAssignment) {
+      throw new ForbiddenException(
+        'Branch Owner assignment changes require Super Administrator approval',
+      );
+    }
 
     if (dto.role && dto.role !== target.role && principal.role === 'branch-owner') {
       throw new ForbiddenException('Branch Owners cannot change account roles');
@@ -263,8 +276,8 @@ export class UsersService {
       throw new NotFoundException('User not found');
     }
 
-    if (target.role === 'franchise-admin') {
-      throw new ForbiddenException('Franchise Administrator accounts cannot be managed here');
+    if (target.role === 'franchise-admin' || target.role === 'super-admin') {
+      throw new ForbiddenException('Governance accounts cannot be managed here');
     }
 
     if (principal.role === 'branch-owner') {
@@ -276,9 +289,9 @@ export class UsersService {
     return target;
   }
 
-  /** A caller may only touch branches inside their own scope. FA is cross-branch. */
+  /** A caller may only touch branches inside their own scope. FA/SA are cross-branch. */
   private assertBranchInScope(principal: Principal, branch: string): void {
-    if (principal.role === 'franchise-admin') return;
+    if (principal.role === 'franchise-admin' || principal.role === 'super-admin') return;
     if (!principal.branches.includes(branch)) {
       throw new ForbiddenException(`You have no access to ${branch}`);
     }

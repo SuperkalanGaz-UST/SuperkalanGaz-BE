@@ -1,3 +1,4 @@
+import { ForbiddenException } from '@nestjs/common';
 import { Principal } from '../auth/principal';
 import { GoTrueAdminService, GoTrueUser } from './gotrue-admin.service';
 import { UsersService } from './users.service';
@@ -78,5 +79,38 @@ describe('UsersService self-service account updates', () => {
     expect(goTrue.updateUser).toHaveBeenCalledWith(principal.userId, {
       password: 'new-password-123',
     });
+  });
+});
+
+describe('UsersService governance boundaries', () => {
+  const principal: Principal = {
+    userId: '2da286c8-76d7-43a7-8394-0e0c74c561d0',
+    role: 'franchise-admin',
+    branches: [],
+    branchIds: [],
+  };
+
+  it('blocks direct Branch Owner reassignment outside the approval queue', async () => {
+    const owner: GoTrueUser = {
+      id: 'b54295ca-2d97-4c77-8a31-c06ded29d93f',
+      email: 'owner@superkalan.com',
+      app_metadata: {
+        role: 'branch-owner',
+        branches: ['Quezon City'],
+        status: 'Active',
+      },
+      user_metadata: {},
+      banned_until: null,
+      created_at: '2026-01-10T00:00:00.000Z',
+    };
+    const goTrue = {
+      getUser: jest.fn().mockResolvedValue(owner),
+      updateUser: jest.fn(),
+    } as unknown as GoTrueAdminService;
+    const service = new UsersService(goTrue);
+
+    await expect(
+      service.update(principal, owner.id, { branches: ['Calamba'] }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
   });
 });

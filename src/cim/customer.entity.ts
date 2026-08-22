@@ -5,6 +5,7 @@ import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
  * an authenticated mobile customer materialized into the branch-owned CIM
  * directory when they first place an order with that branch. */
 export type RegistrationSource = 'staff-created' | 'self-registered';
+export type CustomerAccountType = 'household' | 'commercial';
 
 /**
  * Maps cim.customers — one row per customer profile a branch has registered
@@ -45,6 +46,11 @@ export class Customer {
   /** 'staff-created' | 'self-registered' (see RegistrationSource). */
   @Column({ name: 'registration_source', type: 'text' })
   registrationSource!: RegistrationSource;
+
+  /** Server-owned loyalty track selection copied from protected Auth claims for
+   * mobile customers or explicitly captured by staff at registration. */
+  @Column({ name: 'account_type', type: 'text', default: 'household' })
+  accountType!: CustomerAccountType;
 
   @Column({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;

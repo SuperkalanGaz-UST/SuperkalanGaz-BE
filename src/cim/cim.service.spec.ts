@@ -145,6 +145,7 @@ describe('CimService', () => {
         name: '  Juan Dela Cruz ',
         contactNumber: ' 09171234567 ',
         deliveryAddress: '  123 Rizal St ',
+        accountType: 'household',
       });
 
       expect(result.branchId).toBe('branch-uuid-1');
@@ -154,6 +155,7 @@ describe('CimService', () => {
       expect(result.name).toBe('Juan Dela Cruz');
       expect(result.contactNumber).toBe('09171234567');
       expect(result.deliveryAddress).toBe('123 Rizal St');
+      expect(result.accountType).toBe('household');
       expect(repo.save).toHaveBeenCalledTimes(1);
     });
 
@@ -166,6 +168,7 @@ describe('CimService', () => {
           name: 'Juan',
           contactNumber: '09171234567',
           deliveryAddress: '123 Rizal St',
+          accountType: 'household',
         }),
       ).rejects.toBeInstanceOf(ForbiddenException);
       expect(repo.save).not.toHaveBeenCalled();
@@ -202,6 +205,7 @@ describe('CimService', () => {
         name: '  Shoti Go ',
         contactNumber: ' +639399168168 ',
         deliveryAddress: '  Las Pinas ',
+        accountType: 'commercial',
       });
 
       expect(repo.upsert).toHaveBeenCalledWith(
@@ -212,6 +216,7 @@ describe('CimService', () => {
           contactNumber: '+639399168168',
           deliveryAddress: 'Las Pinas',
           registrationSource: 'self-registered',
+          accountType: 'commercial',
           deletedAt: null,
         }),
         expect.objectContaining({

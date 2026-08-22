@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, Repository } from 'typeorm';
+import { DataSource, EntityManager, Repository } from 'typeorm';
 import { NotificationsService } from '../notifications/notifications.service';
 import { CYLINDER_SIZES, UpdatePricesDto } from './dto/update-prices.dto';
 import { LpgProduct } from './lpg-product.entity';
@@ -30,7 +30,10 @@ export class PricesService {
     return product;
   }
 
-  async updateAll(dto: UpdatePricesDto): Promise<LpgProduct[]> {
+  async updateAll(
+    dto: UpdatePricesDto,
+    manager?: EntityManager,
+  ): Promise<LpgProduct[]> {
     const submittedSizes = new Set(dto.prices.map((price) => price.cylinderSize));
     if (
       submittedSizes.size !== CYLINDER_SIZES.length ||
@@ -39,8 +42,8 @@ export class PricesService {
       throw new BadRequestException('Submit one price for every supported cylinder size');
     }
 
-    await this.dataSource.transaction(async (manager) => {
-      const repository = manager.getRepository(LpgProduct);
+    const apply = async (transactionManager: EntityManager) => {
+      const repository = transactionManager.getRepository(LpgProduct);
       const current = await repository.find({
         where: { isActive: true },
         lock: { mode: 'pessimistic_write' },
@@ -65,9 +68,12 @@ export class PricesService {
 
       if (changes.length > 0) {
         await repository.save(changedProducts);
-        await this.notifications.publishPriceUpdate(changes.join('; '), manager);
+        await this.notifications.publishPriceUpdate(changes.join('; '), transactionManager);
       }
-    });
+    };
+
+    if (manager) await apply(manager);
+    else await this.dataSource.transaction(apply);
 
     return this.list();
   }

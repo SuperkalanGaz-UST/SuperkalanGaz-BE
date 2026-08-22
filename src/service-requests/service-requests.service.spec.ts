@@ -12,6 +12,7 @@ import { CimService } from '../cim/cim.service';
 import { Customer } from '../cim/customer.entity';
 import { FleetService } from '../fleet/fleet.service';
 import { Rider } from '../fleet/rider.entity';
+import { LoyaltyService } from '../loyalty/loyalty.service';
 import { PricesService } from '../prices/prices.service';
 import { PayMongoService } from './paymongo.service';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
@@ -116,6 +117,11 @@ describe('ServiceRequestsService', () => {
       expireCheckout: jest.fn(() => Promise.resolve()),
     }) as unknown as jest.Mocked<PayMongoService>;
 
+  const makeLoyalty = () =>
+    ({
+      recordDeliveredPurchase: jest.fn(() => Promise.resolve()),
+    }) as unknown as jest.Mocked<LoyaltyService>;
+
   // sla defaults to "no thresholds configured" so every pre-existing call site
   // (which only ever passed the first four args) is unaffected — appended at
   // the END of this helper's own params, even though the real constructor
@@ -127,6 +133,7 @@ describe('ServiceRequestsService', () => {
     cim: jest.Mocked<CimService>,
     sla: jest.Mocked<Repository<SlaConfiguration>> = makeSlaConfig(),
     branches: jest.Mocked<Repository<Branch>> = makeBranches(),
+    loyalty: jest.Mocked<LoyaltyService> = makeLoyalty(),
   ) => new ServiceRequestsService(
     repo,
     branches,
@@ -136,6 +143,7 @@ describe('ServiceRequestsService', () => {
     cim,
     makePrices(),
     makePayMongo(),
+    loyalty,
   );
 
   const inBranchCustomer = (): Customer =>
@@ -275,6 +283,7 @@ describe('ServiceRequestsService', () => {
     const mobilePrincipal: Principal = {
       userId: 'auth-user-1',
       role: 'customer',
+      accountType: 'household',
       branches: [],
       branchIds: [],
     };
@@ -295,6 +304,7 @@ describe('ServiceRequestsService', () => {
       name: 'Shoti Go',
       contactNumber: '+639399168168',
       deliveryAddress: 'Las Pinas',
+      accountType: 'household',
     });
     expect(result.customerId).toBe('mobile-cust-1');
     expect(result.orderSource).toBe('Mobile App');
@@ -515,6 +525,41 @@ describe('ServiceRequestsService', () => {
       expect(fleet.markAvailable).not.toHaveBeenCalled();
     });
 
+    it('repairs a missing loyalty entry when a committed delivery is retried', async () => {
+      const { repo, qb } = makeRepo();
+      const delivered = {
+        ...outForDeliverySr(),
+        status: 'Delivered',
+        deliveredAt: new Date('2026-08-21T00:00:00.000Z'),
+        customerId: 'customer-1',
+        cylinderSize: '11kg',
+        quantity: 2,
+      } as ServiceRequest;
+      repo.findOne = jest.fn(() => Promise.resolve(delivered)) as never;
+      const loyalty = makeLoyalty();
+      const service = makeService(
+        repo,
+        makeHistory(),
+        makeFleet(null),
+        makeCim(null),
+        makeSlaConfig(),
+        makeBranches(),
+        loyalty,
+      );
+
+      await expect(
+        service.deliver(principal(['branch-uuid-1']), 'sr-1'),
+      ).resolves.toBe(delivered);
+      expect(loyalty.recordDeliveredPurchase).toHaveBeenCalledWith(
+        'customer-1',
+        'branch-uuid-1',
+        'sr-1',
+        '11kg',
+        2,
+      );
+      expect(qb.execute).not.toHaveBeenCalled();
+    });
+
     it('404s for a request outside the caller scope or not found', async () => {
       const { repo, qb } = makeRepo();
       // findOne returns null by default (out of scope / missing).
@@ -559,6 +604,7 @@ describe('ServiceRequestsService', () => {
         makeCim(null),
         makePrices(),
         makePayMongo(),
+        makeLoyalty(),
       );
 
       const result = await service.edit(principal(['branch-uuid-1']), 'sr-1', {
@@ -604,6 +650,7 @@ describe('ServiceRequestsService', () => {
         makeCim(null),
         makePrices(),
         makePayMongo(),
+        makeLoyalty(),
       );
 
       await expect(
@@ -629,6 +676,7 @@ describe('ServiceRequestsService', () => {
         makeCim(null),
         makePrices(),
         makePayMongo(),
+        makeLoyalty(),
       );
 
       await expect(
@@ -656,6 +704,7 @@ describe('ServiceRequestsService', () => {
         makeCim(null),
         makePrices(),
         makePayMongo(),
+        makeLoyalty(),
       );
 
       const result = await service.cancel(principal(['branch-uuid-1']), 'sr-1', {
@@ -712,6 +761,7 @@ describe('ServiceRequestsService', () => {
         makeCim(null),
         makePrices(),
         payMongo,
+        makeLoyalty(),
       );
 
       await service.cancel(principal(['branch-uuid-1']), 'sr-1', { reason: 'cancel' });
@@ -731,6 +781,7 @@ describe('ServiceRequestsService', () => {
         makeCim(null),
         makePrices(),
         makePayMongo(),
+        makeLoyalty(),
       );
 
       await expect(
@@ -754,6 +805,7 @@ describe('ServiceRequestsService', () => {
         makeCim(null),
         makePrices(),
         makePayMongo(),
+        makeLoyalty(),
       );
 
       await expect(
@@ -781,6 +833,7 @@ describe('ServiceRequestsService', () => {
         makeCim(null),
         makePrices(),
         makePayMongo(),
+        makeLoyalty(),
       );
 
       const result = await service.reassign(principal(['branch-uuid-1']), 'sr-1', {
@@ -863,6 +916,7 @@ describe('ServiceRequestsService', () => {
         makeCim(null),
         makePrices(),
         makePayMongo(),
+        makeLoyalty(),
       );
 
       await expect(

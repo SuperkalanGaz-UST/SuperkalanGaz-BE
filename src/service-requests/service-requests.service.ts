@@ -162,6 +162,9 @@ export class ServiceRequestsService {
     principal: Principal,
     dto: CreateCustomerServiceRequestDto,
   ): Promise<ServiceRequest> {
+    if (!principal.accountType) {
+      throw new ForbiddenException('Customer account type is missing');
+    }
     console.log('[service-requests-service] createForCustomer input', {
       userId: principal.userId,
       role: principal.role,
@@ -183,6 +186,7 @@ export class ServiceRequestsService {
       name: dto.customerName,
       contactNumber: dto.customerContact,
       deliveryAddress: dto.deliveryAddress,
+      accountType: principal.accountType,
     });
 
     const product = await this.prices.findByCylinderSize(dto.cylinderSize);
@@ -301,6 +305,7 @@ export class ServiceRequestsService {
       where: { id, branchId: In(branchIds), deletedAt: IsNull() },
     });
     if (!serviceRequest) throw new NotFoundException('Service request not found');
+
     return serviceRequest;
   }
 
@@ -444,6 +449,14 @@ export class ServiceRequestsService {
     });
     if (!serviceRequest) throw new NotFoundException('Service request not found');
 
+    // Delivery and loyalty credit are deliberately retryable together. If the
+    // delivery row committed but the post-commit loyalty write failed, retrying
+    // this endpoint repairs the idempotent ledger entry instead of stranding it.
+    if (serviceRequest.deliveredAt && serviceRequest.status === 'Delivered') {
+      await this.recordDeliveredPurchase(serviceRequest);
+      return serviceRequest;
+    }
+
     // 2 + 3. Commit atomically: only a request that is out for delivery
     //    (dispatched, not yet delivered) is updated. 0 rows affected means the
     //    request is not out for delivery (still Pending, already Delivered, or
@@ -474,6 +487,13 @@ export class ServiceRequestsService {
       )
       .execute();
     if (!result.affected) {
+      const concurrentlyDelivered = await this.serviceRequests.findOne({
+        where: { id, branchId: In(branchIds), deletedAt: IsNull() },
+      });
+      if (concurrentlyDelivered?.deliveredAt && concurrentlyDelivered.status === 'Delivered') {
+        await this.recordDeliveredPurchase(concurrentlyDelivered);
+        return concurrentlyDelivered;
+      }
       throw new ConflictException('Service request is not out for delivery');
     }
 
@@ -522,18 +542,21 @@ export class ServiceRequestsService {
       // Non-fatal — the delivery itself already committed successfully.
     }
 
-    // 6. Record household points for the completed delivery if the order is linked to a customer
-    if (serviceRequest.customerId) {
-      await this.loyalty.recordHouseholdEarn(
-        serviceRequest.customerId,
-        serviceRequest.branchId,
-        serviceRequest.id,
-        serviceRequest.cylinderSize,
-        serviceRequest.quantity,
-      );
-    }
+    // 6. Credit exactly one server-owned loyalty track for a linked customer.
+    await this.recordDeliveredPurchase(serviceRequest);
 
     return serviceRequest;
+  }
+
+  private async recordDeliveredPurchase(serviceRequest: ServiceRequest): Promise<void> {
+    if (!serviceRequest.customerId) return;
+    await this.loyalty.recordDeliveredPurchase(
+      serviceRequest.customerId,
+      serviceRequest.branchId,
+      serviceRequest.id,
+      serviceRequest.cylinderSize,
+      serviceRequest.quantity,
+    );
   }
 
   /**
