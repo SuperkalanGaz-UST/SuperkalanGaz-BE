@@ -50,12 +50,23 @@ import { GovernanceModule } from './governance/governance.module';
           type: 'postgres' as const,
           url: databaseUrl.toString(),
           ssl: { rejectUnauthorized: false },
-          connectTimeoutMS: 30_000,
+          connectTimeoutMS: 5_000,
           poolSize: 5,
           extra: {
-            connectionTimeoutMillis: 30_000,
+            // Fail inside the API's 10-second web-client budget so the BFF can
+            // return an explicit unavailable response instead of leaving the
+            // dashboard waiting on a saturated pool.
+            connectionTimeoutMillis: 5_000,
+            query_timeout: 8_000,
+            statement_timeout: 8_000,
+            idle_in_transaction_session_timeout: 8_000,
             idleTimeoutMillis: 15_000,
             keepAlive: true,
+            keepAliveInitialDelayMillis: 1_000,
+            // Supavisor endpoints can rotate. Recycling connections prevents a
+            // long-running API process from keeping a stale pool indefinitely.
+            maxLifetimeSeconds: 300,
+            maxUses: 100,
             max: 5,
           },
           autoLoadEntities: true,

@@ -4,8 +4,8 @@ import { GoTrueAdminService } from '../users/gotrue-admin.service';
 
 /**
  * One-time bootstrap for the first Super Administrator. Later Franchise
- * Administrator accounts must use the governance approval queue; this script
- * exists only because the first approver cannot approve their own creation.
+ * Administrator accounts must use the authenticated Super Administrator
+ * invitation path; this script never provisions Franchise Administrators.
  * Credentials come exclusively from uncommitted environment variables.
  */
 async function run(): Promise<void> {

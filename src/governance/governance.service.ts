@@ -80,6 +80,11 @@ export class GovernanceService {
     principal: Principal,
     dto: CreateGovernanceRequestDto,
   ): Promise<GovernanceRequest> {
+    if (dto.type === 'franchise-admin-account') {
+      throw new ForbiddenException(
+        'Franchise Administrator accounts use the Super Administrator invitation flow',
+      );
+    }
     await this.validateRequestPayload(dto);
 
     const request = this.requests.create({
@@ -156,6 +161,14 @@ export class GovernanceService {
     }
     if (current.status !== 'pending') {
       throw new ConflictException('This request has already been reviewed');
+    }
+    if (
+      current.type === 'franchise-admin-account' &&
+      dto.decision !== 'reject'
+    ) {
+      throw new ForbiddenException(
+        'Legacy Franchise Administrator requests can only be rejected; use the invitation flow',
+      );
     }
 
     const claim = await this.requests
@@ -241,19 +254,22 @@ export class GovernanceService {
 
   async dashboard() {
     const last30Days = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const [pending, accountRequests, priceChanges30Days, branchOwnerChanges, audits] = await Promise.all([
-      this.requests.count({ where: { status: 'pending', deletedAt: IsNull() } }),
-      this.requests.count({
-        where: {
-          type: 'franchise-admin-account',
-          status: 'pending',
-          deletedAt: IsNull(),
-        },
-      }),
-      this.audit.count('price-change', last30Days),
-      this.audit.count('branch-owner-change'),
-      this.audit.list(undefined, 25),
-    ]);
+    // Keep this aggregate read within one connection at a time. Running every
+    // count concurrently used all five pool slots, so one dashboard visit could
+    // prevent unrelated BFF requests from obtaining a database connection.
+    const pending = await this.requests.count({
+      where: { status: 'pending', deletedAt: IsNull() },
+    });
+    const accountRequests = await this.requests.count({
+      where: {
+        type: 'franchise-admin-account',
+        status: 'pending',
+        deletedAt: IsNull(),
+      },
+    });
+    const priceChanges30Days = await this.audit.count('price-change', last30Days);
+    const branchOwnerChanges = await this.audit.count('branch-owner-change');
+    const audits = await this.audit.list(undefined, 25);
     return {
       metrics: {
         pendingApprovals: pending,

@@ -135,8 +135,8 @@ Scoping by role (see §7 for full permissions):
 
 | Role | Interface | Can do | Must NOT do |
 | ---- | --------- | ------ | ----------- |
-| **Super Administrator (SA)** | Web | Top-level governance; approve or reject FA-submitted SLA-threshold, price-configuration, Branch Owner-reassignment, and FA-account-creation requests; review immutable price-change, Branch Owner-change, approval, and security activity logs; cross-branch read visibility | Submit or approve their own request; mutate audit history; perform operational writes; process service requests; dispatch; approve redemptions |
-| **Franchise Administrator (FA)** | Web | Cross-branch read visibility; submit system-wide SLA-threshold, price-configuration, Branch Owner-reassignment, and FA-account-creation requests for SA approval; perform initial branch and Branch Owner onboarding; manage other branch accounts | Approve governance requests or FA account creation; mutate audit history; perform operational writes; process service requests; dispatch; approve redemptions |
+| **Super Administrator (SA)** | Web | Top-level governance; directly invite, resend, revoke, deactivate, and reactivate Franchise Administrator accounts; approve or reject FA-submitted SLA-threshold, price-configuration, and Branch Owner-reassignment requests; review immutable Franchise Administrator account, price-change, Branch Owner-change, approval, and security activity logs; cross-branch read visibility | Set or know an invited user's password; expose invitation credentials; submit or approve their own governance request; mutate audit history; perform operational writes; process service requests; dispatch; approve redemptions |
+| **Franchise Administrator (FA)** | Web | Cross-branch read visibility; submit system-wide SLA-threshold, price-configuration, and Branch Owner-reassignment requests for SA approval; perform initial branch and Branch Owner onboarding; manage other branch accounts | Create, invite, approve, deactivate, or reactivate Franchise Administrator accounts; approve governance requests; mutate audit history; perform operational writes; process service requests; dispatch; approve redemptions |
 | **Branch Owner (BO)** | Web | Configure **their branch only**: loyalty merchandise catalog, point rates, threshold values *within FA-set bounds*, Dual-Authorization toggle; view branch analytics | Process daily orders; dispatch; cross-branch access |
 | **Branch Manager (BM)** | Web | **Day-to-day ops for their branch:** create/process service requests, dispatch riders, approve loyalty redemptions | Change SLA thresholds; act outside own branch |
 | **Customer (CU)** | **Mobile only** | Place orders, track delivery status *milestones*, submit CSAT | Access web dashboard; see live GPS coordinates |
@@ -144,15 +144,24 @@ Scoping by role (see §7 for full permissions):
 Hard constraints:
 - **BO and BM are always separate people.** Do not merge these roles or share a session.
 - **SA and FA are governance roles with no operational write actions.** FA proposes
-  system-wide SLA-threshold and price-configuration changes, Branch Owner reassignments,
-  and FA-account creation; SA makes the approval decision. Initial branch/Branch Owner
-  onboarding remains an FA action and must still be audited. Approved changes execute
-  through a separately authorized service path and remain attributable in the audit trail.
-- **No self-approval.** SA cannot create and approve the same governance request, and FA
-  cannot approve FA-account or configuration requests.
-- **Audit history is immutable to users.** Price changes, Branch Owner changes, FA account
-  creation events, and approval decisions must record actor, action, affected record,
-  before/after values where applicable, timestamp, and decision reason.
+  system-wide SLA-threshold and price-configuration changes and Branch Owner reassignments;
+  SA makes the approval decision. Initial branch/Branch Owner onboarding remains an FA
+  action and must still be audited. Approved governance changes execute through a separately
+  authorized service path and remain attributable in the audit trail.
+- **Franchise Administrator provisioning is invitation-only.** There is no public FA signup
+  or applicant-selected FA role. An authenticated Super Administrator enters the intended
+  recipient's verified name and email, and that authorization triggers a single-use,
+  expiring email invitation through the NestJS API. The invitee sets their own password;
+  the SA must never create, view, copy, or transmit it. The backend assigns the
+  `franchise-admin` role only in protected `app_metadata`. Accepting a valid invitation
+  activates the account without a second SA approval.
+- **No self-approval.** SA cannot create and approve the same governance request. Direct FA
+  invitations are provisioning actions, not governance requests, so sending the invitation
+  is the SA's authorization and must not create a duplicate approval step.
+- **Audit history is immutable to users.** Price changes, Branch Owner changes, FA invitation
+  sends/resends/revocations/acceptances and account-status changes, and approval decisions
+  must record actor, action, affected record, before/after values where applicable,
+  timestamp, and reason where the action requires one.
 - **Customers see delivery status milestones only — never live GPS coordinates.**
 
 ---

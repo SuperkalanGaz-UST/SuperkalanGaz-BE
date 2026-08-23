@@ -30,8 +30,8 @@ export class CreateUserDto {
 
   /**
    * Franchise Administrator accounts cannot be provisioned through this
-   * endpoint; they require the Super Administrator governance queue. BO callers
-   * are further restricted to 'branch-manager' in the service.
+   * endpoint; they require the dedicated Super Administrator invitation path.
+   * BO callers are further restricted to 'branch-manager' in the service.
    */
   @IsOptional()
   @IsIn(['branch-owner', 'branch-manager'])
