@@ -25,7 +25,7 @@ export interface Principal {
   username?: string | null;
   displayName?: string | null;
   phone?: string | null;
-  status?: 'Active' | 'Inactive';
+  status?: 'Active' | 'Inactive' | 'Pending';
   /** Customer loyalty classification from protected app_metadata. */
   accountType?: 'household' | 'commercial';
   /**

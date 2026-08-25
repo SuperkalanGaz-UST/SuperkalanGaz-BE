@@ -46,3 +46,8 @@ npm run lint        # lint
 ```
 
 Copy `.env.example` to `.env` and fill in values. Never commit credentials.
+
+For Franchise Administrator invitations, add the first `WEB_ORIGIN` value to
+Supabase Auth's allowed redirect URLs. Set `SUPABASE_EMAIL_OTP_EXPIRY_SECONDS`
+to the same duration as the project's **Email OTP Expiration** setting so the
+governance lifecycle feed and Supabase enforce the same expiry time.

@@ -5,6 +5,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { randomBytes } from 'node:crypto';
 import { DataSource, IsNull, Repository } from 'typeorm';
@@ -16,6 +17,7 @@ import { CYLINDER_SIZES, CylinderSize, UpdatePricesDto } from '../prices/dto/upd
 import { SlaConfiguration, SlaSegment } from '../service-requests/sla-configuration.entity';
 import { GoTrueAdminService, GoTrueUser } from '../users/gotrue-admin.service';
 import { CreateGovernanceRequestDto } from './dto/create-governance-request.dto';
+import { CreateFranchiseAdminInvitationDto } from './dto/create-franchise-admin-invitation.dto';
 import { DecideGovernanceRequestDto } from './dto/decide-governance-request.dto';
 import { ListGovernanceRequestsQuery } from './dto/list-governance.query';
 import { GovernanceAuditCategory } from './governance-audit-event.entity';
@@ -36,6 +38,20 @@ interface AppliedRequestResult {
 
 interface PricePayload {
   prices: { cylinderSize: CylinderSize; unitPrice: number }[];
+}
+
+export type FranchiseAdminInvitationStatus = 'Pending' | 'Expired' | 'Revoked';
+
+export interface FranchiseAdminInvitation {
+  id: string;
+  email: string;
+  displayName: string;
+  status: FranchiseAdminInvitationStatus;
+  invitedAt: string;
+  confirmationSentAt: string;
+  expiresAt: string;
+  invitedBy: string;
+  invitedByName: string;
 }
 
 const SLA_SEGMENTS: readonly SlaSegment[] = [
@@ -60,6 +76,10 @@ function metadataBranches(user: GoTrueUser): string[] {
     : [];
 }
 
+function isConfirmed(user: GoTrueUser): boolean {
+  return Boolean(user.email_confirmed_at ?? user.confirmed_at);
+}
+
 @Injectable()
 export class GovernanceService {
   constructor(
@@ -74,6 +94,7 @@ export class GovernanceService {
     private readonly notifications: NotificationsService,
     private readonly goTrue: GoTrueAdminService,
     private readonly dataSource: DataSource,
+    private readonly config: ConfigService,
   ) {}
 
   async submit(
@@ -302,7 +323,13 @@ export class GovernanceService {
     ]);
     return {
       accounts: users
-        .filter((user) => metadataRole(user) === 'franchise-admin')
+        .filter(
+          (user) =>
+            metadataRole(user) === 'franchise-admin' &&
+            isConfirmed(user) &&
+            user.app_metadata.status !== 'Pending' &&
+            user.app_metadata.status !== 'Revoked',
+        )
         .map((user) => ({
           id: user.id,
           email: user.email,
@@ -319,8 +346,204 @@ export class GovernanceService {
           status: user.app_metadata.status === 'Inactive' ? 'Inactive' : 'Active',
           createdAt: user.created_at,
         })),
+      invitations: users
+        .filter(
+          (user) =>
+            metadataRole(user) === 'franchise-admin' &&
+            (user.app_metadata.status === 'Pending' ||
+              user.app_metadata.status === 'Revoked') &&
+            typeof user.app_metadata.invited_by === 'string',
+        )
+        .map((user) => this.toFranchiseAdminInvitation(user))
+        .sort(
+          (left, right) =>
+            new Date(right.confirmationSentAt).getTime() -
+            new Date(left.confirmationSentAt).getTime(),
+        ),
       requests,
     };
+  }
+
+  async inviteFranchiseAdministrator(
+    principal: Principal,
+    dto: CreateFranchiseAdminInvitationDto,
+  ): Promise<FranchiseAdminInvitation> {
+    const email = dto.email.trim().toLowerCase();
+    const displayName = dto.name.trim();
+    if (await this.goTrue.findByEmail(email)) {
+      throw new ConflictException('An account or invitation with this email already exists');
+    }
+
+    const invited = await this.goTrue.inviteUser(
+      email,
+      displayName,
+      this.franchiseAdminInvitationRedirect(),
+    );
+    const invitedAt = invited.invited_at ?? invited.confirmation_sent_at ?? new Date().toISOString();
+    const confirmationSentAt = invited.confirmation_sent_at ?? invitedAt;
+    const appMetadata: Record<string, unknown> = {
+      ...(invited.app_metadata ?? {}),
+      username: email.split('@')[0],
+      display_name: displayName,
+      role: 'franchise-admin',
+      branches: [],
+      phone: null,
+      status: 'Pending',
+      invited_by: principal.userId,
+      invited_by_name: actorName(principal),
+      invited_at: invitedAt,
+      confirmation_sent_at: confirmationSentAt,
+    };
+    await this.goTrue.updateUser(invited.id, { app_metadata: appMetadata });
+
+    const invitation = this.toFranchiseAdminInvitation({
+      ...invited,
+      email,
+      app_metadata: appMetadata,
+      invited_at: invitedAt,
+      confirmation_sent_at: confirmationSentAt,
+    });
+    await this.audit.record({
+      category: 'admin-account',
+      action: 'franchise-admin-invitation-sent',
+      actor: principal,
+      affectedRecordType: 'franchise-admin-invitation',
+      affectedRecordId: invited.id,
+      afterState: {
+        email,
+        displayName,
+        status: invitation.status,
+        expiresAt: invitation.expiresAt,
+      },
+    });
+    return invitation;
+  }
+
+  async resendFranchiseAdministratorInvitation(
+    principal: Principal,
+    id: string,
+  ): Promise<FranchiseAdminInvitation> {
+    const current = await this.pendingFranchiseAdminInvitation(id);
+    if (current.app_metadata.status === 'Revoked') {
+      throw new ConflictException('A revoked invitation cannot be resent');
+    }
+    if (isConfirmed(current)) {
+      throw new ConflictException(
+        'This recipient already verified the invitation and must finish activation',
+      );
+    }
+    if (!current.email) throw new BadRequestException('Invitation email is missing');
+
+    const displayName =
+      typeof current.app_metadata.display_name === 'string'
+        ? current.app_metadata.display_name
+        : current.email;
+    const resent = await this.goTrue.inviteUser(
+      current.email,
+      displayName,
+      this.franchiseAdminInvitationRedirect(),
+    );
+    const confirmationSentAt = resent.confirmation_sent_at ?? new Date().toISOString();
+    const appMetadata = {
+      ...current.app_metadata,
+      status: 'Pending',
+      confirmation_sent_at: confirmationSentAt,
+    };
+    await this.goTrue.updateUser(id, { app_metadata: appMetadata });
+
+    const invitation = this.toFranchiseAdminInvitation({
+      ...current,
+      ...resent,
+      app_metadata: appMetadata,
+      confirmation_sent_at: confirmationSentAt,
+    });
+    await this.audit.record({
+      category: 'admin-account',
+      action: 'franchise-admin-invitation-resent',
+      actor: principal,
+      affectedRecordType: 'franchise-admin-invitation',
+      affectedRecordId: id,
+      beforeState: {
+        status: this.toFranchiseAdminInvitation(current).status,
+        confirmationSentAt: current.confirmation_sent_at ?? null,
+      },
+      afterState: {
+        status: invitation.status,
+        confirmationSentAt: invitation.confirmationSentAt,
+        expiresAt: invitation.expiresAt,
+      },
+    });
+    return invitation;
+  }
+
+  async revokeFranchiseAdministratorInvitation(
+    principal: Principal,
+    id: string,
+  ): Promise<FranchiseAdminInvitation> {
+    const current = await this.pendingFranchiseAdminInvitation(id);
+    if (current.app_metadata.status === 'Revoked') {
+      throw new ConflictException('This invitation has already been revoked');
+    }
+    const before = this.toFranchiseAdminInvitation(current);
+    const appMetadata = { ...current.app_metadata, status: 'Revoked' };
+
+    // Mark the protected claim first, then ban the retained identity. Either
+    // state independently fails closed if the external Auth call is interrupted.
+    await this.goTrue.updateUser(id, { app_metadata: appMetadata });
+    await this.goTrue.banUser(id);
+    const invitation = this.toFranchiseAdminInvitation({
+      ...current,
+      app_metadata: appMetadata,
+    });
+    await this.audit.record({
+      category: 'admin-account',
+      action: 'franchise-admin-invitation-revoked',
+      actor: principal,
+      affectedRecordType: 'franchise-admin-invitation',
+      affectedRecordId: id,
+      beforeState: { status: before.status },
+      afterState: { status: invitation.status },
+    });
+    return invitation;
+  }
+
+  async acceptFranchiseAdministratorInvitation(principal: Principal): Promise<void> {
+    const current = await this.goTrue.getUser(principal.userId);
+    if (
+      !current ||
+      metadataRole(current) !== 'franchise-admin' ||
+      current.app_metadata.status !== 'Pending' ||
+      !isConfirmed(current)
+    ) {
+      throw new ForbiddenException('This Franchise Administrator invitation is not valid');
+    }
+
+    const appMetadata = {
+      ...current.app_metadata,
+      status: 'Active',
+      invitation_accepted_at: new Date().toISOString(),
+    };
+    await this.goTrue.updateUser(current.id, { app_metadata: appMetadata });
+    await this.audit.record({
+      category: 'admin-account',
+      action: 'franchise-admin-invitation-accepted',
+      actor: principal,
+      affectedRecordType: 'franchise-admin-account',
+      affectedRecordId: current.id,
+      beforeState: { status: 'Pending' },
+      afterState: {
+        status: 'Active',
+        email: current.email,
+        displayName: current.app_metadata.display_name ?? null,
+        invitedBy: current.app_metadata.invited_by ?? null,
+      },
+    });
+    await this.notifications.publishForRole({
+      type: 'system',
+      audienceRole: 'super-admin',
+      title: 'Franchise Administrator invitation accepted',
+      message: `${actorName(principal)} activated their Franchise Administrator account.`,
+    });
   }
 
   async securitySummary() {
@@ -333,7 +556,9 @@ export class GovernanceService {
     const active = (role: string) =>
       staff.filter(
         (user) =>
-          metadataRole(user) === role && user.app_metadata.status !== 'Inactive',
+          metadataRole(user) === role &&
+          (user.app_metadata.status === undefined ||
+            user.app_metadata.status === 'Active'),
       ).length;
     return {
       accountHealth: {
@@ -627,6 +852,81 @@ export class GovernanceService {
       case 'other':
         return;
     }
+  }
+
+  private async pendingFranchiseAdminInvitation(id: string): Promise<GoTrueUser> {
+    const user = await this.goTrue.getUser(id);
+    if (
+      !user ||
+      metadataRole(user) !== 'franchise-admin' ||
+      (user.app_metadata.status !== 'Pending' &&
+        user.app_metadata.status !== 'Revoked') ||
+      typeof user.app_metadata.invited_by !== 'string'
+    ) {
+      throw new NotFoundException('Franchise Administrator invitation not found');
+    }
+    return user;
+  }
+
+  private toFranchiseAdminInvitation(user: GoTrueUser): FranchiseAdminInvitation {
+    const sentAt =
+      user.confirmation_sent_at ??
+      (typeof user.app_metadata.confirmation_sent_at === 'string'
+        ? user.app_metadata.confirmation_sent_at
+        : null) ??
+      user.invited_at ??
+      user.created_at;
+    const invitedAt =
+      user.invited_at ??
+      (typeof user.app_metadata.invited_at === 'string'
+        ? user.app_metadata.invited_at
+        : null) ??
+      sentAt;
+    const expiresAt = new Date(
+      new Date(sentAt).getTime() + this.invitationExpirySeconds() * 1000,
+    );
+    const status: FranchiseAdminInvitationStatus =
+      user.app_metadata.status === 'Revoked'
+        ? 'Revoked'
+        : !isConfirmed(user) && expiresAt.getTime() <= Date.now()
+          ? 'Expired'
+          : 'Pending';
+
+    return {
+      id: user.id,
+      email: user.email ?? '',
+      displayName:
+        typeof user.app_metadata.display_name === 'string'
+          ? user.app_metadata.display_name
+          : user.email ?? 'Franchise Administrator',
+      status,
+      invitedAt,
+      confirmationSentAt: sentAt,
+      expiresAt: expiresAt.toISOString(),
+      invitedBy:
+        typeof user.app_metadata.invited_by === 'string'
+          ? user.app_metadata.invited_by
+          : '',
+      invitedByName:
+        typeof user.app_metadata.invited_by_name === 'string'
+          ? user.app_metadata.invited_by_name
+          : 'Super Administrator',
+    };
+  }
+
+  private franchiseAdminInvitationRedirect(): string {
+    const origin = (this.config.get<string>('WEB_ORIGIN') ?? 'http://localhost:3000')
+      .split(',')[0]
+      .trim()
+      .replace(/\/$/, '');
+    return `${origin}/?invitation=franchise-admin`;
+  }
+
+  private invitationExpirySeconds(): number {
+    const configured = Number(
+      this.config.get<string>('SUPABASE_EMAIL_OTP_EXPIRY_SECONDS') ?? '3600',
+    );
+    return Number.isFinite(configured) && configured > 0 ? configured : 3600;
   }
 
   private pricePayload(payload: Record<string, unknown>): PricePayload {

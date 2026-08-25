@@ -6,10 +6,12 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { Reflector } from '@nestjs/core';
 import { Request } from 'express';
 import { In, Repository } from 'typeorm';
 import { Branch } from '../branches/branch.entity';
 import { isRole, Principal, REQUEST_PRINCIPAL } from './principal';
+import { ALLOW_PENDING_INVITATION_KEY } from './roles.decorator';
 import { SupabaseJwtService } from './supabase-jwt.service';
 
 /**
@@ -24,6 +26,7 @@ import { SupabaseJwtService } from './supabase-jwt.service';
 export class AuthGuard implements CanActivate {
   constructor(
     private readonly jwt: SupabaseJwtService,
+    private readonly reflector: Reflector,
     @InjectRepository(Branch)
     private readonly branches: Repository<Branch>,
   ) {}
@@ -63,7 +66,18 @@ export class AuthGuard implements CanActivate {
       });
       throw new ForbiddenException('No CRM role for this account');
     }
-    if (claims.status !== undefined && claims.status !== 'Active') {
+    const allowPendingInvitation =
+      claims.role === 'franchise-admin' &&
+      claims.status === 'Pending' &&
+      this.reflector.getAllAndOverride<boolean>(ALLOW_PENDING_INVITATION_KEY, [
+        context.getHandler(),
+        context.getClass(),
+      ]) === true;
+    if (
+      claims.status !== undefined &&
+      claims.status !== 'Active' &&
+      !allowPendingInvitation
+    ) {
       throw new ForbiddenException('This account is inactive');
     }
 
@@ -97,8 +111,7 @@ export class AuthGuard implements CanActivate {
       username: typeof claims.username === 'string' ? claims.username : null,
       displayName: typeof claims.display_name === 'string' ? claims.display_name : null,
       phone: typeof claims.phone === 'string' ? claims.phone : null,
-      // Inactive accounts were rejected above, so every constructed principal is active.
-      status: 'Active',
+      status: allowPendingInvitation ? 'Pending' : 'Active',
       accountType:
         claims.account_type === 'household' || claims.account_type === 'commercial'
           ? claims.account_type

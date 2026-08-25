@@ -1,4 +1,5 @@
 import { ForbiddenException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { DataSource, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
@@ -27,7 +28,10 @@ describe('GovernanceService', () => {
     branchIds: [],
   };
 
-  const makeService = (requestOverrides: Partial<Repository<GovernanceRequest>> = {}) => {
+  const makeService = (
+    requestOverrides: Partial<Repository<GovernanceRequest>> = {},
+    goTrueOverrides: Partial<GoTrueAdminService> = {},
+  ) => {
     const requests = {
       create: jest.fn((value: GovernanceRequest) => value),
       save: jest.fn((value: GovernanceRequest) =>
@@ -42,6 +46,9 @@ describe('GovernanceService', () => {
     const notifications = {
       publishForRole: jest.fn(() => Promise.resolve()),
     } as unknown as jest.Mocked<NotificationsService>;
+    const goTrue = {
+      ...goTrueOverrides,
+    } as unknown as jest.Mocked<GoTrueAdminService>;
     const service = new GovernanceService(
       requests,
       { findOne: jest.fn() } as unknown as Repository<Branch>,
@@ -49,10 +56,15 @@ describe('GovernanceService', () => {
       audit,
       {} as PricesService,
       notifications,
-      {} as GoTrueAdminService,
+      goTrue,
       {} as DataSource,
+      {
+        get: jest.fn((key: string) =>
+          key === 'WEB_ORIGIN' ? 'http://localhost:3000' : undefined,
+        ),
+      } as unknown as ConfigService,
     );
-    return { service, requests, audit, notifications };
+    return { service, requests, audit, notifications, goTrue };
   };
 
   it('stores a complete price proposal without applying prices before approval', async () => {
@@ -98,6 +110,93 @@ describe('GovernanceService', () => {
       }),
     ).rejects.toBeInstanceOf(ForbiddenException);
     expect(requests.save).not.toHaveBeenCalled();
+  });
+
+  it('sends a role-locked Franchise Administrator invitation without creating a password', async () => {
+    const sentAt = new Date().toISOString();
+    const invited = {
+      id: '44444444-4444-4444-8444-444444444444',
+      email: 'ana.reyes@example.com',
+      app_metadata: {},
+      user_metadata: {},
+      banned_until: null,
+      created_at: sentAt,
+      invited_at: sentAt,
+      confirmation_sent_at: sentAt,
+      confirmed_at: null,
+      email_confirmed_at: null,
+    };
+    const { service, goTrue, audit } = makeService({}, {
+      findByEmail: jest.fn(() => Promise.resolve(null)),
+      inviteUser: jest.fn(() => Promise.resolve(invited)),
+      updateUser: jest.fn(() => Promise.resolve()),
+    });
+
+    const invitation = await service.inviteFranchiseAdministrator(superAdmin, {
+      name: 'Ana Reyes',
+      email: 'ANA.REYES@EXAMPLE.COM',
+    });
+
+    expect(goTrue.inviteUser).toHaveBeenCalledWith(
+      'ana.reyes@example.com',
+      'Ana Reyes',
+      'http://localhost:3000/?invitation=franchise-admin',
+    );
+    expect(goTrue.updateUser).toHaveBeenCalledWith(
+      invited.id,
+      expect.objectContaining({
+        app_metadata: expect.objectContaining({
+          role: 'franchise-admin',
+          status: 'Pending',
+          invited_by: superAdmin.userId,
+        }),
+      }),
+    );
+    expect(JSON.stringify(goTrue.updateUser.mock.calls)).not.toContain('password');
+    expect(invitation.status).toBe('Pending');
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'franchise-admin-invitation-sent' }),
+    );
+  });
+
+  it('activates a verified pending invitation and records acceptance', async () => {
+    const pendingPrincipal: Principal = {
+      ...franchiseAdmin,
+      userId: '44444444-4444-4444-8444-444444444444',
+      status: 'Pending',
+    };
+    const { service, goTrue, audit, notifications } = makeService({}, {
+      getUser: jest.fn(() => Promise.resolve({
+        id: pendingPrincipal.userId,
+        email: 'ana.reyes@example.com',
+        app_metadata: {
+          role: 'franchise-admin',
+          status: 'Pending',
+          display_name: 'Ana Reyes',
+          invited_by: superAdmin.userId,
+        },
+        user_metadata: {},
+        banned_until: null,
+        created_at: '2026-08-25T01:00:00.000Z',
+        confirmed_at: '2026-08-25T01:30:00.000Z',
+      })),
+      updateUser: jest.fn(() => Promise.resolve()),
+    });
+
+    await service.acceptFranchiseAdministratorInvitation(pendingPrincipal);
+
+    expect(goTrue.updateUser).toHaveBeenCalledWith(
+      pendingPrincipal.userId,
+      expect.objectContaining({
+        app_metadata: expect.objectContaining({ status: 'Active' }),
+      }),
+    );
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'franchise-admin-invitation-accepted' }),
+    );
+    expect(notifications.publishForRole).toHaveBeenCalledWith(
+      expect.objectContaining({ audienceRole: 'super-admin' }),
+    );
   });
 
   it('rejects self-approval before claiming or applying a request', async () => {

@@ -86,7 +86,9 @@ export class UsersService {
       role: principal.role,
       branches: principal.branches,
       phone: principal.phone ?? null,
-      status: principal.status ?? 'Active',
+      // Pending principals are admitted only to the dedicated invitation
+      // acceptance handler, never to this active-account profile path.
+      status: principal.status === 'Inactive' ? 'Inactive' : 'Active',
     };
   }
 

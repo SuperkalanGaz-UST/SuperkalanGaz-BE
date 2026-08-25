@@ -11,8 +11,13 @@ import {
 } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
-import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
+import {
+  AllowPendingInvitation,
+  CurrentPrincipal,
+  Roles,
+} from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
+import { CreateFranchiseAdminInvitationDto } from './dto/create-franchise-admin-invitation.dto';
 import { CreateGovernanceRequestDto } from './dto/create-governance-request.dto';
 import { DecideGovernanceRequestDto } from './dto/decide-governance-request.dto';
 import {
@@ -86,8 +91,58 @@ export class GovernanceController {
     const result = await this.governance.adminAccounts();
     return {
       accounts: result.accounts,
+      invitations: result.invitations,
       requests: result.requests.map((request) => this.toRequestRow(request)),
     };
+  }
+
+  @Post('franchise-admin-invitations')
+  @Roles('super-admin')
+  async inviteFranchiseAdministrator(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: CreateFranchiseAdminInvitationDto,
+  ) {
+    return {
+      invitation: await this.governance.inviteFranchiseAdministrator(principal, dto),
+    };
+  }
+
+  @Post('franchise-admin-invitations/:id/resend')
+  @Roles('super-admin')
+  async resendFranchiseAdministratorInvitation(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ) {
+    return {
+      invitation: await this.governance.resendFranchiseAdministratorInvitation(
+        principal,
+        id,
+      ),
+    };
+  }
+
+  @Patch('franchise-admin-invitations/:id/revoke')
+  @Roles('super-admin')
+  async revokeFranchiseAdministratorInvitation(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ) {
+    return {
+      invitation: await this.governance.revokeFranchiseAdministratorInvitation(
+        principal,
+        id,
+      ),
+    };
+  }
+
+  @Post('franchise-admin-invitations/accept')
+  @Roles('franchise-admin')
+  @AllowPendingInvitation()
+  async acceptFranchiseAdministratorInvitation(
+    @CurrentPrincipal() principal: Principal,
+  ) {
+    await this.governance.acceptFranchiseAdministratorInvitation(principal);
+    return { ok: true };
   }
 
   @Get('audit')

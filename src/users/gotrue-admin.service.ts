@@ -30,15 +30,21 @@ export interface GoTrueUser {
   user_metadata: Record<string, unknown>;
   banned_until: string | null;
   created_at: string;
+  invited_at?: string | null;
+  confirmation_sent_at?: string | null;
+  confirmed_at?: string | null;
+  email_confirmed_at?: string | null;
 }
 
 @Injectable()
 export class GoTrueAdminService {
+  private readonly authUrl: string;
   private readonly baseUrl: string;
   private readonly serviceKey: string;
 
   constructor(config: ConfigService) {
     const supabaseUrl = config.getOrThrow<string>('SUPABASE_URL').replace(/\/$/, '');
+    this.authUrl = `${supabaseUrl}/auth/v1`;
     this.baseUrl = `${supabaseUrl}/auth/v1/admin`;
     this.serviceKey = config.getOrThrow<string>('SUPABASE_SERVICE_ROLE_KEY');
   }
@@ -47,6 +53,26 @@ export class GoTrueAdminService {
   async createUser(attrs: GoTrueUserAttrs): Promise<{ id: string }> {
     const user = await this.request('POST', '/users', attrs);
     return { id: user.id as string };
+  }
+
+  /**
+   * Sends Supabase Auth's single-use invitation email. Only non-sensitive
+   * display data goes in user_metadata; protected CRM claims are written in a
+   * separate Admin API call immediately afterwards.
+   */
+  async inviteUser(
+    email: string,
+    displayName: string,
+    redirectTo: string,
+  ): Promise<GoTrueUser> {
+    const query = new URLSearchParams({ redirect_to: redirectTo });
+    const user = await this.request(
+      'POST',
+      `/invite?${query.toString()}`,
+      { email, data: { display_name: displayName } },
+      this.authUrl,
+    );
+    return user as unknown as GoTrueUser;
   }
 
   /** Fetches a single user by id, or null if GoTrue has no such user. */
@@ -96,13 +122,20 @@ export class GoTrueAdminService {
     await this.updateUser(id, { ban_duration: '876000h' });
   }
 
+  /** Re-enables a retained auth identity; no auth row is deleted. */
+  async unbanUser(id: string): Promise<void> {
+    await this.updateUser(id, { ban_duration: 'none' });
+  }
+
   private async request(
     method: string,
     path: string,
-    body?: GoTrueUserAttrs,
+    body?: GoTrueUserAttrs | Record<string, unknown>,
+    baseUrl = this.baseUrl,
   ): Promise<Record<string, unknown>> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    const res = await fetch(`${baseUrl}${path}`, {
       method,
+      signal: AbortSignal.timeout(8_000),
       headers: {
         apikey: this.serviceKey,
         Authorization: `Bearer ${this.serviceKey}`,
