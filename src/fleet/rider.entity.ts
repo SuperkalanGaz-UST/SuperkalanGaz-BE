@@ -20,11 +20,13 @@ export const RIDER_STATUSES: readonly RiderStatus[] = [
 ];
 
 /**
- * Maps fleet.riders — one row per delivery rider (motorcycle courier) a branch
- * can dispatch to. Riders have NO mobile app or client (AGENTS.md §8/§11) and
- * carry no GPS here; live tracking (SinoTrack ST-901 → Traccar) is deferred.
- * Seeded manually for now — no rider CRUD in this slice. Soft delete only
- * (AGENTS.md §3.2): deleted_at marks a rider retired; this API never hard-deletes.
+ * Maps fleet.riders — one row per Delivery Rider a branch can dispatch to. The
+ * planned Delivery Rider mobile experience handles invitation acceptance,
+ * availability, offer acceptance, and milestones; it does not supply authoritative
+ * GPS. Live tracking remains SinoTrack ST-901 → Traccar and is deferred in this slice.
+ * Seeded manually for now — Rider onboarding is not implemented in this slice. Soft
+ * delete only (AGENTS.md §3.2): deleted_at marks a Delivery Rider retired; this API never
+ * hard-deletes.
  */
 @Entity({ schema: 'fleet', name: 'riders' })
 export class Rider {

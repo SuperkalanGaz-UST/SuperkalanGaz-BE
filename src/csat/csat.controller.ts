@@ -20,14 +20,15 @@ import { ListRatingsQuery } from './dto/list-ratings.query';
 import { ResolveRatingDto } from './dto/resolve-rating.dto';
 import { CreateIncidentDto } from './dto/create-incident.dto';
 import { ListIncidentsQuery } from './dto/list-incidents.query';
+import { BranchReportQuery } from '../common/dto/branch-report.query';
 
 /**
  * CSAT Feedback & Analytics — two Branch Manager flows on the same epic:
  * following up on low-rated deliveries (journey BM-US-08), and logging a
  * lost/undelivered cylinder complaint (journey BM-US-04). Both are Branch
- * Manager day-to-day ops (AGENTS.md §7) — the FA reads CSAT cross-branch
- * (FA-US-04) but does not act on it, so only BM reaches these handlers. Scope
- * comes from the verified Principal, never the client.
+ * Manager day-to-day ops (AGENTS.md §7). The Branch Owner report handler is a
+ * read-only role override; all follow-up and Incident actions remain BM-only.
+ * Scope comes from the verified Principal, never the client.
  *
  * There is deliberately no POST /csat/ratings: ratings are submitted by
  * customers on mobile, not created through the CRM. Incidents ARE created here
@@ -38,6 +39,26 @@ import { ListIncidentsQuery } from './dto/list-incidents.query';
 @Roles('branch-manager')
 export class CsatController {
   constructor(private readonly csat: CsatService) {}
+
+  /** Branch Owner read-only CSAT analytics; scope is narrowed server-side. */
+  @Get('reports/summary')
+  @Roles('branch-owner')
+  async branchReport(
+    @CurrentPrincipal() principal: Principal,
+    @Query() query: BranchReportQuery,
+  ) {
+    const report = await this.csat.getBranchReport(principal, query);
+    return {
+      report: {
+        average_stars: report.averageStars,
+        total_responses: report.totalResponses,
+        delivered_requests: report.deliveredRequests,
+        response_rate: report.responseRate,
+        incidents_raised: report.incidentsRaised,
+        rating_distribution: report.ratingDistribution,
+      },
+    };
+  }
 
   /**
    * The follow-up queue (BM-038): low-CSAT (<= 3 stars by default), Open by

@@ -6,9 +6,18 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, IsNull, Repository } from 'typeorm';
+import {
+  And,
+  In,
+  IsNull,
+  LessThan,
+  MoreThanOrEqual,
+  Repository,
+} from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
+import { BranchReportQuery } from '../common/dto/branch-report.query';
+import { reportRangeFrom } from '../common/report-range';
 import { CimService } from '../cim/cim.service';
 import { FleetService } from '../fleet/fleet.service';
 import { LoyaltyService } from '../loyalty/loyalty.service';
@@ -20,7 +29,7 @@ import { EditServiceRequestDto } from './dto/edit-service-request.dto';
 import { CancelServiceRequestDto } from './dto/cancel-service-request.dto';
 import { ReassignServiceRequestDto } from './dto/reassign-service-request.dto';
 import { LogDelayReasonDto } from './dto/log-delay-reason.dto';
-import { ServiceRequest } from './service-request.entity';
+import { OrderSource, ServiceRequest } from './service-request.entity';
 import { ServiceRequestStatusHistory } from './service-request-status-history.entity';
 import { SlaConfiguration, SlaSegment } from './sla-configuration.entity';
 import { PayMongoService } from './paymongo.service';
@@ -42,13 +51,41 @@ const DELAY_REASON_LABELS: Record<string, string> = {
  * flags a false breach from missing configuration). */
 type ThresholdMap = Partial<Record<SlaSegment, number>>;
 
+export type ReportSlaSegment =
+  | 'request_to_dispatch'
+  | 'dispatch_to_in_transit'
+  | 'in_transit_to_delivery';
+
+export interface SlaReportMetric {
+  evaluated: number;
+  compliant: number;
+  breached: number;
+  complianceRate: number | null;
+}
+
+export interface SlaOrderSourceMetric extends SlaReportMetric {
+  total: number;
+  notEvaluated: number;
+}
+
+export interface SlaBranchReport {
+  totalServiceRequests: number;
+  evaluatedRequests: number;
+  withinSla: number;
+  breaches: number;
+  notEvaluated: number;
+  overallComplianceRate: number | null;
+  segments: Record<ReportSlaSegment, SlaReportMetric>;
+  orderSources: Record<OrderSource, SlaOrderSourceMetric>;
+}
+
 /**
  * Service Request intake & queue (SRD module). Covers create (walk-in / phone
  * intake), the branch queue, detail lookup, dispatch/deliver, pre-dispatch
  * edit/cancel (BM-US-07), and the delayed-delivery journey (BM-US-02):
  * live SLA-at-risk flagging on the queue (BM-008), rider reassignment
  * (BM-010), delay-reason logging (BM-011), and the persisted SLA breach
- * record (BM-012).
+ * record (BM-012), plus read-only Branch Owner SLA reporting.
  *
  * All scoping derives from the verified Principal, never from request
  * params/body (AGENTS.md §5). Isolation is enforced here in the application
@@ -291,6 +328,117 @@ export class ServiceRequestsService {
       );
       return { serviceRequest: sr, slaAtRisk: atRisk, slaAtRiskSegment: segment };
     });
+  }
+
+  /**
+   * Read-only SLA analytics for a Branch Owner. Each real timestamp segment is
+   * evaluated independently. GPS-dependent legs remain explicitly unevaluated
+   * when `in_transit_at` or a configured threshold is absent; the overall result
+   * may still use the existing end-to-end fallback, but never invents segment
+   * attribution.
+   */
+  async getSlaReport(
+    principal: Principal,
+    query: BranchReportQuery,
+  ): Promise<SlaBranchReport> {
+    const branchIds = this.reportBranchIds(principal, query.branchId);
+    const { start, endExclusive } = reportRangeFrom(query);
+    const requests = await this.serviceRequests.find({
+      where: {
+        branchId: In(branchIds),
+        deliveredAt: And(MoreThanOrEqual(start), LessThan(endExclusive)),
+        deletedAt: IsNull(),
+      },
+      order: { deliveredAt: 'DESC' },
+    });
+    const thresholdsByBranch = await this.resolveThresholdsForBranches(branchIds);
+
+    const segments: SlaBranchReport['segments'] = {
+      request_to_dispatch: this.emptySlaMetric(),
+      dispatch_to_in_transit: this.emptySlaMetric(),
+      in_transit_to_delivery: this.emptySlaMetric(),
+    };
+    const orderSources: SlaBranchReport['orderSources'] = {
+      'Mobile App': { ...this.emptySlaMetric(), total: 0, notEvaluated: 0 },
+      'Walk-in/Phone': { ...this.emptySlaMetric(), total: 0, notEvaluated: 0 },
+    };
+
+    let evaluatedRequests = 0;
+    let withinSla = 0;
+    let breaches = 0;
+
+    for (const request of requests) {
+      const thresholds = thresholdsByBranch.get(request.branchId) ?? {};
+      const overallResults: boolean[] = [];
+      const segmentInputs: Array<{
+        key: ReportSlaSegment;
+        from: Date | null;
+        to: Date | null;
+      }> = [
+        {
+          key: 'request_to_dispatch',
+          from: request.requestedAt,
+          to: request.dispatchedAt,
+        },
+        {
+          key: 'dispatch_to_in_transit',
+          from: request.dispatchedAt,
+          to: request.inTransitAt,
+        },
+        {
+          key: 'in_transit_to_delivery',
+          from: request.inTransitAt,
+          to: request.deliveredAt,
+        },
+      ];
+
+      for (const input of segmentInputs) {
+        const threshold = thresholds[input.key];
+        if (threshold == null || !input.from || !input.to) continue;
+        const compliant = this.minutesBetween(input.from, input.to) <= threshold;
+        this.recordSlaOutcome(segments[input.key], compliant);
+        overallResults.push(compliant);
+      }
+
+      // Without the GPS-dependent timestamp, use the same honest end-to-end
+      // fallback as delivery-time breach persistence. It contributes only to
+      // the overall/source result, never to either missing fine-grained segment.
+      if (!request.inTransitAt && request.dispatchedAt && request.deliveredAt) {
+        const endToEnd = thresholds.end_to_end;
+        if (endToEnd != null) {
+          overallResults.push(
+            this.minutesBetween(request.dispatchedAt, request.deliveredAt) <= endToEnd,
+          );
+        }
+      }
+
+      const sourceMetric = orderSources[request.orderSource];
+      sourceMetric.total += 1;
+      if (overallResults.length === 0) {
+        sourceMetric.notEvaluated += 1;
+        continue;
+      }
+
+      const compliant = overallResults.every(Boolean);
+      evaluatedRequests += 1;
+      this.recordSlaOutcome(sourceMetric, compliant);
+      if (compliant) withinSla += 1;
+      else breaches += 1;
+    }
+
+    for (const metric of Object.values(segments)) this.finishSlaMetric(metric);
+    for (const metric of Object.values(orderSources)) this.finishSlaMetric(metric);
+
+    return {
+      totalServiceRequests: requests.length,
+      evaluatedRequests,
+      withinSla,
+      breaches,
+      notEvaluated: requests.length - evaluatedRequests,
+      overallComplianceRate: this.complianceRate(withinSla, evaluatedRequests),
+      segments,
+      orderSources,
+    };
   }
 
   /**
@@ -965,6 +1113,28 @@ export class ServiceRequestsService {
     return result;
   }
 
+  private emptySlaMetric(): SlaReportMetric {
+    return { evaluated: 0, compliant: 0, breached: 0, complianceRate: null };
+  }
+
+  private recordSlaOutcome(metric: SlaReportMetric, compliant: boolean): void {
+    metric.evaluated += 1;
+    if (compliant) metric.compliant += 1;
+    else metric.breached += 1;
+  }
+
+  private finishSlaMetric(metric: SlaReportMetric): void {
+    metric.complianceRate = this.complianceRate(metric.compliant, metric.evaluated);
+  }
+
+  private complianceRate(compliant: number, evaluated: number): number | null {
+    return evaluated === 0 ? null : Number(((compliant / evaluated) * 100).toFixed(1));
+  }
+
+  private minutesBetween(from: Date, to: Date): number {
+    return (to.getTime() - from.getTime()) / 60_000;
+  }
+
   /**
    * LIVE at-risk check for one still-in-flight request (BM-008). See
    * listWithSlaRisk's doc for the Dispatched≈En Route interpretation.
@@ -1071,6 +1241,16 @@ export class ServiceRequestsService {
       throw new ForbiddenException('Caller has no active branch');
     }
     return principal.branchIds;
+  }
+
+  /** A client value can narrow verified JWT scope, never widen it. */
+  private reportBranchIds(principal: Principal, requestedBranchId?: string): string[] {
+    const branchIds = this.requireBranches(principal);
+    if (!requestedBranchId) return branchIds;
+    if (!branchIds.includes(requestedBranchId)) {
+      throw new ForbiddenException('Requested branch is outside the caller scope');
+    }
+    return [requestedBranchId];
   }
 
   /** The single branch a new request is filed under — the caller's own branch. */

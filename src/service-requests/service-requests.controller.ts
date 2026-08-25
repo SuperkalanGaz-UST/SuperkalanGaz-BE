@@ -6,12 +6,14 @@ import {
   ParseUUIDPipe,
   Patch,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
+import { BranchReportQuery } from '../common/dto/branch-report.query';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
 import { CreateCustomerServiceRequestDto } from './dto/create-customer-service-request.dto';
 import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
@@ -30,8 +32,9 @@ import {
 /**
  * Service Request intake & queue (SRD module). Creating and processing daily
  * orders is Branch Manager day-to-day ops (AGENTS.md §7); FA has no operational
- * writes and BO does not process orders, so only BM reaches these handlers.
- * Scope comes from the verified Principal, never the client.
+ * writes and BO does not process orders. The Branch Owner report handler is a
+ * read-only role override; every operational action remains BM-only. Scope
+ * comes from the verified Principal, never the client.
  */
 @Controller('service-requests')
 @UseGuards(AuthGuard, RolesGuard)
@@ -98,6 +101,42 @@ export class ServiceRequestsController {
   ): Promise<{ serviceRequests: ReturnType<ServiceRequestsController['toListRow']>[] }> {
     const items = await this.serviceRequests.listWithSlaRisk(principal);
     return { serviceRequests: items.map((item) => this.toListRow(item)) };
+  }
+
+  /** Branch Owner read-only Service Level Management analytics. */
+  @Get('reports/sla')
+  @Roles('branch-owner')
+  async slaReport(
+    @CurrentPrincipal() principal: Principal,
+    @Query() query: BranchReportQuery,
+  ) {
+    const report = await this.serviceRequests.getSlaReport(principal, query);
+    return {
+      report: {
+        total_service_requests: report.totalServiceRequests,
+        evaluated_requests: report.evaluatedRequests,
+        within_sla: report.withinSla,
+        breaches: report.breaches,
+        not_evaluated: report.notEvaluated,
+        overall_compliance_rate: report.overallComplianceRate,
+        segments: Object.entries(report.segments).map(([segment, metric]) => ({
+          segment,
+          evaluated_requests: metric.evaluated,
+          compliant_requests: metric.compliant,
+          breached_requests: metric.breached,
+          compliance_rate: metric.complianceRate,
+        })),
+        order_sources: Object.entries(report.orderSources).map(([source, metric]) => ({
+          source,
+          total_requests: metric.total,
+          evaluated_requests: metric.evaluated,
+          compliant_requests: metric.compliant,
+          breached_requests: metric.breached,
+          not_evaluated: metric.notEvaluated,
+          compliance_rate: metric.complianceRate,
+        })),
+      },
+    };
   }
 
   @Get(':id')

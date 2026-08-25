@@ -996,4 +996,72 @@ describe('ServiceRequestsService', () => {
       ).rejects.toBeInstanceOf(NotFoundException);
     });
   });
+
+  describe('getSlaReport', () => {
+    it('keeps all three SLA segments separate and groups outcomes by order source', async () => {
+      const repo = makeRepo().repo;
+      repo.find = jest.fn(() =>
+        Promise.resolve([
+          {
+            id: 'sr-mobile',
+            branchId: 'branch-uuid-1',
+            orderSource: 'Mobile App',
+            requestedAt: new Date('2026-05-10T00:00:00Z'),
+            dispatchedAt: new Date('2026-05-10T00:05:00Z'),
+            inTransitAt: new Date('2026-05-10T00:10:00Z'),
+            deliveredAt: new Date('2026-05-10T00:20:00Z'),
+          },
+          {
+            id: 'sr-walk-in',
+            branchId: 'branch-uuid-1',
+            orderSource: 'Walk-in/Phone',
+            requestedAt: new Date('2026-05-11T00:00:00Z'),
+            dispatchedAt: new Date('2026-05-11T00:15:00Z'),
+            inTransitAt: new Date('2026-05-11T00:20:00Z'),
+            deliveredAt: new Date('2026-05-11T00:50:00Z'),
+          },
+        ] as ServiceRequest[]),
+      ) as never;
+      const thresholds = [
+        { branchId: 'branch-uuid-1', segment: 'request_to_dispatch', thresholdMinutes: 10 },
+        { branchId: 'branch-uuid-1', segment: 'dispatch_to_in_transit', thresholdMinutes: 10 },
+        { branchId: 'branch-uuid-1', segment: 'in_transit_to_delivery', thresholdMinutes: 20 },
+      ] as SlaConfiguration[];
+      const sla = makeSlaConfig(thresholds);
+      const service = makeService(
+        repo,
+        makeHistory(),
+        makeFleet(null),
+        makeCim(null),
+        sla,
+      );
+
+      const report = await service.getSlaReport(principal(['branch-uuid-1']), {
+        from: '2026-05-01',
+        to: '2026-05-31',
+        branchId: 'branch-uuid-1',
+      });
+
+      expect(report.overallComplianceRate).toBe(50);
+      expect(report.segments.request_to_dispatch.complianceRate).toBe(50);
+      expect(report.segments.dispatch_to_in_transit.complianceRate).toBe(100);
+      expect(report.segments.in_transit_to_delivery.complianceRate).toBe(50);
+      expect(report.orderSources['Mobile App'].complianceRate).toBe(100);
+      expect(report.orderSources['Walk-in/Phone'].complianceRate).toBe(0);
+    });
+
+    it('rejects a requested branch outside the JWT-derived scope', async () => {
+      const repo = makeRepo().repo;
+      const service = makeService(repo, makeHistory(), makeFleet(null), makeCim(null));
+
+      await expect(
+        service.getSlaReport(principal(['branch-uuid-1']), {
+          from: '2026-05-01',
+          to: '2026-05-31',
+          branchId: 'branch-uuid-2',
+        }),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(repo.find).not.toHaveBeenCalled();
+    });
+  });
 });

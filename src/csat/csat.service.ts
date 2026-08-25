@@ -6,8 +6,19 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, In, LessThanOrEqual, Repository } from 'typeorm';
+import {
+  And,
+  DataSource,
+  In,
+  IsNull,
+  LessThan,
+  LessThanOrEqual,
+  MoreThanOrEqual,
+  Repository,
+} from 'typeorm';
 import { Principal } from '../auth/principal';
+import { BranchReportQuery } from '../common/dto/branch-report.query';
+import { reportRangeFrom } from '../common/report-range';
 import { Rating } from './rating.entity';
 import { Incident } from './incident.entity';
 import { ServiceRequest } from '../service-requests/service-request.entity';
@@ -56,6 +67,15 @@ export interface CsatSummary {
   totalRatings: number;
 }
 
+export interface CsatBranchReport {
+  averageStars: number | null;
+  totalResponses: number;
+  deliveredRequests: number;
+  responseRate: number | null;
+  incidentsRaised: number;
+  ratingDistribution: Record<1 | 2 | 3 | 4 | 5, number>;
+}
+
 /**
  * An incident enriched for the Branch Manager's review (journey BM-US-04): the
  * complaint plus the customer name and the associated Service Request context,
@@ -70,8 +90,8 @@ export interface IncidentListItem {
 }
 
 /**
- * CSAT Feedback & Analytics module — two Branch Manager follow-up flows on the
- * same epic:
+ * CSAT Feedback & Analytics module — two Branch Manager follow-up flows plus
+ * the Branch Owner's read-only branch report:
  *  - closed-loop follow-up on low-rated deliveries (journey BM-US-08). Ratings
  *    are submitted by CUSTOMERS on mobile (AGENTS.md §7); this service never
  *    creates them, only reads and resolves them.
@@ -237,6 +257,69 @@ export class CsatService {
         ? Number((rows.reduce((sum, r) => sum + r.stars, 0) / rows.length).toFixed(2))
         : null,
       totalRatings: rows.length,
+    };
+  }
+
+  /**
+   * Read-only Branch Owner CSAT report. Ratings are tied to deliveries completed
+   * in the selected period, which keeps the response-rate denominator honest
+   * when a customer submits feedback a day or two after delivery.
+   */
+  async getBranchReport(
+    principal: Principal,
+    query: BranchReportQuery,
+  ): Promise<CsatBranchReport> {
+    const branchIds = this.reportBranchIds(principal, query.branchId);
+    const { start, endExclusive } = reportRangeFrom(query);
+
+    const deliveries = await this.serviceRequests.find({
+      where: {
+        branchId: In(branchIds),
+        deliveredAt: And(MoreThanOrEqual(start), LessThan(endExclusive)),
+        deletedAt: IsNull(),
+      },
+      select: { id: true },
+    });
+    const deliveryIds = deliveries.map((delivery) => delivery.id);
+
+    const [ratings, incidentsRaised] = await Promise.all([
+      deliveryIds.length === 0
+        ? Promise.resolve([] as Rating[])
+        : this.ratings.find({
+            where: {
+              branchId: In(branchIds),
+              serviceRequestId: In(deliveryIds),
+            },
+            select: { id: true, stars: true },
+          }),
+      this.incidents.count({
+        where: {
+          branchId: In(branchIds),
+          reportedAt: And(MoreThanOrEqual(start), LessThan(endExclusive)),
+        },
+      }),
+    ]);
+
+    const ratingDistribution: CsatBranchReport['ratingDistribution'] = {
+      1: 0,
+      2: 0,
+      3: 0,
+      4: 0,
+      5: 0,
+    };
+    for (const rating of ratings) ratingDistribution[rating.stars as 1 | 2 | 3 | 4 | 5] += 1;
+
+    return {
+      averageStars: ratings.length
+        ? Number((ratings.reduce((sum, rating) => sum + rating.stars, 0) / ratings.length).toFixed(2))
+        : null,
+      totalResponses: ratings.length,
+      deliveredRequests: deliveries.length,
+      responseRate: deliveries.length
+        ? Number(((ratings.length / deliveries.length) * 100).toFixed(1))
+        : null,
+      incidentsRaised,
+      ratingDistribution,
     };
   }
 
@@ -460,5 +543,15 @@ export class CsatService {
       throw new ForbiddenException('Caller has no active branch');
     }
     return principal.branchIds;
+  }
+
+  /** A client value can narrow verified JWT scope, never widen it. */
+  private reportBranchIds(principal: Principal, requestedBranchId?: string): string[] {
+    const branchIds = this.requireBranches(principal);
+    if (!requestedBranchId) return branchIds;
+    if (!branchIds.includes(requestedBranchId)) {
+      throw new ForbiddenException('Requested branch is outside the caller scope');
+    }
+    return [requestedBranchId];
   }
 }
