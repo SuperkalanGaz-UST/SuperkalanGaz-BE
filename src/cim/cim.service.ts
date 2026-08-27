@@ -1,6 +1,6 @@
 import { ForbiddenException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { IsNull, Repository } from 'typeorm';
+import { In, IsNull, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Customer } from './customer.entity';
 import { CreateCustomerDto } from './dto/create-customer.dto';
@@ -199,6 +199,19 @@ export class CimService {
   ): Promise<Customer | null> {
     return this.customers.findOne({
       where: { id: customerId, branchId, deletedAt: IsNull() },
+    });
+  }
+
+  /** Same as findInBranch, but scoped to any of the caller's branches — for BM
+   * principals that may carry more than one (AGENTS.md §5: request input can
+   * only narrow, but the caller's own branch set may legitimately have more
+   * than one). */
+  async findInBranches(
+    customerId: string,
+    branchIds: string[],
+  ): Promise<Customer | null> {
+    return this.customers.findOne({
+      where: { id: customerId, branchId: In(branchIds), deletedAt: IsNull() },
     });
   }
 

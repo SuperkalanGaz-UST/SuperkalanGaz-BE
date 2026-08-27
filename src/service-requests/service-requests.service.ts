@@ -283,6 +283,28 @@ export class ServiceRequestsService {
     });
   }
 
+  /**
+   * A CIM customer's order history for the Branch Manager's Customer Directory
+   * (click-through detail view) — newest first, branch-scoped via the customer's
+   * own resolved branch rather than the caller's first branch, so a multi-branch
+   * BM gets the right one. 404s (not an empty list) when the id is unknown or
+   * belongs to a branch outside the caller's scope, so the UI can distinguish
+   * "no orders yet" from "wrong id".
+   */
+  async listForCimCustomer(
+    principal: Principal,
+    customerId: string,
+  ): Promise<ServiceRequest[]> {
+    const branchIds = this.requireBranches(principal);
+    const customer = await this.cim.findInBranches(customerId, branchIds);
+    if (!customer) throw new NotFoundException('Customer not found');
+
+    return this.serviceRequests.find({
+      where: { customerId: customer.id, branchId: customer.branchId, deletedAt: IsNull() },
+      order: { requestedAt: 'DESC' },
+    });
+  }
+
   /** Customer order history, newest first. */
   async listForCustomer(principal: Principal): Promise<ServiceRequest[]> {
     const profileIds = await this.cim.profileIdsForAuthUser(principal.userId);
