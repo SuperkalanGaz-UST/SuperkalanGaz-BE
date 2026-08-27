@@ -894,12 +894,51 @@ export class LoyaltyService {
         redemption.customerId,
       ) ?? null;
 
-    if (redemption.track === COMMERCIAL_TRACK) {
+    return this.buildLedgerView(
+      redemption.customerId,
+      redemption.branchId,
+      redemption.track as RedemptionTrack,
+      customerName,
+    );
+  }
+
+  /**
+   * A CIM customer's current loyalty standing for the Branch Manager's Customer
+   * Directory (click-through detail view) — resolved by their CIM profile id
+   * rather than a redemption id. The track is never ambiguous: a customer
+   * profile carries exactly one accountType (household or commercial), so this
+   * always returns that ONE track's figures, never a blend of both — the same
+   * separation the loyalty redemption queue already enforces via its track tabs.
+   * 404s when the id is unknown or outside the caller's branch scope.
+   */
+  async getCustomerLedgerByCimId(
+    principal: Principal,
+    customerId: string,
+  ): Promise<LedgerView> {
+    const branchIds = this.requireBranches(principal);
+    const customer = await this.cim.findInBranches(customerId, branchIds);
+    if (!customer) throw new NotFoundException('Customer not found');
+
+    const track: RedemptionTrack =
+      customer.accountType === 'commercial' ? COMMERCIAL_TRACK : HOUSEHOLD_TRACK;
+    return this.buildLedgerView(customer.id, customer.branchId, track, customer.name);
+  }
+
+  /** Shared by getLedger and getCustomerLedgerByCimId: the household-or-commercial
+   * figures for one (customerId, branchId), scoped to exactly the requested track
+   * so the two mechanics (points vs 30+1 cycles) never mix in one response. */
+  private async buildLedgerView(
+    customerId: string,
+    branchId: string,
+    track: RedemptionTrack,
+    customerName: string | null,
+  ): Promise<LedgerView> {
+    if (track === COMMERCIAL_TRACK) {
       const account = await this.commercialAccounts.findOne({
-        where: { customerId: redemption.customerId, branchId: redemption.branchId },
+        where: { customerId, branchId },
       });
       const commercialPurchases = await this.commercialPurchases.find({
-        where: { customerId: redemption.customerId, branchId: redemption.branchId },
+        where: { customerId, branchId },
         order: { countedAt: 'DESC' },
         take: 100,
       });
@@ -914,15 +953,13 @@ export class LoyaltyService {
       };
     }
 
-    const account = await this.accounts.findOne({
-      where: { customerId: redemption.customerId, branchId: redemption.branchId },
-    });
+    const account = await this.accounts.findOne({ where: { customerId, branchId } });
     if (account) await this.expireHouseholdAccount(account.id);
     const currentAccount = account
       ? await this.accounts.findOne({ where: { id: account.id } })
       : null;
     const householdTransactions = await this.ledger.find({
-      where: { customerId: redemption.customerId, branchId: redemption.branchId },
+      where: { customerId, branchId },
       order: { createdAt: 'DESC' },
       take: 100,
     });

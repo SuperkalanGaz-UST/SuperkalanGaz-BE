@@ -80,6 +80,7 @@ describe('ServiceRequestsService', () => {
   const makeCim = (customer: Customer | null) =>
     ({
       findInBranch: jest.fn(() => Promise.resolve(customer)),
+      findInBranches: jest.fn(() => Promise.resolve(customer)),
       upsertSelfRegisteredInBranch: jest.fn(() =>
         Promise.resolve(
           customer ??
@@ -258,6 +259,38 @@ describe('ServiceRequestsService', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
     // Rejected before persisting the order.
     expect(repo.save).not.toHaveBeenCalled();
+  });
+
+  describe('listForCimCustomer (Customer Directory detail view)', () => {
+    it('returns the customer order history scoped to their resolved branch', async () => {
+      const { repo } = makeRepo();
+      repo.find.mockResolvedValue([pendingSr()]);
+      const cim = makeCim(inBranchCustomer());
+      const service = makeService(repo, makeHistory(), makeFleet(null), cim);
+
+      const result = await service.listForCimCustomer(
+        principal(['branch-uuid-1']),
+        'cust-1',
+      );
+
+      expect(cim.findInBranches).toHaveBeenCalledWith('cust-1', ['branch-uuid-1']);
+      expect(repo.find.mock.calls[0][0]?.where).toMatchObject({
+        customerId: 'cust-1',
+        branchId: 'branch-uuid-1',
+      });
+      expect(result).toEqual([pendingSr()]);
+    });
+
+    it('404s when the customer id is unknown or outside the caller branch scope', async () => {
+      const { repo } = makeRepo();
+      const cim = makeCim(null);
+      const service = makeService(repo, makeHistory(), makeFleet(null), cim);
+
+      await expect(
+        service.listForCimCustomer(principal(['branch-uuid-1']), 'unknown'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(repo.find).not.toHaveBeenCalled();
+    });
   });
 
   it('upserts a mobile customer into branch CIM and links the order to that profile', async () => {

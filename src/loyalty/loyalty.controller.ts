@@ -218,6 +218,22 @@ export class LoyaltyController {
     return { ledger: this.toLedgerView(view) };
   }
 
+  /**
+   * A CIM customer's current loyalty standing, by their CIM profile id — powers
+   * the Customer Directory's click-through detail view. Same shape as the
+   * redemption ledger, always scoped to that customer's ONE track (household
+   * points OR commercial 30+1 cycles — never a blend of both).
+   */
+  @Get('customers/:customerId')
+  @Roles('branch-manager')
+  async customerLedger(
+    @CurrentPrincipal() principal: Principal,
+    @Param('customerId', ParseUUIDPipe) customerId: string,
+  ): Promise<{ ledger: ReturnType<LoyaltyController['toLedgerView']> }> {
+    const view = await this.loyalty.getCustomerLedgerByCimId(principal, customerId);
+    return { ledger: this.toLedgerView(view) };
+  }
+
   /** Branch Owner-managed loyalty configuration for their branch. */
   @Get('settings')
   @Roles('branch-owner')

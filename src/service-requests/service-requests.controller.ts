@@ -139,6 +139,17 @@ export class ServiceRequestsController {
     };
   }
 
+  /** A CIM customer's order history — powers the Customer Directory's
+   * click-through detail view (Branch Manager only, branch-scoped). */
+  @Get('customers/:customerId')
+  async byCustomer(
+    @CurrentPrincipal() principal: Principal,
+    @Param('customerId', ParseUUIDPipe) customerId: string,
+  ): Promise<{ serviceRequests: ReturnType<ServiceRequestsController['toRow']>[] }> {
+    const items = await this.serviceRequests.listForCimCustomer(principal, customerId);
+    return { serviceRequests: items.map((item) => this.toRow(item)) };
+  }
+
   @Get(':id')
   async detail(
     @CurrentPrincipal() principal: Principal,

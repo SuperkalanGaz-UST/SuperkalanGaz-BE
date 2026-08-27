@@ -1,4 +1,4 @@
-import { ForbiddenException } from '@nestjs/common';
+import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { describe, expect, it, jest } from '@jest/globals';
 import { DataSource, EntityManager, FindOperator, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
@@ -41,6 +41,7 @@ const makeService = () => {
   };
   const cim = {
     findInBranch: jest.fn(() => Promise.resolve(null)),
+    findInBranches: jest.fn(() => Promise.resolve(null)),
     profilesForAuthUser: jest.fn(() => Promise.resolve([])),
   } as unknown as jest.Mocked<CimService>;
   const dataSource = {
@@ -66,6 +67,13 @@ const customerPrincipal = (accountType: 'household' | 'commercial'): Principal =
   accountType,
   branches: [],
   branchIds: [],
+});
+
+const bmPrincipal = (): Principal => ({
+  userId: 'bm-1',
+  role: 'branch-manager',
+  branches: ['Alpha'],
+  branchIds: ['branch-1'],
 });
 
 describe('LoyaltyService track separation', () => {
@@ -222,5 +230,66 @@ describe('LoyaltyService track separation', () => {
       { id: account.id },
       expect.objectContaining({ pointsBalance: 0 }),
     );
+  });
+});
+
+describe('LoyaltyService.getCustomerLedgerByCimId (Customer Directory detail view)', () => {
+  it('returns only the household points figures for a household customer, never commercial fields', async () => {
+    const { service, repos, cim } = makeService();
+    cim.findInBranches.mockResolvedValue({
+      id: 'customer-1',
+      branchId: 'branch-1',
+      accountType: 'household',
+      name: 'Juana Dela Cruz',
+    } as Customer);
+    repos.householdAccounts.findOne.mockResolvedValue({
+      id: 'account-1',
+      customerId: 'customer-1',
+      branchId: 'branch-1',
+      pointsBalance: 120,
+    } as HouseholdLoyaltyAccount);
+
+    const view = await service.getCustomerLedgerByCimId(bmPrincipal(), 'customer-1');
+
+    expect(view.track).toBe('household_points');
+    expect(view.pointsBalance).toBe(120);
+    expect(view.completedCycles).toBeNull();
+    expect(view.currentCycleCount).toBeNull();
+    expect(view.commercialPurchases).toEqual([]);
+    expect(repos.commercialAccounts.findOne).not.toHaveBeenCalled();
+  });
+
+  it('returns only the commercial cycle figures for a commercial customer, never a household points balance', async () => {
+    const { service, repos, cim } = makeService();
+    cim.findInBranches.mockResolvedValue({
+      id: 'customer-2',
+      branchId: 'branch-1',
+      accountType: 'commercial',
+      name: 'Sari-Sari Store ni Aling Nena',
+    } as Customer);
+    repos.commercialAccounts.findOne.mockResolvedValue({
+      customerId: 'customer-2',
+      branchId: 'branch-1',
+      currentCycleCount: 14,
+      completedCycles: 2,
+    } as CommercialLoyaltyAccount);
+
+    const view = await service.getCustomerLedgerByCimId(bmPrincipal(), 'customer-2');
+
+    expect(view.track).toBe('commercial_30plus1');
+    expect(view.currentCycleCount).toBe(14);
+    expect(view.completedCycles).toBe(2);
+    expect(view.pointsBalance).toBeNull();
+    expect(view.householdTransactions).toEqual([]);
+    expect(repos.householdAccounts.findOne).not.toHaveBeenCalled();
+  });
+
+  it('404s when the customer id is unknown or outside the caller branch scope', async () => {
+    const { service, cim } = makeService();
+    cim.findInBranches.mockResolvedValue(null);
+
+    await expect(
+      service.getCustomerLedgerByCimId(bmPrincipal(), 'not-found'),
+    ).rejects.toBeInstanceOf(NotFoundException);
   });
 });
