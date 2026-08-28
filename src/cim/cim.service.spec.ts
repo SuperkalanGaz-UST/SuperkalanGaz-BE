@@ -39,16 +39,25 @@ describe('CimService', () => {
       take: jest.fn().mockReturnThis(),
       getMany: jest.fn(() => Promise.resolve(opts?.found ?? [])),
     };
+    // create() re-fetches after save() to pick up the DB-trigger-assigned
+    // customer_code (migration 0029); track the saved row so the default
+    // findOneByOrFail stub can echo it back with a code attached.
+    let lastSaved: Customer | undefined;
     const repo = {
       create: jest.fn((v: Partial<Customer>) => v as Customer),
-      save: jest.fn((v: Customer) => Promise.resolve({ ...v, id: 'cust-1' })),
+      save: jest.fn((v: Customer) => {
+        lastSaved = { ...v, id: 'cust-1' } as Customer;
+        return Promise.resolve(lastSaved);
+      }),
       upsert: jest.fn(() => Promise.resolve({ identifiers: [], generatedMaps: [], raw: [] })),
       find: jest.fn(() => Promise.resolve(opts?.found ?? [])),
       findOne: jest.fn(() => Promise.resolve(null)),
       findOneByOrFail: jest.fn(() =>
         Promise.resolve(
           opts?.selfRegistered ??
-            ({ id: 'mobile-cust-1', branchId: 'branch-uuid-1' } as Customer),
+            (lastSaved
+              ? ({ ...lastSaved, customerCode: 'H-00001' } as Customer)
+              : ({ id: 'mobile-cust-1', branchId: 'branch-uuid-1' } as Customer)),
         ),
       ),
       createQueryBuilder: jest.fn(() => customerQb),
