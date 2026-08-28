@@ -52,6 +52,11 @@ export class Customer {
   @Column({ name: 'account_type', type: 'text', default: 'household' })
   accountType!: CustomerAccountType;
 
+  /** Human-readable per-track ID (H-00001 / C-00001), assigned once at insert
+   * by a DB trigger (migration 0029) — never set or changed from the app. */
+  @Column({ name: 'customer_code', type: 'text', nullable: true })
+  customerCode!: string | null;
+
   @Column({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;
 

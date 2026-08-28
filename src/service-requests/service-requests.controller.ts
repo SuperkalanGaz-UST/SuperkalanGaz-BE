@@ -313,9 +313,11 @@ export class ServiceRequestsController {
     serviceRequest: ServiceRequest;
     slaAtRisk: boolean;
     slaAtRiskSegment: string | null;
+    customerCode: string | null;
   }) {
     return {
       ...this.toRow(item.serviceRequest),
+      customer_code: item.customerCode,
       sla_at_risk: item.slaAtRisk,
       sla_at_risk_segment: item.slaAtRiskSegment,
     };

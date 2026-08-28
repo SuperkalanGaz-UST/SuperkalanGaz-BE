@@ -112,7 +112,10 @@ export class CimService {
       deletedAt: null,
     });
 
-    return this.customers.save(customer);
+    const saved = await this.customers.save(customer);
+    // customer_code is assigned by a DB trigger (migration 0029), invisible to
+    // the in-memory entity returned by save() — reload to pick it up.
+    return this.customers.findOneByOrFail({ id: saved.id });
   }
 
   /**
@@ -171,6 +174,18 @@ export class CimService {
       take: 200,
     });
     return profiles.map((profile) => profile.id);
+  }
+
+  /** Batch id → customer_code lookup (H-00001 / C-00001, migration 0029) used to
+   * annotate order rows without an N+1 query per row. Ids with no live profile
+   * are simply absent from the map. */
+  async codesByIds(ids: string[]): Promise<Map<string, string | null>> {
+    if (ids.length === 0) return new Map();
+    const rows = await this.customers.find({
+      where: { id: In(ids) },
+      select: { id: true, customerCode: true },
+    });
+    return new Map(rows.map((row) => [row.id, row.customerCode]));
   }
 
   /** Live branch projections for one authenticated mobile customer. Loyalty uses

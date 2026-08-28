@@ -332,15 +332,22 @@ export class ServiceRequestsService {
    * below; see BM-012). Delivered/Cancelled/Under Review rows always read
    * slaAtRisk=false here; their permanent record is on the row itself.
    */
-  async listWithSlaRisk(
-    principal: Principal,
-  ): Promise<{ serviceRequest: ServiceRequest; slaAtRisk: boolean; slaAtRiskSegment: SlaSegment | null }[]> {
+  async listWithSlaRisk(principal: Principal): Promise<
+    {
+      serviceRequest: ServiceRequest;
+      slaAtRisk: boolean;
+      slaAtRiskSegment: SlaSegment | null;
+      customerCode: string | null;
+    }[]
+  > {
     const branchIds = this.requireBranches(principal);
     const requests = await this.list(principal);
     if (requests.length === 0) return [];
 
     const thresholdsByBranch = await this.resolveThresholdsForBranches(branchIds);
     const now = new Date();
+    const customerIds = [...new Set(requests.map((sr) => sr.customerId).filter((id): id is string => id != null))];
+    const codes = await this.cim.codesByIds(customerIds);
 
     return requests.map((sr) => {
       const { atRisk, segment } = this.computeAtRisk(
@@ -348,7 +355,12 @@ export class ServiceRequestsService {
         thresholdsByBranch.get(sr.branchId) ?? {},
         now,
       );
-      return { serviceRequest: sr, slaAtRisk: atRisk, slaAtRiskSegment: segment };
+      return {
+        serviceRequest: sr,
+        slaAtRisk: atRisk,
+        slaAtRiskSegment: segment,
+        customerCode: sr.customerId ? (codes.get(sr.customerId) ?? null) : null,
+      };
     });
   }
 
