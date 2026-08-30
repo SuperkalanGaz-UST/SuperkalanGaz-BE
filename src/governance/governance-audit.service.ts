@@ -43,7 +43,10 @@ export class GovernanceAuditService {
         input.actor.email ??
         input.actor.userId,
       actorRole:
-        input.actor.role === 'super-admin' || input.actor.role === 'franchise-admin'
+        input.actor.role === 'super-admin' ||
+        input.actor.role === 'franchise-admin' ||
+        input.actor.role === 'branch-owner' ||
+        input.actor.role === 'driver'
           ? input.actor.role
           : 'system',
       affectedRecordType: input.affectedRecordType.trim(),

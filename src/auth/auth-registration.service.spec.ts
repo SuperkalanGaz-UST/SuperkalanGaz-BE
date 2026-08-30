@@ -83,14 +83,15 @@ describe('AuthRegistrationService', () => {
       expect.objectContaining({
         method: 'PUT',
         headers: expect.objectContaining({ apikey: 'service-key' }),
-        body: JSON.stringify({
-          app_metadata: {
-            role: 'customer',
-            branches: [],
-            status: 'Active',
-            account_type: 'household',
-          },
-        }),
+          body: JSON.stringify({
+            app_metadata: {
+              role: 'customer',
+              branch_ids: [],
+              branches: [],
+              status: 'Active',
+              account_type: 'household',
+            },
+          }),
       }),
     );
   });

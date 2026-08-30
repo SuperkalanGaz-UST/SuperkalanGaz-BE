@@ -5,6 +5,7 @@ import {
   IsIn,
   IsOptional,
   IsString,
+  IsUUID,
   MinLength,
 } from 'class-validator';
 
@@ -37,8 +38,8 @@ export class UpdateUserDto {
   @IsOptional()
   @IsArray()
   @ArrayNotEmpty()
-  @IsString({ each: true })
-  branches?: string[];
+  @IsUUID(undefined, { each: true })
+  branchIds?: string[];
 
   @IsOptional()
   @IsIn(['Active', 'Inactive'])

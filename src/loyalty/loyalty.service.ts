@@ -975,12 +975,12 @@ export class LoyaltyService {
   }
 
   /** The caller's branch loyalty Dual Authorization setting (BM-013). */
-  async getSettings(principal: Principal): Promise<{
+  async getSettings(principal: Principal, selectedBranchId?: string): Promise<{
     branchId: string;
     dualAuth: boolean;
     pointRates: LoyaltyPointRates;
   }> {
-    const branchId = this.requireBranch(principal);
+    const branchId = this.requireSelectedBranch(principal, selectedBranchId);
     const branch = await this.branches.findOne({ where: { id: branchId } });
     if (!branch) throw new NotFoundException('Branch not found');
     return {
@@ -994,8 +994,9 @@ export class LoyaltyService {
   async updateSettings(
     principal: Principal,
     input: { dualAuth?: boolean; pointRates?: LoyaltyPointRates },
+    selectedBranchId?: string,
   ): Promise<{ branchId: string; dualAuth: boolean; pointRates: LoyaltyPointRates }> {
-    const branchId = this.requireBranch(principal);
+    const branchId = this.requireSelectedBranch(principal, selectedBranchId);
     const branch = await this.branches.findOne({ where: { id: branchId } });
     if (!branch) throw new NotFoundException('Branch not found');
     if (input.dualAuth !== undefined) branch.loyaltyDualAuth = input.dualAuth;
@@ -1121,6 +1122,27 @@ export class LoyaltyService {
   /** The single branch a new redemption is filed under — the caller's own branch. */
   private requireBranch(principal: Principal): string {
     return this.requireBranches(principal)[0];
+  }
+
+  /**
+   * Resolve a Branch Owner's explicit UI context. Single-branch owners may omit
+   * it for backward compatibility; multi-branch owners must choose one UUID.
+   */
+  private requireSelectedBranch(
+    principal: Principal,
+    selectedBranchId?: string,
+  ): string {
+    const authorized = this.requireBranches(principal);
+    if (selectedBranchId) {
+      if (!authorized.includes(selectedBranchId)) {
+        throw new ForbiddenException('Requested branch is outside your authorized scope');
+      }
+      return selectedBranchId;
+    }
+    if (authorized.length !== 1) {
+      throw new BadRequestException('Select a branch before managing its settings');
+    }
+    return authorized[0];
   }
 
   // --- Delivery earning + Customer / Mobile App Endpoints ---

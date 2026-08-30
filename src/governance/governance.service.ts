@@ -8,8 +8,14 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { randomBytes } from 'node:crypto';
-import { DataSource, IsNull, Repository } from 'typeorm';
+import { DataSource, In, IsNull, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
+import {
+  hasMetadataBranchIds,
+  metadataBranchIds,
+  metadataBranchNames,
+  withBranchScope,
+} from '../auth/branch-scope';
 import { Branch } from '../branches/branch.entity';
 import { NotificationsService } from '../notifications/notifications.service';
 import { PricesService } from '../prices/prices.service';
@@ -67,13 +73,6 @@ function actorName(principal: Principal): string {
 
 function metadataRole(user: GoTrueUser): string {
   return typeof user.app_metadata?.role === 'string' ? user.app_metadata.role : '';
-}
-
-function metadataBranches(user: GoTrueUser): string[] {
-  const value = user.app_metadata?.branches;
-  return Array.isArray(value)
-    ? value.filter((branch): branch is string => typeof branch === 'string')
-    : [];
 }
 
 function isConfirmed(user: GoTrueUser): boolean {
@@ -386,6 +385,7 @@ export class GovernanceService {
       username: email.split('@')[0],
       display_name: displayName,
       role: 'franchise-admin',
+      branch_ids: [],
       branches: [],
       phone: null,
       status: 'Pending',
@@ -719,6 +719,7 @@ export class GovernanceService {
         username: username?.trim() || email.split('@')[0],
         display_name: name.trim(),
         role: 'franchise-admin',
+        branch_ids: [],
         branches: [],
         phone: phone ?? null,
         status: 'Active',
@@ -756,7 +757,9 @@ export class GovernanceService {
       (user) =>
         user.id !== newOwnerId &&
         metadataRole(user) === 'branch-owner' &&
-        metadataBranches(user).includes(branch.name),
+        (user.id === branch.ownerId ||
+          metadataBranchIds(user.app_metadata).includes(branch.id) ||
+          metadataBranchNames(user.app_metadata).includes(branch.name)),
     );
 
     if (
@@ -768,26 +771,35 @@ export class GovernanceService {
       throw new BadRequestException('The selected Branch Owner account is inactive');
     }
 
-    const newOwnerBranches = metadataBranches(newOwner);
-    if (!newOwnerBranches.includes(branch.name)) {
+    const newOwnerScope = await this.branchScope(newOwner);
+    if (!newOwnerScope.some((assigned) => assigned.id === branch.id)) {
       await this.goTrue.updateUser(newOwner.id, {
         app_metadata: {
-          ...newOwner.app_metadata,
-          branches: [...newOwnerBranches, branch.name],
+          ...withBranchScope(newOwner.app_metadata, [
+            ...newOwnerScope,
+            { id: branch.id, name: branch.name },
+          ]),
           status: 'Active',
         },
       });
     }
 
+    // The branch row is the canonical one-owner-to-many-branches association.
+    // UUID claims are the authorization projection consumed by AuthGuard.
+    branch.ownerId = newOwner.id;
+    branch.updatedAt = new Date();
+    await this.branches.save(branch);
+
     // Provision the incoming owner first so an external GoTrue failure cannot
     // leave the branch with no active owner. A retry is idempotent and removes
     // any remaining previous assignments.
     for (const previous of previousOwners) {
+      const previousScope = await this.branchScope(previous);
       await this.goTrue.updateUser(previous.id, {
-        app_metadata: {
-          ...previous.app_metadata,
-          branches: metadataBranches(previous).filter((name) => name !== branch.name),
-        },
+        app_metadata: withBranchScope(
+          previous.app_metadata,
+          previousScope.filter((assigned) => assigned.id !== branch.id),
+        ),
       });
     }
 
@@ -799,6 +811,34 @@ export class GovernanceService {
       affectedRecordType: 'branch-owner-assignment',
       affectedRecordId: branch.id,
     };
+  }
+
+  /** Resolves UUID scope, with legacy names accepted only during migration. */
+  private async branchScope(user: GoTrueUser): Promise<Array<{ id: string; name: string }>> {
+    const ids = metadataBranchIds(user.app_metadata);
+    const names = metadataBranchNames(user.app_metadata);
+    const hasUuidScope = hasMetadataBranchIds(user.app_metadata);
+    const rows = hasUuidScope
+      ? ids.length
+        ? await this.branches.find({ where: { id: In(ids) }, select: { id: true, name: true } })
+        : []
+      : names.length
+        ? await this.branches.find({
+            where: { name: In(names) },
+            select: { id: true, name: true },
+          })
+        : [];
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    const byName = new Map<string, Branch[]>();
+    for (const row of rows) {
+      byName.set(row.name, [...(byName.get(row.name) ?? []), row]);
+    }
+    return hasUuidScope
+      ? ids.flatMap((id) => (byId.has(id) ? [byId.get(id)!] : []))
+      : names.flatMap((name) => {
+          const matches = byName.get(name) ?? [];
+          return matches.length === 1 ? matches : [];
+        });
   }
 
   private async validateRequestPayload(dto: CreateGovernanceRequestDto): Promise<void> {

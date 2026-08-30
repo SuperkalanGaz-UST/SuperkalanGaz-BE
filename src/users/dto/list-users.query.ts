@@ -1,4 +1,4 @@
-import { IsIn, IsOptional, IsString } from 'class-validator';
+import { IsIn, IsOptional, IsUUID } from 'class-validator';
 
 export class ListUsersQuery {
   @IsOptional()
@@ -11,6 +11,6 @@ export class ListUsersQuery {
    * branch scope before use.
    */
   @IsOptional()
-  @IsString()
-  branch?: string;
+  @IsUUID()
+  branchId?: string;
 }

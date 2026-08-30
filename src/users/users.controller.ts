@@ -119,10 +119,12 @@ export class UsersController {
       username: u.username,
       display_name: u.displayName,
       role: u.role,
+      branch_ids: u.branchIds,
       branches: u.branches,
       phone: u.phone,
       status: u.status,
       created_at: u.createdAt,
+      last_login_at: u.lastLoginAt,
     };
   }
 
@@ -133,6 +135,7 @@ export class UsersController {
       username: u.username,
       display_name: u.displayName,
       role: u.role,
+      branch_ids: u.branchIds,
       branches: u.branches,
       phone: u.phone,
       status: u.status,

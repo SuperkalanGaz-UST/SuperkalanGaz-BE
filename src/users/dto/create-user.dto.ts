@@ -5,6 +5,7 @@ import {
   IsIn,
   IsOptional,
   IsString,
+  IsUUID,
   MinLength,
 } from 'class-validator';
 
@@ -39,8 +40,8 @@ export class CreateUserDto {
 
   @IsArray()
   @ArrayNotEmpty()
-  @IsString({ each: true })
-  branches!: string[];
+  @IsUUID(undefined, { each: true })
+  branchIds!: string[];
 
   @IsOptional()
   @IsIn(['Active', 'Inactive'])

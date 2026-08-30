@@ -1,9 +1,19 @@
 import {
+  BadRequestException,
   ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { In, Repository } from 'typeorm';
+import {
+  hasMetadataBranchIds,
+  metadataBranchIds,
+  metadataBranchNames,
+  withBranchScope,
+} from '../auth/branch-scope';
 import { Principal } from '../auth/principal';
+import { Branch } from '../branches/branch.entity';
 import { CreateUserDto } from './dto/create-user.dto';
 import { ListUsersQuery } from './dto/list-users.query';
 import { UpdateOwnProfileDto } from './dto/update-own-profile.dto';
@@ -17,21 +27,19 @@ export interface CrmUser {
   username: string | null;
   displayName: string | null;
   role: string;
+  branchIds: string[];
   branches: string[];
   phone: string | null;
   status: 'Active' | 'Inactive';
   createdAt: Date;
+  lastLoginAt: Date | null;
 }
 
 /** Current-user projection available directly from the already verified JWT. */
-export type OwnProfile = Omit<CrmUser, 'createdAt'>;
+export type OwnProfile = Omit<CrmUser, 'createdAt' | 'lastLoginAt'>;
 
 function str(v: unknown): string | null {
   return typeof v === 'string' && v !== '' ? v : null;
-}
-
-function strArray(v: unknown): string[] {
-  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
 }
 
 /** True once a user has been soft-deleted (banned into the future). */
@@ -39,19 +47,37 @@ function isBanned(u: GoTrueUser): boolean {
   return !!u.banned_until && new Date(u.banned_until).getTime() > Date.now();
 }
 
-/** Projects a GoTrue user into the CRM shape, reading claims from app_metadata. */
-function toCrmUser(u: GoTrueUser): CrmUser {
+interface BranchDirectory {
+  byId: Map<string, Branch>;
+  byName: Map<string, Branch[]>;
+}
+
+/** Projects protected UUID scope to user-facing branch labels. */
+function toCrmUser(u: GoTrueUser, directory: BranchDirectory): CrmUser {
   const m = u.app_metadata ?? {};
+  const claimedIds = metadataBranchIds(m);
+  const legacyNames = metadataBranchNames(m);
+  const scope = hasMetadataBranchIds(m)
+    ? claimedIds.flatMap((id) => {
+        const branch = directory.byId.get(id);
+        return branch ? [branch] : [];
+      })
+    : legacyNames.flatMap((name) => {
+        const matches = directory.byName.get(name) ?? [];
+        return matches.length === 1 ? matches : [];
+      });
   return {
     id: u.id,
     email: u.email,
     username: str(m.username),
     displayName: str(m.display_name),
     role: str(m.role) ?? '',
-    branches: strArray(m.branches),
+    branchIds: scope.map((branch) => branch.id),
+    branches: scope.map((branch) => branch.name),
     phone: str(m.phone),
     status: m.status === 'Inactive' ? 'Inactive' : 'Active',
     createdAt: new Date(u.created_at),
+    lastLoginAt: u.last_sign_in_at ? new Date(u.last_sign_in_at) : null,
   };
 }
 
@@ -65,7 +91,11 @@ function toCrmUser(u: GoTrueUser): CrmUser {
  */
 @Injectable()
 export class UsersService {
-  constructor(private readonly goTrue: GoTrueAdminService) {}
+  constructor(
+    private readonly goTrue: GoTrueAdminService,
+    @InjectRepository(Branch)
+    private readonly branchRepository: Repository<Branch>,
+  ) {}
 
   /**
    * The caller's own account. The AuthGuard has already verified this user is
@@ -74,7 +104,7 @@ export class UsersService {
   async findById(id: string): Promise<CrmUser> {
     const user = await this.goTrue.getUser(id);
     if (!user || isBanned(user)) throw new NotFoundException('User not found');
-    return toCrmUser(user);
+    return toCrmUser(user, await this.branchDirectory());
   }
 
   private ownProfileFromPrincipal(principal: Principal): OwnProfile {
@@ -84,6 +114,7 @@ export class UsersService {
       username: principal.username ?? null,
       displayName: principal.displayName ?? null,
       role: principal.role,
+      branchIds: principal.branchIds,
       branches: principal.branches,
       phone: principal.phone ?? null,
       // Pending principals are admitted only to the dedicated invitation
@@ -106,6 +137,7 @@ export class UsersService {
       username: target.username,
       display_name: dto.name ?? target.displayName,
       role: target.role,
+      branch_ids: target.branchIds,
       branches: target.branches,
       phone: dto.phone !== undefined ? dto.phone : target.phone,
       status: target.status,
@@ -132,28 +164,33 @@ export class UsersService {
   async list(principal: Principal, query: ListUsersQuery): Promise<CrmUser[]> {
     // Validate the requested branch scope once, up front (a BO cannot list
     // outside their own branches), before we fan out over the user set.
-    if (query.branch) this.assertBranchInScope(principal, query.branch);
+    if (query.branchId) this.assertBranchInScope(principal, query.branchId);
 
     // BO may only ever see Branch Manager accounts, whatever the query says.
     const role = principal.role === 'branch-owner' ? 'branch-manager' : query.role;
 
     // A BO with no branch requested and no branches of their own overlaps nobody.
-    if (!query.branch && principal.role === 'branch-owner' && principal.branches.length === 0) {
+    if (
+      !query.branchId &&
+      principal.role === 'branch-owner' &&
+      principal.branchIds.length === 0
+    ) {
       return [];
     }
 
+    const directory = await this.branchDirectory();
     const users = (await this.goTrue.listUsers())
       .filter((u) => !isBanned(u)) // soft-deleted accounts drop out of the list
-      .map(toCrmUser)
+      .map((user) => toCrmUser(user, directory))
       // This module is the staff-account directory. Customer identities are
       // managed through CIM and must never appear as branch account records.
       .filter((u) => u.role !== 'customer' && u.role !== 'super-admin')
       .filter((u) => {
         if (role && u.role !== role) return false;
-        if (query.branch) return u.branches.includes(query.branch);
+        if (query.branchId) return u.branchIds.includes(query.branchId);
         // No branch requested: a BO still only sees users overlapping their own.
         if (principal.role === 'branch-owner') {
-          return u.branches.some((b) => principal.branches.includes(b));
+          return u.branchIds.some((id) => principal.branchIds.includes(id));
         }
         return true;
       });
@@ -166,9 +203,10 @@ export class UsersService {
     if (principal.role === 'branch-owner' && role !== 'branch-manager') {
       throw new ForbiddenException('Branch Owners may only create Branch Manager accounts');
     }
-    for (const branch of dto.branches) {
-      this.assertBranchInScope(principal, branch);
+    if (role === 'branch-manager' && new Set(dto.branchIds).size !== 1) {
+      throw new BadRequestException('A Branch Manager must be assigned to exactly one branch');
     }
+    const branches = await this.resolveRequestedBranches(principal, dto.branchIds);
 
     // Identity AND CRM claims both live in Supabase Auth. The claims go in
     // app_metadata — service-role-only, so a user can never edit their own role
@@ -181,7 +219,7 @@ export class UsersService {
         username: dto.username ?? dto.email.split('@')[0],
         display_name: dto.name ?? null,
         role,
-        branches: dto.branches,
+        ...withBranchScope(undefined, branches),
         phone: dto.phone ?? null,
         status: dto.status ?? 'Active',
       },
@@ -195,7 +233,7 @@ export class UsersService {
     // It must pass through the Super Administrator queue so the old/new owner,
     // reason, reviewer, and timestamp are captured in one immutable audit event.
     const changesBranchOwnerAssignment =
-      (target.role === 'branch-owner' && dto.branches !== undefined) ||
+      (target.role === 'branch-owner' && dto.branchIds !== undefined) ||
       (dto.role !== undefined && dto.role !== target.role &&
         (dto.role === 'branch-owner' || target.role === 'branch-owner'));
     if (changesBranchOwnerAssignment) {
@@ -207,11 +245,14 @@ export class UsersService {
     if (dto.role && dto.role !== target.role && principal.role === 'branch-owner') {
       throw new ForbiddenException('Branch Owners cannot change account roles');
     }
-    if (dto.branches) {
-      for (const branch of dto.branches) {
-        this.assertBranchInScope(principal, branch);
-      }
+    const resultingRole = dto.role ?? target.role;
+    const resultingBranchIds = dto.branchIds ?? target.branchIds;
+    if (resultingRole === 'branch-manager' && new Set(resultingBranchIds).size !== 1) {
+      throw new BadRequestException('A Branch Manager must be assigned to exactly one branch');
     }
+    const requestedBranches = dto.branchIds
+      ? await this.resolveRequestedBranches(principal, dto.branchIds)
+      : null;
 
     // Auth-owned fields go through the Admin API's first-class columns…
     if (dto.email || dto.password) {
@@ -228,6 +269,7 @@ export class UsersService {
       username: target.username,
       display_name: target.displayName,
       role: target.role,
+      branch_ids: target.branchIds,
       branches: target.branches,
       phone: target.phone,
       status: target.status,
@@ -235,7 +277,7 @@ export class UsersService {
     if (dto.username !== undefined) next.username = dto.username;
     if (dto.name !== undefined) next.display_name = dto.name;
     if (dto.role !== undefined) next.role = dto.role;
-    if (dto.branches !== undefined) next.branches = dto.branches;
+    if (requestedBranches) Object.assign(next, withBranchScope(next, requestedBranches));
     if (dto.phone !== undefined) next.phone = dto.phone;
     if (dto.status !== undefined) next.status = dto.status;
 
@@ -256,6 +298,7 @@ export class UsersService {
         username: target.username,
         display_name: target.displayName,
         role: target.role,
+        branch_ids: target.branchIds,
         branches: target.branches,
         phone: target.phone,
         status: 'Inactive',
@@ -272,7 +315,7 @@ export class UsersService {
   private async findManageable(principal: Principal, id: string): Promise<CrmUser> {
     const user = await this.goTrue.getUser(id);
     if (!user || isBanned(user)) throw new NotFoundException('User not found');
-    const target = toCrmUser(user);
+    const target = toCrmUser(user, await this.branchDirectory());
 
     if (target.role === 'customer') {
       throw new NotFoundException('User not found');
@@ -283,7 +326,7 @@ export class UsersService {
     }
 
     if (principal.role === 'branch-owner') {
-      const overlaps = target.branches.some((b) => principal.branches.includes(b));
+      const overlaps = target.branchIds.some((id) => principal.branchIds.includes(id));
       if (target.role !== 'branch-manager' || !overlaps) {
         throw new NotFoundException('User not found');
       }
@@ -292,10 +335,39 @@ export class UsersService {
   }
 
   /** A caller may only touch branches inside their own scope. FA/SA are cross-branch. */
-  private assertBranchInScope(principal: Principal, branch: string): void {
+  private assertBranchInScope(principal: Principal, branchId: string): void {
     if (principal.role === 'franchise-admin' || principal.role === 'super-admin') return;
-    if (!principal.branches.includes(branch)) {
-      throw new ForbiddenException(`You have no access to ${branch}`);
+    if (!principal.branchIds.includes(branchId)) {
+      throw new ForbiddenException('Requested branch is outside your authorized scope');
     }
+  }
+
+  private async resolveRequestedBranches(
+    principal: Principal,
+    requestedIds: string[],
+  ): Promise<Array<{ id: string; name: string }>> {
+    const ids = Array.from(new Set(requestedIds));
+    for (const id of ids) this.assertBranchInScope(principal, id);
+    const rows = await this.branchRepository.find({
+      where: { id: In(ids), status: 'active' },
+      select: { id: true, name: true },
+    });
+    if (rows.length !== ids.length) {
+      throw new BadRequestException('One or more assigned branches are invalid or inactive');
+    }
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    return ids.map((id) => byId.get(id)!);
+  }
+
+  private async branchDirectory(): Promise<BranchDirectory> {
+    const rows = await this.branchRepository.find();
+    const byName = new Map<string, Branch[]>();
+    for (const branch of rows) {
+      byName.set(branch.name, [...(byName.get(branch.name) ?? []), branch]);
+    }
+    return {
+      byId: new Map(rows.map((branch) => [branch.id, branch])),
+      byName,
+    };
   }
 }

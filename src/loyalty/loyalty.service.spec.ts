@@ -1,4 +1,4 @@
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { describe, expect, it, jest } from '@jest/globals';
 import { DataSource, EntityManager, FindOperator, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
@@ -76,7 +76,45 @@ const bmPrincipal = (): Principal => ({
   branchIds: ['branch-1'],
 });
 
+const multiBranchOwnerPrincipal = (): Principal => ({
+  userId: 'bo-1',
+  role: 'branch-owner',
+  branches: ['Alpha', 'Beta'],
+  branchIds: ['branch-1', 'branch-2'],
+});
+
 describe('LoyaltyService track separation', () => {
+  it('uses the selected authorized UUID for multi-branch owner settings', async () => {
+    const { service, repos } = makeService();
+    repos.branches.findOne.mockResolvedValue({
+      id: 'branch-2',
+      loyaltyDualAuth: true,
+      loyaltyPointRates: { '2.7kg': 5, '5kg': 10, '11kg': 15, '22kg': 20, '50kg': 25 },
+    } as Branch);
+
+    const settings = await service.getSettings(multiBranchOwnerPrincipal(), 'branch-2');
+
+    expect(settings.branchId).toBe('branch-2');
+    expect(repos.branches.findOne).toHaveBeenCalledWith({ where: { id: 'branch-2' } });
+  });
+
+  it('requires an explicit branch for multi-branch owner settings', async () => {
+    const { service } = makeService();
+
+    await expect(service.getSettings(multiBranchOwnerPrincipal())).rejects.toBeInstanceOf(
+      BadRequestException,
+    );
+  });
+
+  it('rejects an out-of-scope UUID for Branch Owner settings', async () => {
+    const { service, repos } = makeService();
+
+    await expect(
+      service.getSettings(multiBranchOwnerPrincipal(), 'branch-3'),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(repos.branches.findOne).not.toHaveBeenCalled();
+  });
+
   it('routes a household delivery only to the household points ledger', async () => {
     const { service, cim } = makeService();
     cim.findInBranch.mockResolvedValue({

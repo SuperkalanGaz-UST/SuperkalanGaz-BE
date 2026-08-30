@@ -63,6 +63,7 @@ export class AuthRegistrationService {
       await this.adminRequest(`/users/${encodeURIComponent(user.id)}`, {
         app_metadata: {
           role: 'customer',
+          branch_ids: [],
           branches: [],
           status: 'Active',
           account_type: dto.accountType,

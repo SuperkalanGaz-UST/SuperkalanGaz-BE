@@ -28,10 +28,10 @@ export interface LoyaltyPointRates {
  * hard-delete). `status` is guarded by a CHECK constraint in the DB, so its
  * union type below must stay in sync with it.
  *
- * The Franchise Administrator-assigned geofence is stored on this branch row.
- * Curfew is still deferred, while low-stock thresholds live per product on
- * inventory.stock_levels. Owner identity is not stored on the branch either: it
- * is provisioned into Supabase Auth (CRM claims in app_metadata) by the service.
+ * The Franchise Administrator-assigned geofence and canonical Branch Owner
+ * association are stored on this row. Curfew is still deferred, while low-stock
+ * thresholds live per product on inventory.stock_levels. The owner's UUID scope
+ * is also projected into protected Supabase Auth app_metadata for request guards.
  */
 @Entity({ schema: 'core', name: 'branches' })
 export class Branch {
@@ -80,6 +80,14 @@ export class Branch {
    */
   @Column({ name: 'source_store_location_id', type: 'uuid', nullable: true })
   sourceStoreLocationId!: string | null;
+
+  /**
+   * Logical reference to the owning auth.users identity. Multiple branch rows
+   * may point to the same Branch Owner; a branch has at most one active owner.
+   * No database FK by project convention (service-layer integrity only).
+   */
+  @Column({ name: 'owner_id', type: 'uuid', nullable: true })
+  ownerId!: string | null;
 
   /** Delivery coverage polygon (added in migration 0006). Null = none set. */
   @Column({ type: 'jsonb', nullable: true })

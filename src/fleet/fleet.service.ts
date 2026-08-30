@@ -65,6 +65,76 @@ export class FleetService {
     });
   }
 
+  /** Minimal authoritative mobile workspace for an activated Delivery Rider. */
+  async deliveryRiderDashboard(principal: Principal) {
+    const branchId = this.requireSingleBranch(principal);
+    const rider = await this.riders.findOne({
+      where: {
+        authUserId: principal.userId,
+        branchId,
+        deletedAt: IsNull(),
+      },
+    });
+    if (!rider) throw new NotFoundException('Delivery Rider roster entry not found');
+    const vehicle = await this.vehicles.findOne({
+      where: { branchId, assignedRiderId: rider.id },
+    });
+
+    return {
+      deliveryRider: {
+        id: rider.id,
+        displayName: principal.displayName ?? rider.name,
+        email: principal.email ?? '',
+        mobile: principal.phone ?? '',
+        branchName: principal.branches[0] ?? '',
+        availability: rider.status,
+        vehicle: vehicle
+          ? {
+              id: vehicle.id,
+              label: vehicle.plateNumber,
+              model: vehicle.vehicleType,
+              healthy: vehicle.status === 'active',
+            }
+          : null,
+      },
+      currentOffer: null,
+      activeDelivery: null,
+    };
+  }
+
+  /**
+   * A rider can go Available only when a healthy same-branch vehicle has been
+   * assigned by the Branch Manager. Going Offline is always allowed unless an
+   * active delivery already owns the rider state.
+   */
+  async setDeliveryRiderAvailability(
+    principal: Principal,
+    available: boolean,
+  ): Promise<void> {
+    const branchId = this.requireSingleBranch(principal);
+    const rider = await this.riders.findOne({
+      where: { authUserId: principal.userId, branchId, deletedAt: IsNull() },
+    });
+    if (!rider) throw new NotFoundException('Delivery Rider roster entry not found');
+    if (rider.status === 'On Delivery') {
+      throw new ConflictException('Availability cannot change during an active delivery');
+    }
+    if (available) {
+      const vehicle = await this.vehicles.findOne({
+        where: { branchId, assignedRiderId: rider.id, status: 'active' },
+      });
+      if (!vehicle) {
+        throw new ConflictException(
+          'A healthy branch vehicle must be assigned before going available',
+        );
+      }
+    }
+    await this.riders.update(
+      { id: rider.id, branchId },
+      { status: available ? 'Available' : 'Offline', updatedAt: new Date() },
+    );
+  }
+
   /**
    * Internal lookup used by the SRD dispatch flow to confirm a rider is
    * assignable to a Service Request: the rider exists, is not soft-deleted,

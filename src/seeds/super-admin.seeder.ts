@@ -48,6 +48,7 @@ async function run(): Promise<void> {
         username: email.split('@')[0],
         display_name: displayName,
         role: 'super-admin',
+        branch_ids: [],
         branches: [],
         phone,
         status: 'Active',

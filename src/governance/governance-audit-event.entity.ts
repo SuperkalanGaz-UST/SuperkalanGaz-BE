@@ -29,7 +29,7 @@ export class GovernanceAuditEvent {
   actorName!: string;
 
   @Column({ name: 'actor_role', type: 'text' })
-  actorRole!: 'super-admin' | 'franchise-admin' | 'system';
+  actorRole!: 'super-admin' | 'franchise-admin' | 'branch-owner' | 'driver' | 'system';
 
   @Column({ name: 'affected_record_type', type: 'text' })
   affectedRecordType!: string;

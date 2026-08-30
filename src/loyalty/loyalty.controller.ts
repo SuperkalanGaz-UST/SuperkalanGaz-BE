@@ -28,6 +28,7 @@ import {
   CreateCustomerCommercialRedemptionDto,
   CreateCustomerRedemptionDto,
 } from './dto/create-customer-redemption.dto';
+import { BranchSelectionQuery } from './dto/branch-selection.query';
 
 /**
  * Loyalty Program Monitoring HTTP boundary for the separate household-points and
@@ -239,8 +240,9 @@ export class LoyaltyController {
   @Roles('branch-owner')
   async settings(
     @CurrentPrincipal() principal: Principal,
+    @Query() query: BranchSelectionQuery,
   ) {
-    const s = await this.loyalty.getSettings(principal);
+    const s = await this.loyalty.getSettings(principal, query.branchId);
     return {
       settings: {
         branch_id: s.branchId,
@@ -259,9 +261,10 @@ export class LoyaltyController {
   @Roles('branch-owner')
   async updateSettings(
     @CurrentPrincipal() principal: Principal,
+    @Query() query: BranchSelectionQuery,
     @Body() dto: UpdateLoyaltySettingsDto,
   ) {
-    const s = await this.loyalty.updateSettings(principal, dto);
+    const s = await this.loyalty.updateSettings(principal, dto, query.branchId);
     return {
       settings: {
         branch_id: s.branchId,

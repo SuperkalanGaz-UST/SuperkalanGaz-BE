@@ -9,8 +9,8 @@ import { RolesGuard } from './roles.guard';
 import { SupabaseJwtService } from './supabase-jwt.service';
 
 @Module({
-  // Branch is registered so the guard can resolve a caller's branch NAMES (from
-  // the JWT's app_metadata) to their core.branches UUIDs (AGENTS.md §5).
+  // Branch is registered so the guard can validate protected branch UUID claims
+  // against live core.branches rows (AGENTS.md §5).
   imports: [TypeOrmModule.forFeature([Branch])],
   controllers: [AuthController],
   providers: [

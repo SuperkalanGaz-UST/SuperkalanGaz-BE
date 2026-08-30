@@ -90,17 +90,27 @@ Sections below are tagged `[api]`, `[web]`, `[mobile]`, or `[all]` where they ap
 - Isolation is enforced **at the application layer** via **NestJS guards reading JWT
   claims** — **NOT** Postgres Row-Level Security and **NOT** physical partitioning.
 - **Implication for you:** the database will not stop a cross-branch read. *You* must. Every
-  repository/service query for branch-owned data must apply the `branch_id` derived from the
-  authenticated principal. Do not trust a `branch_id` sent from the client body/params for
-  scoping; derive it from the verified JWT.
+  repository/service query for branch-owned data must apply a `branch_id` contained in the
+  authenticated principal's protected `app_metadata.branch_ids`. A Branch Owner may select
+  one active branch UUID from that authorized set as request context; the guard must validate
+  membership and inject the authorized context before a service uses it. Client input may
+  narrow verified scope but must never widen it or be trusted directly. For a Branch Owner,
+  the guard must also intersect those UUID claims with live `core.branches.owner_id` rows for
+  that Auth user, so a stale token cannot retain a branch after reassignment.
 - **Do not claim or comment that isolation is "DB-enforced."** It is guard-enforced. Accurate
   comments matter — this is a panel-defense point.
 
 Scoping by role (see §7 for full permissions):
 - **SA:** cross-branch governance and audit read visibility (no operational writes).
 - **FA:** cross-branch read visibility (no operational writes).
-- **BO / BM:** strictly their own `branch_id`.
+- **BO:** strictly one of their assigned `branch_ids`; a BO may own one or more branches.
+- **BM:** strictly their single assigned `branch_id`.
 - **Customer:** their own records only.
+
+For every Branch Owner action or branch-specific view, require an explicit selected branch UUID
+when the owner has multiple assignments, validate it against the guard-resolved scope, and use
+that UUID in every repository query. Never default a multi-branch owner to `branchIds[0]`, and
+never use a branch name as an authorization key.
 
 ---
 
@@ -117,15 +127,20 @@ Scoping by role (see §7 for full permissions):
 - **Identity is owned by Supabase Auth, not a `public.profiles` table.** The one row per
   user lives in `auth.users`; CRM claims (role, branch scope, status) are stored in that
   user's **`app_metadata`** (service-role-only — never `user_metadata`, which the user can
-  self-edit and would allow tenancy/privilege escalation). These claims ride in the verified
-  JWT, so the guard reads them from the token (§5) and never queries a mirror table. Manage
-  them through the GoTrue Admin API, never a `public.profiles` row or PostgREST.
+  self-edit and would allow tenancy/privilege escalation). Branch authorization is stored as
+  immutable UUIDs in `app_metadata.branch_ids`; branch names may be retained only as display
+  metadata and must never authorize access. These claims ride in the verified JWT, so the
+  guard reads them from the token (§5) and never queries a mirror table. Manage them through
+  the GoTrue Admin API, never a `public.profiles` row or PostgREST.
 - **UUID primary keys** everywhere.
 - **No foreign-key constraints in the schema.** Referential integrity is enforced in the
   **NestJS service layer**. When writing services, validate referenced records exist and
   belong to the correct branch before persisting.
 - **Explicit indexes are required on all reference columns** (every column used as a logical
   FK / lookup). Add the index in the same migration that introduces the column.
+- **Branch ownership is one-to-many through `core.branches.owner_id`.** Multiple branch rows
+  may reference the same Branch Owner `auth.users` UUID; each branch row has at most one
+  active owner. `owner_id` is indexed and has no database FK.
 - **Soft delete only** (§3.2).
 - Migrations are the only way to change schema; do not rely on TypeORM `synchronize`.
 
@@ -137,13 +152,16 @@ Scoping by role (see §7 for full permissions):
 | ---- | --------- | ------ | ----------- |
 | **Super Administrator (SA)** | Web | Top-level governance; directly invite, resend, revoke, deactivate, and reactivate Franchise Administrator accounts; approve or reject FA-submitted SLA-threshold, price-configuration, and Branch Owner-reassignment requests; review immutable Franchise Administrator account, price-change, Branch Owner-change, approval, and security activity logs; cross-branch read visibility | Set or know an invited user's password; expose invitation credentials; submit or approve their own governance request; mutate audit history; perform operational writes; process service requests; dispatch; approve redemptions |
 | **Franchise Administrator (FA)** | Web | Cross-branch read visibility; submit system-wide SLA-threshold, price-configuration, and Branch Owner-reassignment requests for SA approval; perform initial branch and Branch Owner onboarding; manage other branch accounts | Create, invite, approve, deactivate, or reactivate Franchise Administrator accounts; approve governance requests; mutate audit history; perform operational writes; process service requests; dispatch; approve redemptions |
-| **Branch Owner (BO)** | Web | Configure **their branch only**: loyalty merchandise catalog, point rates, threshold values *within FA-set bounds*, Dual-Authorization toggle; view branch analytics | Process daily orders; dispatch; cross-branch access |
+| **Branch Owner (BO)** | Web | Own one or more assigned branches; select one authorized branch context at a time; configure that branch's loyalty merchandise catalog, point rates, threshold values *within FA-set bounds*, and Dual-Authorization toggle; view analytics for assigned branches | Process daily orders; dispatch; access any branch outside `branch_ids` |
 | **Branch Manager (BM)** | Web | **Day-to-day ops for their branch:** create/process service requests, prepare authorized Delivery Riders for dispatch, offer/dispatch service requests, assign branch vehicles, approve loyalty redemptions | Authorize Delivery Rider identity or branch membership; change SLA thresholds; act outside own branch |
-| **Delivery Rider (DR)** | **Mobile only** | Accept a Branch Owner invitation, manage availability after activation, accept or decline assigned service-request offers, and update delivery milestones | Choose or change authoritative `branch_id`; browse or claim unoffered requests; access another branch or staff governance screens |
+| **Delivery Rider (DR)** | **Web or mobile onboarding; mobile operations** | Accept a Branch Owner invitation through the dedicated registration flow, then use mobile to manage availability after activation, accept or decline assigned service-request offers, and update delivery milestones | Access a web operations dashboard; choose or change authoritative `branch_id`; browse or claim unoffered requests; access another branch or staff governance screens |
 | **Customer (CU)** | **Mobile only** | Place orders, track delivery status *milestones*, submit CSAT | Access web dashboard; see live GPS coordinates |
 
 Hard constraints:
 - **BO and BM are always separate people.** Do not merge these roles or share a session.
+- **Branch Owner ownership is one-to-many.** A Branch Owner may own one or more branches;
+  each branch has exactly one active Branch Owner. A Branch Manager remains assigned to
+  exactly one branch. Store authorization as UUIDs, not editable branch names.
 - **SA and FA are governance roles with no operational write actions.** FA proposes
   system-wide SLA-threshold and price-configuration changes and Branch Owner reassignments;
   SA makes the approval decision. Initial branch/Branch Owner onboarding remains an FA
@@ -165,7 +183,11 @@ Hard constraints:
   timestamp, and reason where the action requires one.
 - **Delivery Rider provisioning is invitation-only.** A Branch Owner supplies the intended
   person's verified identity; the API binds a single-use, expiring invitation to the
-  Owner's JWT-derived branch. The invitee sets their own password.
+  server-validated active branch selected from the Owner's JWT-derived `branch_ids`. The
+  invitee sets their own password.
+- **Delivery Rider web access is registration-only.** The same API invitation state machine
+  may be called by the dedicated token-gated web page or mobile flow. Web activation must end
+  with an app handoff and must never authorize a Delivery Rider web operations dashboard.
 - **Invitation acceptance is the authorization.** After identity verification, only the API
   writes protected `driver`, invitation-bound `branch_id`, and active claims to
   `app_metadata`. No Branch Manager approval or applicant-selected branch is allowed.
@@ -195,8 +217,9 @@ Hard constraints:
 4. **CSAT Feedback & Analytics** — post-delivery star ratings, complaint (Incident) logging,
    average response-time tracking.
 5. **Fleet Management** — Delivery Rider roster and vehicle assignment plus GPS via SinoTrack
-   ST-901 → Traccar → API. Delivery Riders use the role-gated mobile experience for registration,
-   availability, offer acceptance, and delivery milestones. The phone is not the
+   ST-901 → Traccar → API. Delivery Riders may register through the invitation-authorized web
+   or mobile flow, but use the role-gated mobile experience for availability, offer acceptance,
+   and delivery milestones. The phone is not the
    authoritative GPS source; live coordinates still come from SinoTrack ST-901 through
    Traccar. Hardware-dependent live GPS may be sprint-deferred — check the current sprint.
 
@@ -220,15 +243,18 @@ Shared workflow:
 ### 8b. Delivery Rider invitation and branch activation `[api] [web] [mobile]`
 
 1. The Branch Owner issues a single-use, expiring invitation bound by the API to a verified
-   identity and the Owner's JWT-derived branch.
-2. The invitee selects **Register as Delivery Rider**, verifies the invited email and PH
-   mobile identity, and sets their own password; the branch is not editable.
+   identity and the server-validated active branch selected from the Owner's JWT-derived
+   `branch_ids`.
+2. The invitee selects **Register as Delivery Rider** in the dedicated web page or mobile
+   flow, verifies the invited email and PH mobile identity, and sets their own password; the
+   branch is not editable.
 3. The API rejects mismatched, expired, revoked, used, or replayed invitations without
    exposing branch data.
 4. Successful acceptance consumes the invitation and writes protected `driver`, branch,
    and active claims to `app_metadata`, with immutable audit attribution to the Owner.
-5. The Rider appears Offline and unassigned. The Branch Manager manages vehicle readiness
-   but cannot authorize identity, branch membership, or role claims.
+5. Web registration ends with a mobile-app handoff. The Delivery Rider appears Offline and
+   unassigned. The Branch Manager manages vehicle readiness but cannot authorize identity,
+   branch membership, or role claims.
 
 ---
 

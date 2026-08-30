@@ -36,6 +36,7 @@ export class CustomerAddressesService {
       app_metadata: {
         ...(user.app_metadata ?? {}),
         role: 'customer',
+        branch_ids: [],
         branches: [],
         status: 'Active',
         account_type: rawAccountType,

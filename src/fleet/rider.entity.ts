@@ -24,14 +24,18 @@ export const RIDER_STATUSES: readonly RiderStatus[] = [
  * planned Delivery Rider mobile experience handles invitation acceptance,
  * availability, offer acceptance, and milestones; it does not supply authoritative
  * GPS. Live tracking remains SinoTrack ST-901 → Traccar and is deferred in this slice.
- * Seeded manually for now — Rider onboarding is not implemented in this slice. Soft
- * delete only (AGENTS.md §3.2): deleted_at marks a Delivery Rider retired; this API never
- * hard-deletes.
+ * Invitation acceptance creates new roster rows as Offline and unassigned.
+ * Soft delete only (AGENTS.md §3.2): deleted_at marks a Delivery Rider retired;
+ * this API never hard-deletes.
  */
 @Entity({ schema: 'fleet', name: 'riders' })
 export class Rider {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
+
+  /** Supabase Auth identity for invitation-provisioned Delivery Riders. */
+  @Column({ name: 'auth_user_id', type: 'uuid', nullable: true })
+  authUserId!: string | null;
 
   /** Tenancy handle — a rider belongs to exactly one branch. No FK by design
    * (AGENTS.md §6); the service validates the branch/rider relationship. */

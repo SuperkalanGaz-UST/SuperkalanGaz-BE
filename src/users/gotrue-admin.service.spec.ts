@@ -26,6 +26,7 @@ describe('GoTrueAdminService', () => {
     );
     global.fetch = fetchMock;
     const service = new GoTrueAdminService({
+      get: jest.fn(() => undefined),
       getOrThrow: jest.fn((key: string) =>
         key === 'SUPABASE_URL'
           ? 'https://project.supabase.co'

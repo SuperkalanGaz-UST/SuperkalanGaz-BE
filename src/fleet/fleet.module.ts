@@ -2,6 +2,11 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from '../auth/auth.module';
 import { Branch } from '../branches/branch.entity';
+import { GovernanceModule } from '../governance/governance.module';
+import { UsersModule } from '../users/users.module';
+import { DeliveryRiderInvitationsController } from './delivery-rider-invitations.controller';
+import { DeliveryRiderInvitationsService } from './delivery-rider-invitations.service';
+import { DeliveryRiderController } from './delivery-rider.controller';
 import { FleetController } from './fleet.controller';
 import { FleetService } from './fleet.service';
 import { Rider } from './rider.entity';
@@ -20,9 +25,16 @@ import { TraccarClient } from './traccar/traccar.client';
   imports: [
     TypeOrmModule.forFeature([Rider, Vehicle, VehicleMaintenanceLog, Branch]),
     AuthModule,
+    GovernanceModule,
+    UsersModule,
   ],
-  controllers: [FleetController, VehiclesController],
-  providers: [FleetService, TraccarClient],
+  controllers: [
+    FleetController,
+    VehiclesController,
+    DeliveryRiderInvitationsController,
+    DeliveryRiderController,
+  ],
+  providers: [FleetService, TraccarClient, DeliveryRiderInvitationsService],
   exports: [FleetService],
 })
 export class FleetModule {}

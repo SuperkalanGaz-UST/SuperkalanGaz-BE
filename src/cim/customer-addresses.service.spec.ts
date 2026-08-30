@@ -113,6 +113,7 @@ describe('CustomerAddressesService', () => {
       app_metadata: {
         locale: 'en',
         role: 'customer',
+        branch_ids: [],
         branches: [],
         status: 'Active',
         account_type: 'household',

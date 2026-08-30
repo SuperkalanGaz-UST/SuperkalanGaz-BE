@@ -10,6 +10,11 @@ import { Reflector } from '@nestjs/core';
 import { Request } from 'express';
 import { In, Repository } from 'typeorm';
 import { Branch } from '../branches/branch.entity';
+import {
+  hasMetadataBranchIds,
+  metadataBranchIds,
+  metadataBranchNames,
+} from './branch-scope';
 import { isRole, Principal, REQUEST_PRINCIPAL } from './principal';
 import { ALLOW_PENDING_INVITATION_KEY } from './roles.decorator';
 import { SupabaseJwtService } from './supabase-jwt.service';
@@ -81,21 +86,55 @@ export class AuthGuard implements CanActivate {
       throw new ForbiddenException('This account is inactive');
     }
 
-    const names = Array.isArray(claims.branches)
-      ? (claims.branches as unknown[]).filter((b): b is string => typeof b === 'string')
-      : [];
+    const claimedBranchIds = metadataBranchIds(claims);
+    const legacyBranchNames = metadataBranchNames(claims);
+    const hasUuidScopeClaim = hasMetadataBranchIds(claims);
 
-    // Resolve the caller's branch names to their core.branches UUIDs once here,
-    // so every domain service can scope by branch_id (AGENTS.md §5/§6) without
-    // repeating the lookup. Only live branches count: this table soft-deletes via
-    // status='inactive', so an inactive/renamed name drops out and scoping fails
-    // closed.
-    const liveBranches = names.length
-      ? await this.branches.find({
-          where: { name: In(names), status: 'active' },
-          select: { id: true },
+    // UUIDs are the authorization claim. The name lookup is a rollout-only
+    // compatibility path for sessions created before branch_ids was introduced;
+    // it is ignored as soon as a UUID claim is present, so stale display labels
+    // can never widen an already migrated account.
+    const liveBranches = hasUuidScopeClaim
+      ? claimedBranchIds.length
+        ? await this.branches.find({
+            where: { id: In(claimedBranchIds), status: 'active' },
+            select: { id: true, name: true, ownerId: true },
+          })
+        : []
+      : legacyBranchNames.length
+        ? await this.branches.find({
+            where: { name: In(legacyBranchNames), status: 'active' },
+            select: { id: true, name: true, ownerId: true },
+          })
+        : [];
+
+    const liveById = new Map(liveBranches.map((branch) => [branch.id, branch]));
+    const liveByName = new Map<string, Branch[]>();
+    for (const branch of liveBranches) {
+      liveByName.set(branch.name, [...(liveByName.get(branch.name) ?? []), branch]);
+    }
+    const claimedLiveBranches = hasUuidScopeClaim
+      ? claimedBranchIds.flatMap((id) => {
+          const branch = liveById.get(id);
+          return branch ? [branch] : [];
         })
-      : [];
+      : legacyBranchNames.flatMap((name) => {
+          const matches = liveByName.get(name) ?? [];
+          return matches.length === 1 ? matches : [];
+        });
+
+    // For migrated Branch Owners, intersect the protected UUID claim with the
+    // canonical branch row. This blocks a reassigned branch immediately even if
+    // an older access token still contains its UUID. The legacy name path stays
+    // available only long enough to run the documented UUID backfill.
+    const orderedBranches =
+      claimedRole === 'branch-owner' && hasUuidScopeClaim
+        ? claimedLiveBranches.filter((branch) => branch.ownerId === payload.sub)
+        : claimedLiveBranches;
+
+    if (claimedRole === 'branch-manager' && orderedBranches.length !== 1) {
+      throw new ForbiddenException('Branch Manager must have exactly one active branch');
+    }
 
     console.log('[auth] resolved principal', {
       requestPath,
@@ -116,8 +155,8 @@ export class AuthGuard implements CanActivate {
         claims.account_type === 'household' || claims.account_type === 'commercial'
           ? claims.account_type
           : undefined,
-      branches: names,
-      branchIds: liveBranches.map((b) => b.id),
+      branches: orderedBranches.map((branch) => branch.name),
+      branchIds: orderedBranches.map((branch) => branch.id),
     };
     Object.defineProperty(request, REQUEST_PRINCIPAL, {
       value: principal,

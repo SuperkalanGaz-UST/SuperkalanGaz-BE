@@ -15,6 +15,7 @@
     "seed:fleet-rider-demo": "nest build && node dist/seeds/fleet-rider-demo.seeder",
     "seed:fleet-vehicles-demo": "nest build && node dist/seeds/fleet-vehicles-demo.seeder",
     "seed:super-admin": "nest build && node dist/seeds/super-admin.seeder",
+    "migrate:branch-scope-uuid": "nest build && node dist/seeds/branch-scope-uuid.seeder",
     "lint": "eslint \"src/**/*.ts\"",
     "test": "jest --passWithNoTests",
     "test:e2e": "jest --config ./test/jest-e2e.json --passWithNoTests"
