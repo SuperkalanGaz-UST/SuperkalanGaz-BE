@@ -27,6 +27,7 @@ import { ListRatingsQuery } from './dto/list-ratings.query';
 import { ResolveRatingDto } from './dto/resolve-rating.dto';
 import { CreateIncidentDto } from './dto/create-incident.dto';
 import { ListIncidentsQuery } from './dto/list-incidents.query';
+import { CreateRatingDto } from './dto/create-rating.dto';
 
 /** Service Request statuses a complaint may be logged against (BM-US-04 AC1:
  * "any closed or active Service Request"). Interpreted as Dispatched/En Route
@@ -134,14 +135,18 @@ export class CsatService {
   ): Promise<RatingListItem[]> {
     const branchIds = this.requireBranches(principal);
 
-    // Default to the actionable low-CSAT queue; callers may widen deliberately.
-    const maxStars = query.maxStars ?? LOW_CSAT_MAX_STARS;
+    // Only filter by star range if explicitly requested. When maxStars is
+    // omitted the caller wants the full picture (e.g. the "All" view on the
+    // BM CSAT screen). The frontend checkbox sends maxStars=2 when the user
+    // ticks "Low CSAT only" — the service must not impose its own default here.
     const resolution = query.resolution ?? 'Open';
 
     const ratings = await this.ratings.find({
       where: {
         branchId: In(branchIds),
-        stars: LessThanOrEqual(maxStars),
+        ...(query.maxStars != null
+          ? { stars: LessThanOrEqual(query.maxStars) }
+          : {}),
         ...(resolution === 'all' ? {} : { resolutionStatus: resolution }),
       },
       order: { submittedAt: 'DESC' },
@@ -180,6 +185,83 @@ export class CsatService {
         riderName: sr?.riderId ? (riderNames.get(sr.riderId) ?? null) : null,
       };
     });
+  }
+
+  /**
+   * Submit a customer rating for a completed delivery. Called from the mobile
+   * app after delivery (customer role only). Validates that:
+   *  (a) the Service Request exists and belongs to the authenticated customer;
+   *  (b) the SR is in 'Delivered' status — only completed deliveries can be rated;
+   *  (c) no rating already exists for this SR (idempotent guard → 409 on duplicate).
+   *
+   * The branch_id is derived from the Service Request, never trusted from the
+   * client (AGENTS.md §5). submitted_at and created_at are stamped server-side.
+   */
+  async submitRating(
+    principal: Principal,
+    dto: CreateRatingDto,
+  ): Promise<Rating> {
+    if (principal.role !== 'customer') {
+      throw new ForbiddenException('Only customers may submit ratings');
+    }
+
+    // Resolve the CIM profile UUIDs for this auth user. The SR's customer_id
+    // is the CIM customer profile UUID, NOT the raw Supabase auth user id.
+    // We include the auth userId itself as a fallback for legacy orders written
+    // before migration 0025 synced mobile customers into CIM — exactly the same
+    // approach listForCustomer uses.
+    const profileRows = await this.ratings.manager
+      .createQueryBuilder()
+      .select('c.id', 'id')
+      .from('cim.customers', 'c')
+      .where('c.auth_user_id = :authUserId', { authUserId: principal.userId })
+      .andWhere('c.deleted_at IS NULL')
+      .getRawMany<{ id: string }>();
+    const ownedCustomerIds = [
+      ...new Set([principal.userId, ...profileRows.map((r) => r.id)]),
+    ];
+
+    // (a) Locate the service request owned by this customer.
+    const sr = await this.serviceRequests.findOne({
+      where: { id: dto.serviceRequestId, customerId: In(ownedCustomerIds) },
+    });
+    if (!sr) {
+      throw new NotFoundException('Order not found');
+    }
+
+    // (b) Only Delivered orders can be rated.
+    if (sr.status !== 'Delivered') {
+      throw new BadRequestException(
+        'Only delivered orders can be rated. This order is currently ' + sr.status,
+      );
+    }
+
+    // (c) Duplicate guard — one rating per order.
+    const existing = await this.ratings.findOne({
+      where: { serviceRequestId: dto.serviceRequestId },
+    });
+    if (existing) {
+      throw new ConflictException('This order has already been rated');
+    }
+
+    const now = new Date();
+    const rating = this.ratings.create({
+      branchId: sr.branchId,
+      serviceRequestId: sr.id,
+      // Store the SR's actual customer_id (the CIM UUID) so CSAT queries
+      // that join on customer_id work correctly downstream.
+      customerId: sr.customerId ?? principal.userId,
+      stars: dto.stars,
+      comment: dto.comment ?? null,
+      submittedAt: now,
+      createdAt: now,
+      resolutionStatus: dto.stars <= LOW_CSAT_MAX_STARS ? 'Open' : 'Resolved',
+      resolutionNote: null,
+      resolvedBy: null,
+      resolvedAt: null,
+    });
+
+    return this.ratings.save(rating);
   }
 
   /**
@@ -244,14 +326,18 @@ export class CsatService {
       select: { id: true, stars: true, resolutionStatus: true },
     });
 
-    const openCount = rows.filter((r) => r.resolutionStatus === 'Open').length;
-    const lowCsatOpenCount = rows.filter(
+    // "Open Complaints" = complaint-band (≤2★) Open ratings the BM must act on.
+    // 3–5★ ratings are auto-resolved at submission, but guard here too for any
+    // legacy rows created before that rule was introduced.
+    const openCount = rows.filter(
       (r) => r.resolutionStatus === 'Open' && r.stars <= LOW_CSAT_MAX_STARS,
     ).length;
+    const lowCsatOpenCount = openCount; // same definition, kept for API compat
+    const resolvedCount = rows.length - openCount;
 
     return {
       openCount,
-      resolvedCount: rows.length - openCount,
+      resolvedCount,
       lowCsatOpenCount,
       averageStars: rows.length
         ? Number((rows.reduce((sum, r) => sum + r.stars, 0) / rows.length).toFixed(2))

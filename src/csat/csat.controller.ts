@@ -21,6 +21,7 @@ import { ResolveRatingDto } from './dto/resolve-rating.dto';
 import { CreateIncidentDto } from './dto/create-incident.dto';
 import { ListIncidentsQuery } from './dto/list-incidents.query';
 import { BranchReportQuery } from '../common/dto/branch-report.query';
+import { CreateRatingDto } from './dto/create-rating.dto';
 
 /**
  * CSAT Feedback & Analytics — two Branch Manager flows on the same epic:
@@ -39,6 +40,25 @@ import { BranchReportQuery } from '../common/dto/branch-report.query';
 @Roles('branch-manager')
 export class CsatController {
   constructor(private readonly csat: CsatService) {}
+
+  /**
+   * Customer submits a star rating (+ optional comment) for a completed
+   * delivery. branch_id is derived server-side from the linked Service Request
+   * so the customer cannot forge or expose another branch's data.
+   * Returns 409 if the order was already rated (duplicate guard).
+   * Returns 400 if the order is not yet delivered or stars is outside 1–5.
+   * Returns 404 if the order does not belong to this customer.
+   */
+  @Post('ratings')
+  @Roles('customer')
+  async submitRating(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: CreateRatingDto,
+  ): Promise<{ rating: ReturnType<CsatController['toRatingRow']> }> {
+    const row = await this.csat.submitRating(principal, dto);
+    return { rating: this.toRatingRow(row) };
+  }
+
 
   /** Branch Owner read-only CSAT analytics; scope is narrowed server-side. */
   @Get('reports/summary')
@@ -67,6 +87,7 @@ export class CsatController {
    * inline (BM-039). ?maxStars and ?resolution narrow or widen the view.
    */
   @Get('ratings')
+  @Roles('branch-manager', 'branch-owner')
   async list(
     @CurrentPrincipal() principal: Principal,
     @Query() query: ListRatingsQuery,
@@ -80,6 +101,7 @@ export class CsatController {
    * resolve, plus resolved/total/average for the dashboard tiles.
    */
   @Get('summary')
+  @Roles('branch-manager', 'branch-owner')
   async summary(
     @CurrentPrincipal() principal: Principal,
   ): Promise<{ summary: ReturnType<CsatController['toSummaryRow']> }> {
@@ -127,6 +149,7 @@ export class CsatController {
    * rider, the same delivery context BM-039 provides for ratings.
    */
   @Get('incidents')
+  @Roles('branch-manager', 'branch-owner')
   async listIncidents(
     @CurrentPrincipal() principal: Principal,
     @Query() query: ListIncidentsQuery,
