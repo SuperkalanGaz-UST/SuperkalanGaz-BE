@@ -3,6 +3,7 @@ import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
+import { ConnectVehicleGpsDto } from './dto/connect-vehicle-gps.dto';
 import { CreateVehicleDto } from './dto/create-vehicle.dto';
 import { LogMileageDto } from './dto/log-mileage.dto';
 import { FleetService } from './fleet.service';
@@ -71,6 +72,20 @@ export class VehiclesController {
     @Param('id', ParseUUIDPipe) id: string,
   ): Promise<{ vehicle: ReturnType<VehiclesController['toRow']> }> {
     const vehicle = await this.fleet.retryVehicleProvisioning(principal, id);
+    const [riderNames, thresholds] = await Promise.all([
+      this.fleet.riderNamesFor(this.assignedRiderIds([vehicle])),
+      this.fleet.maintenanceThresholdsForBranches([vehicle.branchId]),
+    ]);
+    return { vehicle: this.toRow(vehicle, riderNames, thresholds) };
+  }
+
+  @Post(':id/gps-provisioning')
+  async connectGps(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ConnectVehicleGpsDto,
+  ): Promise<{ vehicle: ReturnType<VehiclesController['toRow']> }> {
+    const vehicle = await this.fleet.connectVehicleGps(principal, id, dto);
     const [riderNames, thresholds] = await Promise.all([
       this.fleet.riderNamesFor(this.assignedRiderIds([vehicle])),
       this.fleet.maintenanceThresholdsForBranches([vehicle.branchId]),

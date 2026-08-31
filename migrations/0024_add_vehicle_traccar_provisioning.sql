@@ -1,8 +1,8 @@
 -- 0024_add_vehicle_traccar_provisioning.sql
 -- Keeps the CRM vehicle UUID, the physical SinoTrack identifier, and Traccar's
--- middleware identifier distinct. Existing vehicles remain "unconfigured";
--- newly registered vehicles move through pending -> provisioned/failed in the
--- NestJS service. No database foreign keys are added by design.
+-- middleware identifier distinct. Vehicles remain "unconfigured" until a
+-- Branch Manager deliberately connects hardware; that separate action moves
+-- through pending -> provisioned/failed. No database foreign keys are added.
 
 ALTER TABLE fleet.vehicles
   ADD COLUMN IF NOT EXISTS hardware_unique_id text;

@@ -289,7 +289,6 @@ describe('FleetService', () => {
     const vehicleRepo = makeVehicleRepo();
     vehicleRepo.findOne
       .mockResolvedValueOnce(null) // plate is free
-      .mockResolvedValueOnce(null) // hardware identifier is free
       .mockResolvedValueOnce(null); // rider is not assigned elsewhere
     const traccar = makeTraccar();
     const service = makeService(
@@ -302,7 +301,6 @@ describe('FleetService', () => {
 
     const registered = await service.registerVehicle(principal(['branch-uuid-1']), {
       plateNumber: '  abc-1234  ',
-      hardwareUniqueId: '867530900000002',
       initialOdometerKm: 4250,
       assignedRiderId: '550e8400-e29b-41d4-a716-446655440000',
     });
@@ -314,27 +312,71 @@ describe('FleetService', () => {
         vehicleType: 'motorcycle',
         assignedRiderId: '550e8400-e29b-41d4-a716-446655440000',
         status: 'active',
-        hardwareUniqueId: '867530900000002',
-        traccarProvisioningStatus: 'pending',
+        hardwareUniqueId: null,
+        traccarProvisioningStatus: 'unconfigured',
         currentOdometerKm: 4250,
         lastPmsOdometerKm: 4250,
       }),
     );
-    expect(traccar.provisionDevice).toHaveBeenCalledWith(
-      'ABC-1234',
-      '867530900000002',
-    );
-    expect(registered.traccarDeviceId).toBe('77');
-    expect(registered.traccarProvisioningStatus).toBe('provisioned');
-    expect(registered.traccarProvisionedAt).toBeInstanceOf(Date);
+    expect(traccar.provisionDevice).not.toHaveBeenCalled();
+    expect(registered.traccarDeviceId).toBeNull();
+    expect(registered.traccarProvisioningStatus).toBe('unconfigured');
+    expect(registered.traccarProvisionedAt).toBeNull();
     expect(registered.id).toBe('vehicle-new');
   });
 
-  it('rejects a hardware identifier already registered to another CRM vehicle', async () => {
-    const vehicleRepo = makeVehicleRepo();
+  it('connects a SinoTrack ST-901 to an existing branch-scoped vehicle', async () => {
+    const vehicleRepo = makeVehicleRepo({
+      hardwareUniqueId: null,
+      traccarDeviceId: null,
+      traccarProvisioningStatus: 'unconfigured',
+      traccarProvisionedAt: null,
+    });
     vehicleRepo.findOne
-      .mockResolvedValueOnce(null) // plate is free
-      .mockResolvedValueOnce(vehicleRepo.__vehicle); // hardware identifier is taken
+      .mockResolvedValueOnce(vehicleRepo.__vehicle) // branch-scoped vehicle
+      .mockResolvedValueOnce(null); // hardware identifier is free
+    const traccar = makeTraccar();
+    const service = makeService(
+      makeRiderRepo(),
+      vehicleRepo,
+      makeLogRepo(),
+      makeBranchRepo(),
+      traccar,
+    );
+
+    const connected = await service.connectVehicleGps(
+      principal(['branch-uuid-1']),
+      'vehicle-1',
+      {
+        hardwareUniqueId: '867530900000001',
+      },
+    );
+
+    expect(vehicleRepo.findOne.mock.calls[0][0]?.where).toEqual(
+      expect.objectContaining({ id: 'vehicle-1' }),
+    );
+    expect(vehicleRepo.findOne.mock.calls[1][0]?.where).toEqual({
+      branchId: 'branch-uuid-1',
+      hardwareUniqueId: '867530900000001',
+    });
+    expect(traccar.provisionDevice).toHaveBeenCalledWith(
+      'NBH-1234',
+      '867530900000001',
+    );
+    expect(connected.traccarProvisioningStatus).toBe('provisioned');
+    expect(connected.traccarDeviceId).toBe('77');
+  });
+
+  it('rejects a hardware identifier already connected to another branch vehicle', async () => {
+    const vehicleRepo = makeVehicleRepo({
+      hardwareUniqueId: null,
+      traccarDeviceId: null,
+      traccarProvisioningStatus: 'unconfigured',
+      traccarProvisionedAt: null,
+    });
+    vehicleRepo.findOne
+      .mockResolvedValueOnce(vehicleRepo.__vehicle)
+      .mockResolvedValueOnce({ ...vehicleRepo.__vehicle, id: 'vehicle-2' });
     const traccar = makeTraccar();
     const service = makeService(
       makeRiderRepo(),
@@ -345,25 +387,24 @@ describe('FleetService', () => {
     );
 
     await expect(
-      service.registerVehicle(principal(['branch-uuid-1']), {
-        plateNumber: 'ABC-1234',
+      service.connectVehicleGps(principal(['branch-uuid-1']), 'vehicle-1', {
         hardwareUniqueId: '867530900000001',
-        initialOdometerKm: 0,
       }),
     ).rejects.toThrow('GPS hardware identifier is already registered');
 
-    expect(vehicleRepo.findOne.mock.calls[1][0]?.where).toEqual({
-      branchId: 'branch-uuid-1',
-      hardwareUniqueId: '867530900000001',
-    });
     expect(vehicleRepo.save).not.toHaveBeenCalled();
     expect(traccar.provisionDevice).not.toHaveBeenCalled();
   });
 
-  it('keeps the CRM vehicle but marks provisioning failed when Traccar is unavailable', async () => {
-    const vehicleRepo = makeVehicleRepo();
+  it('keeps the vehicle but marks connection failed when Traccar is unavailable', async () => {
+    const vehicleRepo = makeVehicleRepo({
+      hardwareUniqueId: null,
+      traccarDeviceId: null,
+      traccarProvisioningStatus: 'unconfigured',
+      traccarProvisionedAt: null,
+    });
     vehicleRepo.findOne
-      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(vehicleRepo.__vehicle)
       .mockResolvedValueOnce(null);
     const traccar = makeTraccar();
     traccar.provisionDevice.mockRejectedValueOnce(new Error('Traccar is unreachable'));
@@ -375,15 +416,15 @@ describe('FleetService', () => {
       traccar,
     );
 
-    const registered = await service.registerVehicle(principal(['branch-uuid-1']), {
-      plateNumber: 'ABC-1234',
-      hardwareUniqueId: '867530900000002',
-      initialOdometerKm: 0,
-    });
+    const connected = await service.connectVehicleGps(
+      principal(['branch-uuid-1']),
+      'vehicle-1',
+      { hardwareUniqueId: '867530900000002' },
+    );
 
-    expect(registered.traccarProvisioningStatus).toBe('failed');
-    expect(registered.traccarProvisioningError).toBe('Traccar is unreachable');
-    expect(registered.traccarDeviceId).toBeNull();
+    expect(connected.traccarProvisioningStatus).toBe('failed');
+    expect(connected.traccarProvisioningError).toBe('Traccar is unreachable');
+    expect(connected.traccarDeviceId).toBeNull();
     expect(vehicleRepo.save).toHaveBeenCalledTimes(2);
   });
 
@@ -429,7 +470,6 @@ describe('FleetService', () => {
     await expect(
       service.registerVehicle(principal(['branch-uuid-1']), {
         plateNumber: 'NBH-1234',
-        hardwareUniqueId: '867530900000002',
         initialOdometerKm: 0,
       }),
     ).rejects.toBeInstanceOf(ConflictException);
@@ -448,11 +488,10 @@ describe('FleetService', () => {
     await expect(
       service.registerVehicle(principal(['branch-uuid-1']), {
         plateNumber: 'ABC-1234',
-        hardwareUniqueId: '867530900000002',
         initialOdometerKm: 0,
         assignedRiderId: '550e8400-e29b-41d4-a716-446655440000',
       }),
-    ).rejects.toThrow('Assigned rider was not found in this branch');
+    ).rejects.toThrow('Assigned Delivery Rider was not found in this branch');
 
     expect(vehicleRepo.save).not.toHaveBeenCalled();
   });
@@ -464,7 +503,6 @@ describe('FleetService', () => {
     await expect(
       service.registerVehicle(principal(['branch-uuid-1', 'branch-uuid-2']), {
         plateNumber: 'ABC-1234',
-        hardwareUniqueId: '867530900000002',
         initialOdometerKm: 0,
       }),
     ).rejects.toBeInstanceOf(ForbiddenException);

@@ -9,6 +9,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { In, IsNull, LessThanOrEqual, QueryFailedError, Raw, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
+import { ConnectVehicleGpsDto } from './dto/connect-vehicle-gps.dto';
 import { CreateVehicleDto } from './dto/create-vehicle.dto';
 import { ListRidersQuery } from './dto/list-riders.query';
 import { LogMileageDto } from './dto/log-mileage.dto';
@@ -21,14 +22,14 @@ import { TraccarClient } from './traccar/traccar.client';
 /**
  * Fleet roster (Fleet module). This slice is minimal: list the caller's branch
  * riders for the dispatch dropdown, an internal lookup the SRD service reuses
- * to validate a rider at dispatch time, and server-side Traccar provisioning
- * during vehicle registration. Live position ingestion remains a separate,
+ * to validate a rider at dispatch time, and optional server-side Traccar
+ * provisioning after vehicle registration. Live position ingestion remains a separate,
  * hardware-dependent Fleet slice.
  *
  * All scoping derives from the verified Principal, never from request input
  * (AGENTS.md §5). Isolation is enforced here in the application layer, not by the
- * DB — a missing branch filter is a cross-tenant leak. Vehicle registration
- * also provisions the physical device in Traccar through a server-only adapter.
+ * DB — a missing branch filter is a cross-tenant leak. Physical-device setup
+ * remains a separate, deliberate action through a server-only Traccar adapter.
  */
 @Injectable()
 export class FleetService {
@@ -293,7 +294,6 @@ export class FleetService {
   ): Promise<Vehicle> {
     const branchId = this.requireSingleBranch(principal);
     const plateNumber = dto.plateNumber.trim().toUpperCase().replace(/\s+/g, ' ');
-    const hardwareUniqueId = dto.hardwareUniqueId.trim();
     const branch = await this.branches.findOne({ where: { id: branchId } });
     if (!branch) throw new ForbiddenException('Caller has no active branch');
 
@@ -302,13 +302,6 @@ export class FleetService {
     });
     if (existingPlate) {
       throw new ConflictException('A vehicle with this plate number is already registered');
-    }
-
-    const existingHardware = await this.vehicles.findOne({
-      where: { branchId, hardwareUniqueId },
-    });
-    if (existingHardware) {
-      throw new ConflictException('This GPS hardware identifier is already registered');
     }
 
     if (dto.assignedRiderId) {
@@ -320,14 +313,18 @@ export class FleetService {
         },
       });
       if (!rider) {
-        throw new BadRequestException('Assigned rider was not found in this branch');
+        throw new BadRequestException(
+          'Assigned Delivery Rider was not found in this branch',
+        );
       }
 
       const assignedVehicle = await this.vehicles.findOne({
         where: { branchId, assignedRiderId: rider.id },
       });
       if (assignedVehicle) {
-        throw new ConflictException('This rider is already assigned to another vehicle');
+        throw new ConflictException(
+          'This Delivery Rider is already assigned to another vehicle',
+        );
       }
     }
 
@@ -338,9 +335,9 @@ export class FleetService {
       vehicleType: 'motorcycle',
       assignedRiderId: dto.assignedRiderId ?? null,
       status: 'active',
-      hardwareUniqueId,
+      hardwareUniqueId: null,
       traccarDeviceId: null,
-      traccarProvisioningStatus: 'pending',
+      traccarProvisioningStatus: 'unconfigured',
       traccarProvisioningError: null,
       traccarProvisionedAt: null,
       currentOdometerKm: dto.initialOdometerKm,
@@ -358,13 +355,77 @@ export class FleetService {
         (error as { code?: string }).code === '23505'
       ) {
         throw new ConflictException(
-          'The plate number, rider, or GPS hardware identifier is already registered',
+          'The plate number or Delivery Rider is already assigned in this branch',
         );
       }
       throw error;
     }
 
-    return this.provisionVehicle(saved);
+    return saved;
+  }
+
+  /**
+   * Connect a physical SinoTrack ST-901 only after its CRM vehicle exists.
+   * Both the vehicle lookup and friendly duplicate check stay branch-scoped;
+   * the global unique index remains the final cross-branch integrity boundary
+   * without revealing another branch's vehicle to the caller.
+   */
+  async connectVehicleGps(
+    principal: Principal,
+    vehicleId: string,
+    dto: ConnectVehicleGpsDto,
+  ): Promise<Vehicle> {
+    const branchId = this.requireSingleBranch(principal);
+    const vehicle = await this.getVehicle(principal, vehicleId);
+    const hardwareUniqueId = dto.hardwareUniqueId.trim();
+
+    if (vehicle.traccarProvisioningStatus === 'provisioned') {
+      if (vehicle.hardwareUniqueId === hardwareUniqueId) return vehicle;
+      throw new ConflictException(
+        'This vehicle already has a connected SinoTrack ST-901',
+      );
+    }
+    if (
+      vehicle.hardwareUniqueId &&
+      vehicle.hardwareUniqueId !== hardwareUniqueId
+    ) {
+      throw new ConflictException(
+        'This vehicle already has a different SinoTrack hardware identifier',
+      );
+    }
+
+    const existingHardware = await this.vehicles.findOne({
+      where: { branchId, hardwareUniqueId },
+    });
+    if (existingHardware && existingHardware.id !== vehicle.id) {
+      throw new ConflictException(
+        'This GPS hardware identifier is already registered',
+      );
+    }
+
+    vehicle.hardwareUniqueId = hardwareUniqueId;
+    vehicle.traccarDeviceId = null;
+    vehicle.traccarProvisioningStatus = 'pending';
+    vehicle.traccarProvisioningError = null;
+    vehicle.traccarProvisionedAt = null;
+    vehicle.updatedAt = new Date();
+
+    let pending: Vehicle;
+    try {
+      pending = await this.vehicles.save(vehicle);
+    } catch (error) {
+      if (
+        error instanceof QueryFailedError &&
+        (error as { code?: string }).code === '23505'
+      ) {
+        throw new ConflictException(
+          'This GPS hardware identifier is already registered',
+        );
+      }
+      throw error;
+    }
+
+    return this.provisionVehicle(pending);
   }
 
   /** Re-attempt a failed/pending provisioning operation without accepting a
