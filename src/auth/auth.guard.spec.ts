@@ -90,4 +90,68 @@ describe('AuthGuard UUID branch scope', () => {
       ForbiddenException,
     );
   });
+
+  it('allows a pending Delivery Rider only on an invitation-decorated endpoint', async () => {
+    const request = {
+      headers: { authorization: 'Bearer token' },
+      method: 'GET',
+      originalUrl: '/api/delivery-rider-invitations/session/acceptance',
+    } as Partial<Request>;
+    const jwt = {
+      verify: jest.fn().mockResolvedValue({
+        sub: 'driver-1',
+        email: 'driver@example.com',
+        app_metadata: {
+          role: 'driver',
+          status: 'Pending',
+          branch_ids: [firstBranchId],
+        },
+      }),
+    } as unknown as SupabaseJwtService;
+    const branches = {
+      find: jest.fn().mockResolvedValue([
+        { id: firstBranchId, name: 'Alpha', ownerId: 'owner-1' },
+      ]),
+    } as unknown as Repository<Branch>;
+    const reflector = {
+      getAllAndOverride: jest.fn().mockReturnValue(true),
+    } as unknown as Reflector;
+    const guard = new AuthGuard(jwt, reflector, branches);
+
+    await expect(guard.canActivate(contextFor(request))).resolves.toBe(true);
+    const principal = (request as Record<string, unknown>)[REQUEST_PRINCIPAL] as Principal;
+    expect(principal).toMatchObject({
+      userId: 'driver-1',
+      role: 'driver',
+      status: 'Pending',
+      branchIds: [firstBranchId],
+    });
+  });
+
+  it('rejects a pending Delivery Rider on normal protected endpoints', async () => {
+    const request = {
+      headers: { authorization: 'Bearer token' },
+      method: 'GET',
+      originalUrl: '/api/delivery-rider/me',
+    } as Partial<Request>;
+    const jwt = {
+      verify: jest.fn().mockResolvedValue({
+        sub: 'driver-1',
+        app_metadata: {
+          role: 'driver',
+          status: 'Pending',
+          branch_ids: [firstBranchId],
+        },
+      }),
+    } as unknown as SupabaseJwtService;
+    const branches = { find: jest.fn() } as unknown as Repository<Branch>;
+    const reflector = {
+      getAllAndOverride: jest.fn().mockReturnValue(false),
+    } as unknown as Reflector;
+    const guard = new AuthGuard(jwt, reflector, branches);
+
+    await expect(guard.canActivate(contextFor(request))).rejects.toBeInstanceOf(
+      ForbiddenException,
+    );
+  });
 });

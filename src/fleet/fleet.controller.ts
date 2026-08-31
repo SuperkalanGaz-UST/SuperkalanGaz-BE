@@ -24,7 +24,12 @@ export class FleetController {
     @Query() query: ListRidersQuery,
   ): Promise<{ riders: ReturnType<FleetController['toRow']>[] }> {
     const rows = await this.fleet.listForBranch(principal, query);
-    return { riders: rows.map((r) => this.toRow(r)) };
+    return {
+      riders: rows.map((r) => ({
+        ...this.toRow(r),
+        operational_location: this.fleet.operationalLocationFor(r),
+      })),
+    };
   }
 
   @Get(':id')
@@ -41,7 +46,10 @@ export class FleetController {
     return { rider: this.toRow(rider) };
   }
 
-  /** Snake_case response row, matching the precedent in UsersController.toRow. */
+  /**
+   * Customer-safe row. Operational phone coordinates are added only by the
+   * Branch Manager list handler above and never by this shared detail mapper.
+   */
   private toRow(rider: Rider) {
     return {
       id: rider.id,

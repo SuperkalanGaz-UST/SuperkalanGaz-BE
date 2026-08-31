@@ -12,16 +12,21 @@ import {
 } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
-import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
+import {
+  AllowPendingInvitation,
+  CurrentPrincipal,
+  Roles,
+} from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { DeliveryRiderInvitationsService } from './delivery-rider-invitations.service';
 import { CreateDeliveryRiderInvitationDto } from './dto/create-delivery-rider-invitation.dto';
 import {
   CreateDeliveryRiderAccountDto,
+  CreateDeliveryRiderSessionAccountDto,
   DeliveryRiderInvitationTokenDto,
   ListDeliveryRiderInvitationsQuery,
   RevokeDeliveryRiderInvitationDto,
-  VerifyDeliveryRiderMobileDto,
+  VerifyDeliveryRiderSessionMobileDto,
 } from './dto/delivery-rider-invitation.dto';
 
 @Controller('delivery-rider-invitations')
@@ -41,24 +46,87 @@ export class DeliveryRiderInvitationsController {
     return { message: 'Delivery Rider account password created' };
   }
 
-  @Post('mobile-code')
-  @HttpCode(200)
-  async mobileCode(@Body() dto: DeliveryRiderInvitationTokenDto) {
-    await this.invitations.sendMobileCode(dto.token);
-    return { message: 'Verification code sent' };
-  }
-
-  @Post('verify-mobile')
-  @HttpCode(200)
-  async verifyMobile(@Body() dto: VerifyDeliveryRiderMobileDto) {
-    await this.invitations.verifyMobile(dto.token, dto.code);
-    return { message: 'Mobile number verified' };
-  }
-
   @Post('accept')
   @HttpCode(200)
   async accept(@Body() dto: DeliveryRiderInvitationTokenDto) {
     await this.invitations.accept(dto.token);
+    return { message: 'Delivery Rider account activated' };
+  }
+
+  /** Mirrors FA web registration after Supabase verifies the invitation email. */
+  @Get('session/acceptance')
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles('driver')
+  @AllowPendingInvitation()
+  async sessionAcceptance(@CurrentPrincipal() principal: Principal) {
+    return this.invitations.acceptanceForSession(principal);
+  }
+
+  @Post('session/account')
+  @HttpCode(200)
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles('driver')
+  @AllowPendingInvitation()
+  async createSessionAccount(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: CreateDeliveryRiderSessionAccountDto,
+  ) {
+    await this.invitations.createAccountForSession(principal, dto.password);
+    return { message: 'Delivery Rider account password created' };
+  }
+
+  @Post('session/mobile-code')
+  @HttpCode(200)
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles('driver')
+  @AllowPendingInvitation()
+  async sessionMobileCode(@CurrentPrincipal() principal: Principal) {
+    await this.invitations.sendMobileCodeForSession(principal);
+    return { message: 'Verification code sent' };
+  }
+
+  @Get('session/mobile-verification')
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles('driver')
+  @AllowPendingInvitation()
+  async sessionMobileVerification(@CurrentPrincipal() principal: Principal) {
+    return this.invitations.mobileVerificationForSession(principal);
+  }
+
+  @Post('session/verify-mobile')
+  @HttpCode(200)
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles('driver')
+  @AllowPendingInvitation()
+  async verifySessionMobile(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: VerifyDeliveryRiderSessionMobileDto,
+  ) {
+    await this.invitations.verifyMobileForSession(principal, dto.code);
+    return { message: 'Mobile number verified and Delivery Rider account activated' };
+  }
+
+  @Post('session/complete-placeholder-mobile-verification')
+  @HttpCode(200)
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles('driver')
+  @AllowPendingInvitation()
+  async completePlaceholderMobileVerification(
+    @CurrentPrincipal() principal: Principal,
+  ) {
+    await this.invitations.completePlaceholderMobileVerificationForSession(principal);
+    return {
+      message: 'Temporary mobile verification placeholder completed',
+    };
+  }
+
+  @Post('session/accept')
+  @HttpCode(200)
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles('driver')
+  @AllowPendingInvitation()
+  async acceptSession(@CurrentPrincipal() principal: Principal) {
+    await this.invitations.acceptForSession(principal);
     return { message: 'Delivery Rider account activated' };
   }
 

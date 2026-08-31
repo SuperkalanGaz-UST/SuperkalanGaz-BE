@@ -4,6 +4,7 @@ import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { SetDeliveryRiderAvailabilityDto } from './dto/delivery-rider-invitation.dto';
+import { UpdateDeliveryRiderLocationDto } from './dto/update-delivery-rider-location.dto';
 import { FleetService } from './fleet.service';
 
 @Controller('delivery-rider')
@@ -24,5 +25,13 @@ export class DeliveryRiderController {
   ) {
     await this.fleet.setDeliveryRiderAvailability(principal, dto.available);
     return this.fleet.deliveryRiderDashboard(principal);
+  }
+
+  @Post('location')
+  async location(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: UpdateDeliveryRiderLocationDto,
+  ) {
+    return this.fleet.updateDeliveryRiderOperationalLocation(principal, dto);
   }
 }

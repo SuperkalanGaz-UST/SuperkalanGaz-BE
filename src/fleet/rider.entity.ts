@@ -21,9 +21,10 @@ export const RIDER_STATUSES: readonly RiderStatus[] = [
 
 /**
  * Maps fleet.riders — one row per Delivery Rider a branch can dispatch to. The
- * planned Delivery Rider mobile experience handles invitation acceptance,
- * availability, offer acceptance, and milestones; it does not supply authoritative
- * GPS. Live tracking remains SinoTrack ST-901 → Traccar and is deferred in this slice.
+ * Delivery Rider mobile experience handles invitation acceptance, availability,
+ * offer acceptance, milestones, and foreground operational phone location. These
+ * phone coordinates support dispatch only; authoritative vehicle location remains
+ * SinoTrack ST-901 → Traccar for Fleet geofencing and PMS.
  * Invitation acceptance creates new roster rows as Offline and unassigned.
  * Soft delete only (AGENTS.md §3.2): deleted_at marks a Delivery Rider retired;
  * this API never hard-deletes.
@@ -51,6 +52,23 @@ export class Rider {
 
   @Column({ type: 'text', default: 'Available' })
   status!: RiderStatus;
+
+  /** Latest foreground phone position for Service Request and dispatch operations.
+   * These fields are deliberately separate from vehicle/Traccar telemetry. */
+  @Column({ name: 'operational_latitude', type: 'double precision', nullable: true })
+  operationalLatitude!: number | null;
+
+  @Column({ name: 'operational_longitude', type: 'double precision', nullable: true })
+  operationalLongitude!: number | null;
+
+  @Column({ name: 'operational_accuracy_m', type: 'real', nullable: true })
+  operationalAccuracyM!: number | null;
+
+  @Column({ name: 'operational_location_captured_at', type: 'timestamptz', nullable: true })
+  operationalLocationCapturedAt!: Date | null;
+
+  @Column({ name: 'operational_location_received_at', type: 'timestamptz', nullable: true })
+  operationalLocationReceivedAt!: Date | null;
 
   @Column({ name: 'created_at', type: 'timestamptz' })
   createdAt!: Date;

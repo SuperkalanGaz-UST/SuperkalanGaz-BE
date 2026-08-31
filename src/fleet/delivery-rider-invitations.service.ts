@@ -4,6 +4,7 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -28,8 +29,11 @@ const META = {
   revokedAt: 'delivery_rider_invitation_revoked_at',
   accountCreatedAt: 'delivery_rider_account_created_at',
   mobileVerifiedAt: 'delivery_rider_mobile_verified_at',
+  mobileVerificationMethod: 'delivery_rider_mobile_verification_method',
   acceptedAt: 'delivery_rider_invitation_accepted_at',
 } as const;
+
+export type DeliveryRiderMobileVerificationMode = 'sms' | 'placeholder';
 
 export type DeliveryRiderInvitationStatus =
   | 'Pending'
@@ -51,6 +55,11 @@ export interface DeliveryRiderInvitationView {
   emailVerified: boolean;
   accountCreated: boolean;
   mobileVerified: boolean;
+}
+
+export interface DeliveryRiderMobileVerificationView
+  extends DeliveryRiderInvitationView {
+  verificationMode: DeliveryRiderMobileVerificationMode;
 }
 
 function metadataString(user: GoTrueUser, key: string): string | null {
@@ -216,7 +225,7 @@ export class DeliveryRiderInvitationsService {
         recipientName: metadataString(current, 'display_name') ?? current.email,
       });
     }
-    if (current.app_metadata.status === 'Active') {
+    if (this.statusFor(current) === 'Accepted') {
       throw new ConflictException('This invitation has already been accepted');
     }
     if (isEmailVerified(current)) {
@@ -276,7 +285,7 @@ export class DeliveryRiderInvitationsService {
     if (current.app_metadata.status === 'Revoked') {
       throw new ConflictException('This invitation has already been revoked');
     }
-    if (current.app_metadata.status === 'Active') {
+    if (this.statusFor(current) === 'Accepted') {
       throw new ConflictException('An accepted invitation cannot be revoked');
     }
     const revokedAt = new Date().toISOString();
@@ -317,6 +326,94 @@ export class DeliveryRiderInvitationsService {
 
   async createAccount(token: string, password: string): Promise<void> {
     const user = await this.liveInvitationForToken(token);
+    await this.createAccountForInvitation(user, password);
+  }
+
+  async acceptanceForSession(
+    principal: Principal,
+  ): Promise<DeliveryRiderInvitationView> {
+    const user = await this.liveInvitationForPrincipal(principal);
+    const branch = await this.requiredInvitationBranch(user);
+    return this.toView(user, branch.name);
+  }
+
+  async createAccountForSession(
+    principal: Principal,
+    password: string,
+  ): Promise<void> {
+    const user = await this.liveInvitationForPrincipal(principal);
+    await this.createAccountForInvitation(user, password);
+  }
+
+  async sendMobileCodeForSession(principal: Principal): Promise<void> {
+    const user = await this.acceptedAccountAwaitingMobileVerification(principal);
+    if (this.mobileVerificationMode() === 'placeholder') {
+      throw new ConflictException(
+        'SMS delivery is disabled while placeholder verification is active',
+      );
+    }
+    await this.sendMobileCodeForInvitation(user);
+  }
+
+  async mobileVerificationForSession(
+    principal: Principal,
+  ): Promise<DeliveryRiderMobileVerificationView> {
+    const user = await this.acceptedAccountAwaitingMobileVerification(principal);
+    const branch = await this.requiredInvitationBranch(user);
+    return {
+      ...this.toView(user, branch.name),
+      verificationMode: this.mobileVerificationMode(),
+    };
+  }
+
+  async verifyMobileForSession(principal: Principal, code: string): Promise<void> {
+    if (this.mobileVerificationMode() === 'placeholder') {
+      throw new ConflictException(
+        'Use the temporary placeholder action while SMS delivery is disabled',
+      );
+    }
+    const user = await this.acceptedAccountAwaitingMobileVerification(principal);
+    await this.verifyMobileForInvitation(user, code);
+    const verifiedUser = await this.goTrue.getUser(user.id);
+    if (!verifiedUser) {
+      throw new NotFoundException('Delivery Rider account not found');
+    }
+    await this.activateDeliveryRider(verifiedUser);
+  }
+
+  async completePlaceholderMobileVerificationForSession(
+    principal: Principal,
+  ): Promise<void> {
+    if (this.mobileVerificationMode() !== 'placeholder') {
+      throw new NotFoundException('Placeholder mobile verification is not available');
+    }
+    const user = await this.acceptedAccountAwaitingMobileVerification(principal);
+    const verifiedAt = new Date().toISOString();
+    await this.goTrue.updateUser(user.id, {
+      // Placeholder mode deliberately does not claim that Supabase verified the phone.
+      phone_confirm: false,
+      app_metadata: {
+        ...user.app_metadata,
+        [META.mobileVerifiedAt]: verifiedAt,
+        [META.mobileVerificationMethod]: 'placeholder',
+      },
+    });
+    const updatedUser = await this.goTrue.getUser(user.id);
+    if (!updatedUser) {
+      throw new NotFoundException('Delivery Rider account not found');
+    }
+    await this.activateDeliveryRider(updatedUser);
+  }
+
+  async acceptForSession(principal: Principal): Promise<void> {
+    const user = await this.liveInvitationForPrincipal(principal);
+    await this.acceptInvitationUser(user);
+  }
+
+  private async createAccountForInvitation(
+    user: GoTrueUser,
+    password: string,
+  ): Promise<void> {
     if (!isEmailVerified(user)) {
       throw new ForbiddenException('Open the verified email invitation before continuing');
     }
@@ -337,8 +434,7 @@ export class DeliveryRiderInvitationsService {
     });
   }
 
-  async sendMobileCode(token: string): Promise<void> {
-    const user = await this.liveInvitationForToken(token);
+  private async sendMobileCodeForInvitation(user: GoTrueUser): Promise<void> {
     if (!metadataString(user, META.accountCreatedAt)) {
       throw new ConflictException('Create the account password before verifying mobile');
     }
@@ -347,8 +443,10 @@ export class DeliveryRiderInvitationsService {
     await this.goTrue.requestPhoneOtp(phone);
   }
 
-  async verifyMobile(token: string, code: string): Promise<void> {
-    const user = await this.liveInvitationForToken(token);
+  private async verifyMobileForInvitation(
+    user: GoTrueUser,
+    code: string,
+  ): Promise<void> {
     if (!metadataString(user, META.accountCreatedAt)) {
       throw new ConflictException('Create the account password before verifying mobile');
     }
@@ -363,12 +461,17 @@ export class DeliveryRiderInvitationsService {
       app_metadata: {
         ...user.app_metadata,
         [META.mobileVerifiedAt]: new Date().toISOString(),
+        [META.mobileVerificationMethod]: 'sms',
       },
     });
   }
 
   async accept(token: string): Promise<void> {
     const tokenUser = await this.liveInvitationForToken(token);
+    await this.acceptInvitationUser(tokenUser);
+  }
+
+  private async acceptInvitationUser(tokenUser: GoTrueUser): Promise<void> {
     const user = await this.goTrue.getUser(tokenUser.id);
     if (!user || !isEmailVerified(user)) {
       throw new ForbiddenException('The invitation email has not been verified');
@@ -376,8 +479,51 @@ export class DeliveryRiderInvitationsService {
     if (!metadataString(user, META.accountCreatedAt)) {
       throw new ConflictException('Create the account password before accepting');
     }
+    const branch = await this.requiredInvitationBranch(user);
+    const now = new Date();
+    const acceptedAt = now.toISOString();
+    const appMetadata = {
+      ...user.app_metadata,
+      status: 'Pending',
+      [META.acceptedAt]: acceptedAt,
+    };
+    await this.goTrue.updateUser(user.id, { app_metadata: appMetadata });
+    await this.audit.record({
+      category: 'security',
+      action: 'delivery-rider-invitation-accepted',
+      actor: {
+        userId: user.id,
+        role: 'driver',
+        displayName: metadataString(user, 'display_name'),
+        username: metadataString(user, 'username'),
+        email: user.email,
+      },
+      affectedRecordType: 'delivery-rider-invitation',
+      affectedRecordId: user.id,
+      branchId: branch.id,
+      beforeState: { status: 'Pending' },
+      afterState: {
+        status: 'Accepted',
+        mobileVerification: metadataString(user, META.mobileVerifiedAt)
+          ? 'Verified'
+          : 'Pending',
+        invitedBy: metadataString(user, META.invitedBy),
+      },
+    });
+
+    // Existing mobile-first attempts may already have verified the number.
+    // New web registrations always finish this activation step in the app.
+    if (metadataString(user, META.mobileVerifiedAt)) {
+      await this.activateDeliveryRider({ ...user, app_metadata: appMetadata });
+    }
+  }
+
+  private async activateDeliveryRider(user: GoTrueUser): Promise<void> {
+    if (!metadataString(user, META.acceptedAt)) {
+      throw new ConflictException('Accept the invitation on the website first');
+    }
     if (!metadataString(user, META.mobileVerifiedAt)) {
-      throw new ConflictException('Verify the invitation mobile number before accepting');
+      throw new ConflictException('Verify the invitation mobile number first');
     }
     const branch = await this.requiredInvitationBranch(user);
     const now = new Date();
@@ -399,21 +545,21 @@ export class DeliveryRiderInvitationsService {
         error instanceof QueryFailedError &&
         (error as { code?: string }).code === '23505'
       ) {
-        throw new ConflictException('This invitation is already being accepted');
+        throw new ConflictException('This Delivery Rider account is already being activated');
       }
       throw error;
     }
 
-    const acceptedAt = now.toISOString();
     const appMetadata = {
       ...user.app_metadata,
       status: 'Active',
-      [META.acceptedAt]: acceptedAt,
     };
+    const mobileVerificationMethod =
+      metadataString(user, META.mobileVerificationMethod) ?? 'sms';
     await this.goTrue.updateUser(user.id, { app_metadata: appMetadata });
     await this.audit.record({
       category: 'security',
-      action: 'delivery-rider-invitation-accepted',
+      action: 'delivery-rider-account-activated',
       actor: {
         userId: user.id,
         role: 'driver',
@@ -424,14 +570,35 @@ export class DeliveryRiderInvitationsService {
       affectedRecordType: 'delivery-rider-account',
       affectedRecordId: user.id,
       branchId: branch.id,
-      beforeState: { status: 'Pending' },
+      beforeState: {
+        status: 'Pending',
+        mobileVerification:
+          mobileVerificationMethod === 'placeholder' ? 'Placeholder' : 'Verified',
+      },
       afterState: {
         status: 'Active',
+        mobileVerificationMethod,
         rosterId: saved.id,
         availability: 'Offline',
         invitedBy: metadataString(user, META.invitedBy),
       },
     });
+  }
+
+  private mobileVerificationMode(): DeliveryRiderMobileVerificationMode {
+    const requested = this.config
+      .get<string>('DELIVERY_RIDER_MOBILE_VERIFICATION_MODE')
+      ?.trim()
+      .toLowerCase();
+    if (requested !== 'placeholder') return 'sms';
+
+    const environment = this.config.get<string>('NODE_ENV')?.trim().toLowerCase();
+    if (environment !== 'development' && environment !== 'test') {
+      throw new ServiceUnavailableException(
+        'Placeholder mobile verification is available only in development or test',
+      );
+    }
+    return 'placeholder';
   }
 
   private async requireManagedInvitation(
@@ -562,6 +729,41 @@ export class DeliveryRiderInvitationsService {
       const stored = metadataString(candidate, META.tokenHash);
       return stored ? this.sameDigest(stored, digest) : false;
     });
+    return this.requireLiveInvitation(user ?? null);
+  }
+
+  private async liveInvitationForPrincipal(principal: Principal): Promise<GoTrueUser> {
+    if (principal.role !== 'driver' || principal.status !== 'Pending') {
+      throw new ForbiddenException('A pending Delivery Rider invitation is required');
+    }
+    const user = await this.goTrue.getUser(principal.userId);
+    return this.requireLiveInvitation(user);
+  }
+
+  private async acceptedAccountAwaitingMobileVerification(
+    principal: Principal,
+  ): Promise<GoTrueUser> {
+    if (principal.role !== 'driver' || principal.status !== 'Pending') {
+      throw new ForbiddenException('A pending Delivery Rider account is required');
+    }
+    const user = await this.goTrue.getUser(principal.userId);
+    if (
+      !user ||
+      !this.isDeliveryRiderInvitation(user) ||
+      user.app_metadata.status !== 'Pending' ||
+      metadataString(user, META.revokedAt) ||
+      !metadataString(user, META.accountCreatedAt) ||
+      !metadataString(user, META.acceptedAt) ||
+      metadataString(user, META.mobileVerifiedAt)
+    ) {
+      throw new ForbiddenException(
+        'This account is not awaiting Delivery Rider mobile verification',
+      );
+    }
+    return user;
+  }
+
+  private requireLiveInvitation(user: GoTrueUser | null): GoTrueUser {
     if (
       !user ||
       !this.isDeliveryRiderInvitation(user) ||

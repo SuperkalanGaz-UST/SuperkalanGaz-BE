@@ -94,6 +94,13 @@ describe('FleetService', () => {
     branchIds,
   });
 
+  const driverPrincipal = (branchIds: string[]): Principal => ({
+    userId: 'driver-user-1',
+    role: 'driver',
+    branches: ['Alpha'],
+    branchIds,
+  });
+
   it('scopes the roster to the caller branches and excludes soft-deleted rows', async () => {
     const repo = makeRiderRepo();
     const service = makeService(repo);
@@ -126,6 +133,99 @@ describe('FleetService', () => {
       service.listForBranch(principal([]), {}),
     ).rejects.toBeInstanceOf(ForbiddenException);
     expect(repo.find).not.toHaveBeenCalled();
+  });
+
+  it('stores foreground phone location for the authenticated rider in their sole branch', async () => {
+    const repo = makeRiderRepo();
+    repo.findOne.mockResolvedValueOnce({
+      id: 'rider-1',
+      authUserId: 'driver-user-1',
+      branchId: 'branch-uuid-1',
+      status: 'Available',
+      deletedAt: null,
+    } as Rider);
+    const service = makeService(repo);
+    const capturedAt = new Date().toISOString();
+
+    const result = await service.updateDeliveryRiderOperationalLocation(
+      driverPrincipal(['branch-uuid-1']),
+      {
+        latitude: 14.5995,
+        longitude: 120.9842,
+        accuracyM: 8.5,
+        capturedAt,
+      },
+    );
+
+    expect(repo.findOne).toHaveBeenCalledWith({
+      where: expect.objectContaining({
+        authUserId: 'driver-user-1',
+        branchId: 'branch-uuid-1',
+      }),
+    });
+    const [criteria, patch] = repo.update.mock.calls[0];
+    expect(criteria).toEqual(expect.objectContaining({
+      id: 'rider-1',
+      branchId: 'branch-uuid-1',
+      status: 'Available',
+    }));
+    expect(patch).toEqual(expect.objectContaining({
+      operationalLatitude: 14.5995,
+      operationalLongitude: 120.9842,
+      operationalAccuracyM: 8.5,
+      operationalLocationCapturedAt: new Date(capturedAt),
+    }));
+    expect(result.recorded).toBe(true);
+    expect(result.receivedAt).toBeInstanceOf(Date);
+  });
+
+  it('rejects phone location while the rider is Offline', async () => {
+    const repo = makeRiderRepo();
+    repo.findOne.mockResolvedValueOnce({
+      id: 'rider-1',
+      authUserId: 'driver-user-1',
+      branchId: 'branch-uuid-1',
+      status: 'Offline',
+      deletedAt: null,
+    } as Rider);
+    const service = makeService(repo);
+
+    await expect(service.updateDeliveryRiderOperationalLocation(
+      driverPrincipal(['branch-uuid-1']),
+      {
+        latitude: 14.5995,
+        longitude: 120.9842,
+        accuracyM: 8.5,
+        capturedAt: new Date().toISOString(),
+      },
+    )).rejects.toBeInstanceOf(ConflictException);
+    expect(repo.update).not.toHaveBeenCalled();
+  });
+
+  it('clears dispatch-facing phone location when the rider goes Offline', async () => {
+    const repo = makeRiderRepo();
+    repo.findOne.mockResolvedValueOnce({
+      id: 'rider-1',
+      authUserId: 'driver-user-1',
+      branchId: 'branch-uuid-1',
+      status: 'Available',
+      deletedAt: null,
+    } as Rider);
+    const service = makeService(repo);
+
+    await service.setDeliveryRiderAvailability(
+      driverPrincipal(['branch-uuid-1']),
+      false,
+    );
+
+    const [, patch] = repo.update.mock.calls[0];
+    expect(patch).toEqual(expect.objectContaining({
+      status: 'Offline',
+      operationalLatitude: null,
+      operationalLongitude: null,
+      operationalLocationCapturedAt: null,
+      operationalLocationReceivedAt: null,
+    }));
   });
 
   it('looks up an assignable rider by id, branch, Available status, and live row', async () => {

@@ -67,8 +67,10 @@ Sections below are tagged `[api]`, `[web]`, `[mobile]`, or `[all]` where they ap
   API only supplies CRM-owned coordinates/geofences. Geocoding is not currently
   implemented and must be treated as a separate future decision.
 - **Mobile:** React Native + Expo (Customer and Delivery Rider role-gated experiences).
-- **GPS:** **SinoTrack ST-901** hardware devices → **Traccar** (self-hosted middleware) →
-  ingested by the API. These are two distinct things; never conflate them (§10).
+- **GPS has two separate sources.** SinoTrack ST-901 → Traccar → API is authoritative
+  vehicle telemetry for Fleet geofencing and PMS. Delivery Rider phone GPS → Expo app →
+  branch-scoped NestJS API supplies foreground operational location for Service Request
+  and dispatch workflows. Never conflate the sources (§10).
 - **Edge:** NGINX reverse proxy in front of the API.
 - **Architecture style:** **Modular monolith** using NestJS's native module system.
   **No microservices.** RESTful, 3-tier.
@@ -185,12 +187,16 @@ Hard constraints:
   person's verified identity; the API binds a single-use, expiring invitation to the
   server-validated active branch selected from the Owner's JWT-derived `branch_ids`. The
   invitee sets their own password.
-- **Delivery Rider web access is registration-only.** The same API invitation state machine
-  may be called by the dedicated token-gated web page or mobile flow. Web activation must end
-  with an app handoff and must never authorize a Delivery Rider web operations dashboard.
-- **Invitation acceptance is the authorization.** After identity verification, only the API
-  writes protected `driver`, invitation-bound `branch_id`, and active claims to
-  `app_metadata`. No Branch Manager approval or applicant-selected branch is allowed.
+- **Delivery Rider web access is registration-only.** The token-gated web page reviews the
+  invitation, creates the password, and records final invitation acceptance before handing
+  off to the app. PH mobile verification happens only after app sign-in, and web must never
+  authorize a Delivery Rider operations dashboard.
+  Pending-session endpoints may accept only a verified `driver` JWT on handlers explicitly
+  marked for invitation activation; every normal protected endpoint must still reject it.
+- **Invitation acceptance is the authorization.** Website acceptance consumes the invitation
+  while status remains pending. After app-based PH mobile verification, only the API writes
+  active status and creates the branch-scoped `Offline`, unassigned Fleet roster entry. No
+  Branch Manager approval or applicant-selected branch is allowed.
 - **Customers see delivery status milestones only — never live GPS coordinates.**
 
 ---
@@ -216,12 +222,11 @@ Hard constraints:
 3. **Loyalty Program Monitoring (LPM)** — see §8a. Two **separate** tracks; never merge.
 4. **CSAT Feedback & Analytics** — post-delivery star ratings, complaint (Incident) logging,
    average response-time tracking.
-5. **Fleet Management** — Delivery Rider roster and vehicle assignment plus GPS via SinoTrack
-   ST-901 → Traccar → API. Delivery Riders may register through the invitation-authorized web
-   or mobile flow, but use the role-gated mobile experience for availability, offer acceptance,
-   and delivery milestones. The phone is not the
-   authoritative GPS source; live coordinates still come from SinoTrack ST-901 through
-   Traccar. Hardware-dependent live GPS may be sprint-deferred — check the current sprint.
+5. **Fleet Management** — Delivery Rider roster, vehicle assignment, geofencing, and PMS.
+   SinoTrack ST-901 → Traccar → API is authoritative for vehicle geofencing and PMS.
+   Separately, the Delivery Rider app submits foreground phone location while Available or
+   On Delivery for Service Request and dispatch operations. Store and return those coordinates
+   separately; never use them as vehicle telemetry or expose them to customers.
 
 ### 8a. Loyalty Program Rules `[api] [web]`
 
@@ -245,16 +250,15 @@ Shared workflow:
 1. The Branch Owner issues a single-use, expiring invitation bound by the API to a verified
    identity and the server-validated active branch selected from the Owner's JWT-derived
    `branch_ids`.
-2. The invitee selects **Register as Delivery Rider** in the dedicated web page or mobile
-   flow, verifies the invited email and PH mobile identity, and sets their own password; the
-   branch is not editable.
+2. The invitee uses the dedicated web page to review the locked invitation and create their
+   password after email verification.
 3. The API rejects mismatched, expired, revoked, used, or replayed invitations without
    exposing branch data.
-4. Successful acceptance consumes the invitation and writes protected `driver`, branch,
-   and active claims to `app_metadata`, with immutable audit attribution to the Owner.
-5. Web registration ends with a mobile-app handoff. The Delivery Rider appears Offline and
-   unassigned. The Branch Manager manages vehicle readiness but cannot authorize identity,
-   branch membership, or role claims.
+4. Website acceptance consumes the invitation and records immutable attribution to the Owner
+   while the protected Delivery Rider account remains pending.
+5. After app sign-in, the rider verifies the invitation-bound PH mobile number. The API then
+   activates protected claims and creates the `Offline`, unassigned Fleet roster entry. The
+   Branch Manager manages vehicle readiness but cannot authorize identity or membership.
 
 ---
 
@@ -332,8 +336,11 @@ propose an in-scope alternative.
 
 ### `[mobile]`
 - Expo with separate, role-gated Customer and Delivery Rider navigation. No SA/FA/BO/BM screens.
-- Customers see **delivery status milestones only**. Delivery Rider actions never replace
-  SinoTrack ST-901/Traccar as the authoritative source of live vehicle coordinates.
+- The phone-location endpoint derives Delivery Rider identity and the single `branch_id` from
+  the verified JWT, accepts updates only while Available or On Delivery, prevents older
+  samples from replacing newer ones, and clears operational location on Offline/maintenance.
+- Customers see **delivery status milestones only** and never receive phone or vehicle
+  coordinates. SinoTrack ST-901/Traccar remains authoritative for vehicle geofencing and PMS.
 
 ---
 

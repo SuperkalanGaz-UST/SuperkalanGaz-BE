@@ -28,7 +28,14 @@ export class CreateDeliveryRiderAccountDto extends DeliveryRiderInvitationTokenD
   password!: string;
 }
 
-export class VerifyDeliveryRiderMobileDto extends DeliveryRiderInvitationTokenDto {
+export class CreateDeliveryRiderSessionAccountDto {
+  @IsString()
+  @MinLength(8)
+  @MaxLength(72)
+  password!: string;
+}
+
+export class VerifyDeliveryRiderSessionMobileDto {
   @Matches(/^\d{6}$/, { message: 'Enter the 6-digit verification code' })
   code!: string;
 }

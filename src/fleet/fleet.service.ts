@@ -6,12 +6,13 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, IsNull, LessThanOrEqual, QueryFailedError, Repository } from 'typeorm';
+import { In, IsNull, LessThanOrEqual, QueryFailedError, Raw, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
 import { CreateVehicleDto } from './dto/create-vehicle.dto';
 import { ListRidersQuery } from './dto/list-riders.query';
 import { LogMileageDto } from './dto/log-mileage.dto';
+import { UpdateDeliveryRiderLocationDto } from './dto/update-delivery-rider-location.dto';
 import { Rider } from './rider.entity';
 import { Vehicle } from './vehicle.entity';
 import { VehicleMaintenanceLog } from './vehicle-maintenance-log.entity';
@@ -88,6 +89,7 @@ export class FleetService {
         mobile: principal.phone ?? '',
         branchName: principal.branches[0] ?? '',
         availability: rider.status,
+        operationalLocation: this.operationalLocationFor(rider),
         vehicle: vehicle
           ? {
               id: vehicle.id,
@@ -131,8 +133,70 @@ export class FleetService {
     }
     await this.riders.update(
       { id: rider.id, branchId },
-      { status: available ? 'Available' : 'Offline', updatedAt: new Date() },
+      {
+        status: available ? 'Available' : 'Offline',
+        updatedAt: new Date(),
+        ...(!available ? this.emptyOperationalLocation() : {}),
+      },
     );
+  }
+
+  /**
+   * Store the authenticated Delivery Rider's latest foreground phone position.
+   * The server derives both rider identity and branch from protected JWT claims;
+   * coordinates never select or widen tenant scope. Offline and maintenance-
+   * blocked riders cannot publish operational location.
+   */
+  async updateDeliveryRiderOperationalLocation(
+    principal: Principal,
+    dto: UpdateDeliveryRiderLocationDto,
+  ): Promise<{ recorded: boolean; receivedAt: Date | null }> {
+    const branchId = this.requireSingleBranch(principal);
+    const rider = await this.riders.findOne({
+      where: { authUserId: principal.userId, branchId, deletedAt: IsNull() },
+    });
+    if (!rider) throw new NotFoundException('Delivery Rider roster entry not found');
+    if (!['Available', 'On Delivery'].includes(rider.status)) {
+      throw new ConflictException(
+        'Operational location is accepted only while Available or On Delivery',
+      );
+    }
+
+    const capturedAt = new Date(dto.capturedAt);
+    const receivedAt = new Date();
+    if (capturedAt.getTime() > receivedAt.getTime() + 5 * 60_000) {
+      throw new BadRequestException('Location timestamp is too far in the future');
+    }
+    if (capturedAt.getTime() < receivedAt.getTime() - 15 * 60_000) {
+      throw new BadRequestException('Location timestamp is too old for dispatch');
+    }
+
+    const result = await this.riders.update(
+      {
+        id: rider.id,
+        branchId,
+        status: rider.status,
+        deletedAt: IsNull(),
+        operationalLocationCapturedAt: Raw(
+          (column) => `(${column} IS NULL OR ${column} <= :capturedAt)`,
+          { capturedAt },
+        ),
+      },
+      {
+        operationalLatitude: dto.latitude,
+        operationalLongitude: dto.longitude,
+        operationalAccuracyM: dto.accuracyM,
+        operationalLocationCapturedAt: capturedAt,
+        operationalLocationReceivedAt: receivedAt,
+        updatedAt: receivedAt,
+      },
+    );
+
+    // A newer sample or concurrent transition to Offline/Maintenance wins. The
+    // client can keep watching without treating that safe no-op as a failure.
+    return result.affected
+      ? { recorded: true, receivedAt }
+      : { recorded: false, receivedAt: null };
   }
 
   /**
@@ -212,6 +276,7 @@ export class FleetService {
       {
         status: dueForMaintenance ? 'Maintenance Due' : 'Available',
         updatedAt: new Date(),
+        ...(dueForMaintenance ? this.emptyOperationalLocation() : {}),
       },
     );
   }
@@ -439,7 +504,11 @@ export class FleetService {
     if (dueForMaintenance && vehicle.assignedRiderId) {
       await this.riders.update(
         { id: vehicle.assignedRiderId, status: 'Available' },
-        { status: 'Maintenance Due', updatedAt: now },
+        {
+          status: 'Maintenance Due',
+          updatedAt: now,
+          ...this.emptyOperationalLocation(),
+        },
       );
     }
 
@@ -515,6 +584,42 @@ export class FleetService {
     if (branchIds.length === 0) return new Map();
     const rows = await this.branches.find({ where: { id: In(branchIds) } });
     return new Map(rows.map((b) => [b.id, b.maintenanceThresholdKm]));
+  }
+
+  operationalLocationFor(rider: Rider) {
+    if (
+      typeof rider.operationalLatitude !== 'number' ||
+      typeof rider.operationalLongitude !== 'number' ||
+      !(rider.operationalLocationCapturedAt instanceof Date) ||
+      !(rider.operationalLocationReceivedAt instanceof Date)
+    ) {
+      return null;
+    }
+    return {
+      latitude: rider.operationalLatitude,
+      longitude: rider.operationalLongitude,
+      accuracyM: rider.operationalAccuracyM,
+      capturedAt: rider.operationalLocationCapturedAt,
+      receivedAt: rider.operationalLocationReceivedAt,
+      source: 'phone' as const,
+    };
+  }
+
+  private emptyOperationalLocation(): Pick<
+    Rider,
+    | 'operationalLatitude'
+    | 'operationalLongitude'
+    | 'operationalAccuracyM'
+    | 'operationalLocationCapturedAt'
+    | 'operationalLocationReceivedAt'
+  > {
+    return {
+      operationalLatitude: null,
+      operationalLongitude: null,
+      operationalAccuracyM: null,
+      operationalLocationCapturedAt: null,
+      operationalLocationReceivedAt: null,
+    };
   }
 
   /** The caller's active branch UUIDs; fails closed if they have none. */

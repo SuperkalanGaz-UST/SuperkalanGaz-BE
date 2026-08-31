@@ -71,3 +71,7 @@ the dedicated `/delivery-rider-invitation` web route (or the local custom scheme
 and add the corresponding path-scoped URL to Supabase Auth's redirect allow list.
 That route supports invitation-only web onboarding and ends with a mobile-app
 handoff; Delivery Rider operations remain mobile-only.
+If Supabase returns the verified invitation session to the web Site URL, the web
+client follows the same pending-session activation pattern used for Franchise
+Administrator invitations. Only explicitly decorated Delivery Rider onboarding
+endpoints accept the pending JWT.
