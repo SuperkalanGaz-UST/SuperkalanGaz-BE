@@ -17,10 +17,11 @@ import { UsersModule } from './users/users.module';
 import { GovernanceModule } from './governance/governance.module';
 
 /**
- * Modular monolith root (AGENTS.md §4). Supabase is used as managed Postgres ONLY:
- * we connect with a standard Postgres connection string + TypeORM. The Supabase
- * client SDK / PostgREST are deliberately absent — they would bypass the
- * branch-scoped guard system enforced in this application layer.
+ * Modular monolith root (AGENTS.md §4). Supabase PostgreSQL is accessed through
+ * a standard connection + TypeORM. The Supabase client SDK / PostgREST are
+ * deliberately absent — they would bypass the branch-scoped guard system. A
+ * temporary private Storage adapter is separately used by SRD for delivery
+ * proof bytes; it is server-only and never a domain-data access path.
  */
 @Module({
   imports: [

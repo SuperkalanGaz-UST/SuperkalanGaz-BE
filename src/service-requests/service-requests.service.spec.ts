@@ -16,7 +16,9 @@ import { LoyaltyService } from '../loyalty/loyalty.service';
 import { PricesService } from '../prices/prices.service';
 import { PayMongoService } from './paymongo.service';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
+import { PrivateObjectStorageService } from '../storage/private-object-storage.service';
 import { ServiceRequest } from './service-request.entity';
+import { ServiceRequestDeliveryProof } from './service-request-delivery-proof.entity';
 import { ServiceRequestStatusHistory } from './service-request-status-history.entity';
 import { SlaConfiguration } from './sla-configuration.entity';
 import { ServiceRequestsService } from './service-requests.service';
@@ -62,6 +64,7 @@ describe('ServiceRequestsService', () => {
     ({
       findAssignableRider: jest.fn(() => Promise.resolve(assignableRider)),
       findInBranch: jest.fn(() => Promise.resolve(currentRider)),
+      findByAuthUserInBranch: jest.fn(() => Promise.resolve(currentRider)),
       markOnDelivery: jest.fn(() => Promise.resolve()),
       markAvailable: jest.fn(() => Promise.resolve()),
     }) as unknown as jest.Mocked<FleetService>;
@@ -123,6 +126,24 @@ describe('ServiceRequestsService', () => {
       recordDeliveredPurchase: jest.fn(() => Promise.resolve()),
     }) as unknown as jest.Mocked<LoyaltyService>;
 
+  const makeProofRepo = (existing: ServiceRequestDeliveryProof | null = null) =>
+    ({
+      create: jest.fn((v: Partial<ServiceRequestDeliveryProof>) => v),
+      findOne: jest.fn(() => Promise.resolve(existing)),
+      save: jest.fn((v: ServiceRequestDeliveryProof) => Promise.resolve(v)),
+    }) as unknown as jest.Mocked<Repository<ServiceRequestDeliveryProof>>;
+
+  const makeProofStorage = () =>
+    ({
+      putObject: jest.fn(() => Promise.resolve({ path: 'branch-uuid-1/sr-1/proof.jpg' })),
+      getObject: jest.fn(() => Promise.resolve({
+        data: Buffer.from([0xff, 0xd8, 0xff]),
+        contentType: 'image/jpeg',
+        contentLength: 3,
+      })),
+      removeObject: jest.fn(() => Promise.resolve()),
+    }) as unknown as jest.Mocked<PrivateObjectStorageService>;
+
   // sla defaults to "no thresholds configured" so every pre-existing call site
   // (which only ever passed the first four args) is unaffected — appended at
   // the END of this helper's own params, even though the real constructor
@@ -135,6 +156,8 @@ describe('ServiceRequestsService', () => {
     sla: jest.Mocked<Repository<SlaConfiguration>> = makeSlaConfig(),
     branches: jest.Mocked<Repository<Branch>> = makeBranches(),
     loyalty: jest.Mocked<LoyaltyService> = makeLoyalty(),
+    proofs?: jest.Mocked<Repository<ServiceRequestDeliveryProof>>,
+    storage?: jest.Mocked<PrivateObjectStorageService>,
   ) => new ServiceRequestsService(
     repo,
     branches,
@@ -145,6 +168,8 @@ describe('ServiceRequestsService', () => {
     makePrices(),
     makePayMongo(),
     loyalty,
+    proofs,
+    storage,
   );
 
   const inBranchCustomer = (): Customer =>
@@ -153,6 +178,13 @@ describe('ServiceRequestsService', () => {
   const principal = (branchIds: string[]): Principal => ({
     userId: 'user-1',
     role: 'branch-manager',
+    branches: ['Alpha'],
+    branchIds,
+  });
+
+  const driverPrincipal = (branchIds: string[]): Principal => ({
+    userId: 'driver-user-1',
+    role: 'driver',
     branches: ['Alpha'],
     branchIds,
   });
@@ -516,6 +548,80 @@ describe('ServiceRequestsService', () => {
   });
 
   describe('deliver', () => {
+    it('requires, uploads, and commits one rider proof with delivery state', async () => {
+      const { repo, qb } = makeRepo(1);
+      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
+      const proofRepo = makeProofRepo();
+      const storage = makeProofStorage();
+      const transaction = jest.fn(async (callback: (manager: unknown) => Promise<number>) =>
+        callback({
+          createQueryBuilder: jest.fn(() => qb),
+          getRepository: jest.fn(() => proofRepo),
+        }),
+      );
+      (repo as unknown as { manager: { transaction: typeof transaction } }).manager = { transaction };
+      const fleet = makeFleet(availableRider());
+      const service = makeService(
+        repo,
+        makeHistory(),
+        fleet,
+        makeCim(null),
+        makeSlaConfig(),
+        makeBranches(),
+        makeLoyalty(),
+        proofRepo,
+        storage,
+      );
+      const proof = {
+        buffer: Buffer.from([0xff, 0xd8, 0xff, 0x01]),
+        originalname: 'handoff.jpg',
+        mimetype: 'image/jpeg',
+        size: 4,
+      };
+
+      const result = await service.deliver(driverPrincipal(['branch-uuid-1']), 'sr-1', proof);
+
+      expect(result.status).toBe('Delivered');
+      expect(storage.putObject).toHaveBeenCalledWith(
+        expect.stringMatching(/^branch-uuid-1\/sr-1\/.*\.jpg$/),
+        proof.buffer,
+        'image/jpeg',
+      );
+      expect(transaction).toHaveBeenCalledTimes(1);
+      expect(proofRepo.save).toHaveBeenCalledWith(expect.objectContaining({
+        serviceRequestId: 'sr-1',
+        branchId: 'branch-uuid-1',
+        riderId: 'rider-1',
+        storagePath: expect.stringMatching(/^branch-uuid-1\/sr-1\/.*\.jpg$/),
+        sha256: expect.any(String),
+      }));
+    });
+
+    it('does not complete a rider delivery without a proof photo', async () => {
+      const { repo, qb } = makeRepo(1);
+      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
+      const proofRepo = makeProofRepo();
+      const storage = makeProofStorage();
+      const fleet = makeFleet(availableRider());
+      const service = makeService(
+        repo,
+        makeHistory(),
+        fleet,
+        makeCim(null),
+        makeSlaConfig(),
+        makeBranches(),
+        makeLoyalty(),
+        proofRepo,
+        storage,
+      );
+
+      await expect(
+        service.deliver(driverPrincipal(['branch-uuid-1']), 'sr-1'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(qb.execute).not.toHaveBeenCalled();
+      expect(storage.putObject).not.toHaveBeenCalled();
+    });
+
     it('stamps delivery, closes the chain, and returns the rider to Available', async () => {
       const { repo, qb } = makeRepo(1);
       repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;

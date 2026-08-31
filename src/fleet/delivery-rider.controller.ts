@@ -1,4 +1,12 @@
-import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
@@ -33,5 +41,14 @@ export class DeliveryRiderController {
     @Body() dto: UpdateDeliveryRiderLocationDto,
   ) {
     return this.fleet.updateDeliveryRiderOperationalLocation(principal, dto);
+  }
+
+  @Post('service-requests/:id/in-transit')
+  async inTransit(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) serviceRequestId: string,
+  ) {
+    await this.fleet.markServiceRequestInTransit(principal, serviceRequestId);
+    return this.fleet.deliveryRiderDashboard(principal);
   }
 }

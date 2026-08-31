@@ -6,9 +6,18 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, IsNull, LessThanOrEqual, QueryFailedError, Raw, Repository } from 'typeorm';
+import {
+  In,
+  IsNull,
+  LessThanOrEqual,
+  Not,
+  QueryFailedError,
+  Raw,
+  Repository,
+} from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
+import { ServiceRequest } from '../service-requests/service-request.entity';
 import { ConnectVehicleGpsDto } from './dto/connect-vehicle-gps.dto';
 import { CreateVehicleDto } from './dto/create-vehicle.dto';
 import { ListRidersQuery } from './dto/list-riders.query';
@@ -43,6 +52,8 @@ export class FleetService {
     @InjectRepository(Branch)
     private readonly branches: Repository<Branch>,
     private readonly traccar: TraccarClient,
+    @InjectRepository(ServiceRequest)
+    private readonly serviceRequests: Repository<ServiceRequest>,
   ) {}
 
   /**
@@ -55,7 +66,7 @@ export class FleetService {
     principal: Principal,
     query: ListRidersQuery,
   ): Promise<Rider[]> {
-    const branchIds = this.requireBranches(principal);
+    const branchIds = this.scopedBranchIds(principal, query.branchId);
 
     return this.riders.find({
       where: {
@@ -65,6 +76,38 @@ export class FleetService {
       },
       order: { name: 'ASC' },
     });
+  }
+
+  /**
+   * Returns the currently dispatched Service Request code for each rider in a
+   * roster response. This is deliberately branch-scoped and only includes
+   * requests that are still in flight; historical activity is not stored in
+   * the Fleet module, so the web client must not manufacture it.
+   */
+  async currentOrdersForRiders(riders: Rider[]): Promise<Map<string, string>> {
+    if (riders.length === 0) return new Map();
+
+    const branchIds = [...new Set(riders.map((rider) => rider.branchId))];
+    const riderIds = riders.map((rider) => rider.id);
+    const requests = await this.serviceRequests.find({
+      where: {
+        branchId: In(branchIds),
+        riderId: In(riderIds),
+        status: In(['Dispatched', 'En Route']),
+        dispatchedAt: Not(IsNull()),
+        deliveredAt: IsNull(),
+        deletedAt: IsNull(),
+      },
+      order: { dispatchedAt: 'DESC' },
+    });
+
+    const currentOrders = new Map<string, string>();
+    for (const request of requests) {
+      if (request.riderId && !currentOrders.has(request.riderId)) {
+        currentOrders.set(request.riderId, request.srCode);
+      }
+    }
+    return currentOrders;
   }
 
   /** Minimal authoritative mobile workspace for an activated Delivery Rider. */
@@ -80,6 +123,20 @@ export class FleetService {
     if (!rider) throw new NotFoundException('Delivery Rider roster entry not found');
     const vehicle = await this.vehicles.findOne({
       where: { branchId, assignedRiderId: rider.id },
+    });
+    const activeServiceRequest = await this.serviceRequests.findOne({
+      where: {
+        branchId,
+        riderId: rider.id,
+        status: In(['Dispatched', 'En Route']),
+        dispatchedAt: Not(IsNull()),
+        deliveredAt: IsNull(),
+        deletedAt: IsNull(),
+      },
+      // A rider should have one active delivery. If legacy data temporarily
+      // violates that invariant, returning the newest dispatch is deterministic
+      // and keeps the rider's view branch-scoped.
+      order: { dispatchedAt: 'DESC' },
     });
 
     return {
@@ -101,8 +158,72 @@ export class FleetService {
           : null,
       },
       currentOffer: null,
-      activeDelivery: null,
+      activeDelivery: activeServiceRequest
+        ? {
+            serviceRequestId: activeServiceRequest.id,
+            srCode: activeServiceRequest.srCode,
+            customerName: activeServiceRequest.customerName,
+            deliveryAddress: activeServiceRequest.deliveryAddress,
+            cylinderSize: activeServiceRequest.cylinderSize,
+            quantity: activeServiceRequest.quantity,
+            vehicleLabel: vehicle?.plateNumber ?? 'Vehicle not assigned',
+            requestedAt: activeServiceRequest.requestedAt.toISOString(),
+            dispatchedAt: activeServiceRequest.dispatchedAt!.toISOString(),
+            inTransitAt: activeServiceRequest.inTransitAt?.toISOString() ?? null,
+          }
+        : null,
     };
+  }
+
+  /**
+   * Start the authenticated Delivery Rider's assigned Service Request. The
+   * rider identity and branch are derived from the verified principal; the
+   * Service Request id can only narrow that scope. The conditional update keeps
+   * two milestone requests from both winning the Dispatched → En Route change.
+   */
+  async markServiceRequestInTransit(
+    principal: Principal,
+    serviceRequestId: string,
+  ): Promise<void> {
+    const branchId = this.requireSingleBranch(principal);
+    const rider = await this.riders.findOne({
+      where: { authUserId: principal.userId, branchId, deletedAt: IsNull() },
+    });
+    if (!rider) throw new NotFoundException('Delivery Rider roster entry not found');
+    if (rider.status !== 'On Delivery') {
+      throw new ConflictException('Delivery Rider is not on an active delivery');
+    }
+
+    const now = new Date();
+    const result = await this.serviceRequests
+      .createQueryBuilder()
+      .update(ServiceRequest)
+      .set({
+        inTransitAt: now,
+        status: 'En Route',
+        updatedAt: now,
+      })
+      .where(
+        `id = :serviceRequestId
+          AND branch_id = :branchId
+          AND rider_id = :riderId
+          AND status = :status
+          AND dispatched_at IS NOT NULL
+          AND in_transit_at IS NULL
+          AND delivered_at IS NULL
+          AND deleted_at IS NULL`,
+        {
+          serviceRequestId,
+          branchId,
+          riderId: rider.id,
+          status: 'Dispatched',
+        },
+      )
+      .execute();
+
+    if (!result.affected) {
+      throw new ConflictException('Service Request is no longer ready to start');
+    }
   }
 
   /**
@@ -233,6 +354,18 @@ export class FleetService {
   async findInBranch(riderId: string, branchId: string): Promise<Rider | null> {
     return this.riders.findOne({
       where: { id: riderId, branchId, deletedAt: IsNull() },
+    });
+  }
+
+  /** Look up the live roster entry for an authenticated Delivery Rider in the
+   * already-authorized request branch. Used to protect rider milestone writes
+   * without trusting a rider id supplied by the mobile client. */
+  async findByAuthUserInBranch(
+    authUserId: string,
+    branchId: string,
+  ): Promise<Rider | null> {
+    return this.riders.findOne({
+      where: { authUserId, branchId, deletedAt: IsNull() },
     });
   }
 
@@ -689,6 +822,21 @@ export class FleetService {
       throw new ForbiddenException('Caller has no active branch');
     }
     return principal.branchIds;
+  }
+
+  /** A selected UUID can narrow the verified scope, never widen it. */
+  private scopedBranchIds(principal: Principal, requestedBranchId?: string): string[] {
+    const branchIds = this.requireBranches(principal);
+    if (!requestedBranchId) {
+      if (principal.role === 'branch-owner' && branchIds.length > 1) {
+        throw new ForbiddenException('Select an assigned branch before loading the roster');
+      }
+      return branchIds;
+    }
+    if (!branchIds.includes(requestedBranchId)) {
+      throw new ForbiddenException('Requested branch is outside the caller scope');
+    }
+    return [requestedBranchId];
   }
 
   /** A Branch Manager owns one branch. Fail closed if token metadata drifts. */

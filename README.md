@@ -9,7 +9,7 @@ before writing any code — branch scoping (`branch_id`) and soft-delete rules a
 ## Stack
 
 - **NestJS** + TypeScript (strict) — modular monolith, no microservices
-- **TypeORM** + **PostgreSQL** (Supabase as managed Postgres only — no Supabase SDK/PostgREST)
+- **TypeORM** + **PostgreSQL** (Supabase managed Postgres; temporary private Supabase Storage is server-only)
 - **NGINX** reverse proxy at the edge
 - GPS: SinoTrack ST-901 hardware → Traccar (self-hosted middleware) → this API
 
@@ -75,3 +75,15 @@ If Supabase returns the verified invitation session to the web Site URL, the web
 client follows the same pending-session activation pattern used for Franchise
 Administrator invitations. Only explicitly decorated Delivery Rider onboarding
 endpoints accept the pending JWT.
+
+## Temporary Proof of Delivery storage
+
+Create a private Supabase Storage bucket named `delivery-proofs` (or set
+`SUPABASE_STORAGE_BUCKET` to the approved bucket name). Public access must remain
+disabled. Apply `migrations/0033_create_service_request_delivery_proofs.sql`.
+
+The NestJS API uses the server-only `SUPABASE_SERVICE_ROLE_KEY` to upload and
+stream Proof of Delivery images after enforcing the caller's branch scope. The
+web and mobile clients never call Supabase Storage directly. This is a temporary
+provider decision so the storage adapter can later be replaced by another
+private object-storage provider without changing the domain or client APIs.

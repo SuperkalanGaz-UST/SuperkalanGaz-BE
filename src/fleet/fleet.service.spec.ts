@@ -2,6 +2,7 @@ import { ConflictException, ForbiddenException, NotFoundException } from '@nestj
 import { Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
+import { ServiceRequest } from '../service-requests/service-request.entity';
 import { FleetService } from './fleet.service';
 import { Rider } from './rider.entity';
 import { Vehicle } from './vehicle.entity';
@@ -68,6 +69,21 @@ describe('FleetService', () => {
       ),
     }) as unknown as jest.Mocked<Repository<Branch>>;
 
+  const makeServiceRequestRepo = (updateAffected = 1) => {
+    const execute = jest.fn(() => Promise.resolve({ affected: updateAffected }));
+    const qb = {
+      update: jest.fn().mockReturnThis(),
+      set: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      execute,
+    };
+    return {
+      findOne: jest.fn(() => Promise.resolve(null)),
+      createQueryBuilder: jest.fn(() => qb),
+      __qb: qb,
+    } as unknown as jest.Mocked<Repository<ServiceRequest>> & { __qb: typeof qb };
+  };
+
   const makeTraccar = () =>
     ({
       provisionDevice: jest.fn(() =>
@@ -85,11 +101,26 @@ describe('FleetService', () => {
     logRepo = makeLogRepo(),
     branchRepo = makeBranchRepo(),
     traccar = makeTraccar(),
-  ) => new FleetService(riderRepo, vehicleRepo, logRepo, branchRepo, traccar);
+    serviceRequestRepo = makeServiceRequestRepo(),
+  ) => new FleetService(
+    riderRepo,
+    vehicleRepo,
+    logRepo,
+    branchRepo,
+    traccar,
+    serviceRequestRepo,
+  );
 
   const principal = (branchIds: string[]): Principal => ({
     userId: 'user-1',
     role: 'branch-manager',
+    branches: ['Alpha'],
+    branchIds,
+  });
+
+  const branchOwnerPrincipal = (branchIds: string[]): Principal => ({
+    userId: 'owner-1',
+    role: 'branch-owner',
     branches: ['Alpha'],
     branchIds,
   });
@@ -99,6 +130,112 @@ describe('FleetService', () => {
     role: 'driver',
     branches: ['Alpha'],
     branchIds,
+  });
+
+  it('returns the rider assignment on the mobile dashboard after dispatch', async () => {
+    const riderRepo = makeRiderRepo();
+    riderRepo.findOne.mockResolvedValueOnce({
+      id: 'rider-1',
+      authUserId: 'driver-user-1',
+      branchId: 'branch-uuid-1',
+      name: 'Lily Cruz',
+      status: 'On Delivery',
+      deletedAt: null,
+    } as Rider);
+    const serviceRequestRepo = makeServiceRequestRepo();
+    const requestedAt = new Date('2026-09-01T06:00:00.000Z');
+    const dispatchedAt = new Date('2026-09-01T06:15:00.000Z');
+    const activeRequest = {
+      id: 'service-request-1',
+      srCode: 'SR-00001',
+      branchId: 'branch-uuid-1',
+      riderId: 'rider-1',
+      status: 'Dispatched',
+      customerName: 'Customer One',
+      deliveryAddress: 'Las Pinas 1',
+      cylinderSize: '11kg',
+      quantity: 2,
+      requestedAt,
+      dispatchedAt,
+      inTransitAt: null,
+      deliveredAt: null,
+      deletedAt: null,
+    } as ServiceRequest;
+    serviceRequestRepo.findOne.mockResolvedValueOnce(activeRequest);
+    const service = makeService(
+      riderRepo,
+      makeVehicleRepo(),
+      makeLogRepo(),
+      makeBranchRepo(),
+      makeTraccar(),
+      serviceRequestRepo,
+    );
+
+    const dashboard = await service.deliveryRiderDashboard(
+      driverPrincipal(['branch-uuid-1']),
+    );
+
+    expect(serviceRequestRepo.findOne).toHaveBeenCalledWith({
+      where: expect.objectContaining({
+        branchId: 'branch-uuid-1',
+        riderId: 'rider-1',
+        status: expect.anything(),
+        deliveredAt: expect.anything(),
+        deletedAt: expect.anything(),
+      }),
+      order: { dispatchedAt: 'DESC' },
+    });
+    expect(dashboard.activeDelivery).toEqual({
+      serviceRequestId: 'service-request-1',
+      srCode: 'SR-00001',
+      customerName: 'Customer One',
+      deliveryAddress: 'Las Pinas 1',
+      cylinderSize: '11kg',
+      quantity: 2,
+      vehicleLabel: 'NBH-1234',
+      requestedAt: requestedAt.toISOString(),
+      dispatchedAt: dispatchedAt.toISOString(),
+      inTransitAt: null,
+    });
+  });
+
+  it('moves the assigned Service Request to En Route for the authenticated rider', async () => {
+    const riderRepo = makeRiderRepo();
+    riderRepo.findOne.mockResolvedValueOnce({
+      id: 'rider-1',
+      authUserId: 'driver-user-1',
+      branchId: 'branch-uuid-1',
+      status: 'On Delivery',
+      deletedAt: null,
+    } as Rider);
+    const serviceRequestRepo = makeServiceRequestRepo();
+    const service = makeService(
+      riderRepo,
+      makeVehicleRepo(),
+      makeLogRepo(),
+      makeBranchRepo(),
+      makeTraccar(),
+      serviceRequestRepo,
+    );
+
+    await service.markServiceRequestInTransit(
+      driverPrincipal(['branch-uuid-1']),
+      'service-request-1',
+    );
+
+    expect(serviceRequestRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    expect(serviceRequestRepo.__qb.set).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'En Route', inTransitAt: expect.any(Date) }),
+    );
+    expect(serviceRequestRepo.__qb.where).toHaveBeenCalledWith(
+      expect.stringContaining('rider_id = :riderId'),
+      expect.objectContaining({
+        serviceRequestId: 'service-request-1',
+        branchId: 'branch-uuid-1',
+        riderId: 'rider-1',
+      }),
+    );
+    expect(serviceRequestRepo.__qb.execute).toHaveBeenCalledTimes(1);
   });
 
   it('scopes the roster to the caller branches and excludes soft-deleted rows', async () => {
@@ -123,6 +260,37 @@ describe('FleetService', () => {
 
     const where = repo.find.mock.calls[0][0]?.where as Record<string, unknown>;
     expect(where.status).toBe('Available');
+  });
+
+  it('requires and validates a selected branch when a Branch Owner has multiple branches', async () => {
+    const repo = makeRiderRepo();
+    const service = makeService(repo);
+
+    await expect(
+      service.listForBranch(branchOwnerPrincipal(['branch-uuid-1', 'branch-uuid-2']), {}),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    await expect(
+      service.listForBranch(
+        branchOwnerPrincipal(['branch-uuid-1', 'branch-uuid-2']),
+        { branchId: 'branch-uuid-3' },
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(repo.find).not.toHaveBeenCalled();
+  });
+
+  it('narrows a Branch Owner roster query to the selected authorized branch UUID', async () => {
+    const repo = makeRiderRepo();
+    const service = makeService(repo);
+
+    await service.listForBranch(
+      branchOwnerPrincipal(['branch-uuid-1', 'branch-uuid-2']),
+      { branchId: 'branch-uuid-2' },
+    );
+
+    const where = repo.find.mock.calls[0][0]?.where as Record<string, unknown>;
+    expect(where.branchId).toEqual(
+      expect.objectContaining({ _type: 'in', _value: ['branch-uuid-2'] }),
+    );
   });
 
   it('fails closed when the caller has no active branch', async () => {

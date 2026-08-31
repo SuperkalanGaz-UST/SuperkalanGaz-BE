@@ -2,11 +2,13 @@ import {
   Body,
   Controller,
   Get,
+  Header,
   Param,
   ParseUUIDPipe,
   Patch,
   Post,
   Query,
+  StreamableFile,
   UseGuards,
 } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
@@ -16,6 +18,7 @@ import { RolesGuard } from '../auth/roles.guard';
 import { BranchReportQuery } from '../common/dto/branch-report.query';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
 import { CreateCustomerServiceRequestDto } from './dto/create-customer-service-request.dto';
+import { DeliveryProofQuery } from './dto/delivery-proof.query';
 import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
 import { EditServiceRequestDto } from './dto/edit-service-request.dto';
 import { CancelServiceRequestDto } from './dto/cancel-service-request.dto';
@@ -103,6 +106,21 @@ export class ServiceRequestsController {
     return { serviceRequests: items.map((item) => this.toListRow(item)) };
   }
 
+  /** Branch-scoped completed records used by the staff Proof of Delivery
+   * viewer. This remains read-only for Branch Owners. */
+  @Get('delivery-records')
+  @Roles('branch-manager', 'branch-owner')
+  async deliveryRecords(
+    @CurrentPrincipal() principal: Principal,
+    @Query() query: DeliveryProofQuery,
+  ): Promise<{ serviceRequests: ReturnType<ServiceRequestsController['toRow']>[] }> {
+    const items = await this.serviceRequests.listDeliveryRecords(
+      principal,
+      query.branchId,
+    );
+    return { serviceRequests: items.map((item) => this.toRow(item)) };
+  }
+
   /** Branch Owner read-only Service Level Management analytics. */
   @Get('reports/sla')
   @Roles('branch-owner')
@@ -157,6 +175,33 @@ export class ServiceRequestsController {
   ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
     const row = await this.serviceRequests.findById(principal, id);
     return { serviceRequest: this.toRow(row) };
+  }
+
+  /**
+   * Staff-only Proof of Delivery read. The image is deliberately absent from
+   * list/detail JSON responses and is streamed only after an explicit user
+   * action. Branch Owner requests must include their selected branch UUID when
+   * they own multiple branches; the service validates it against JWT scope.
+   */
+  @Get(':id/delivery-proof')
+  @Roles('branch-manager', 'branch-owner')
+  @Header('Cache-Control', 'private, no-store')
+  @Header('X-Content-Type-Options', 'nosniff')
+  async deliveryProof(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: DeliveryProofQuery,
+  ): Promise<StreamableFile> {
+    const proof = await this.serviceRequests.downloadDeliveryProof(
+      principal,
+      id,
+      query.branchId,
+    );
+    return new StreamableFile(proof.data, {
+      type: proof.contentType,
+      length: proof.contentLength,
+      disposition: `inline; filename="${proof.fileName}"`,
+    });
   }
 
   @Post()
@@ -273,6 +318,7 @@ export class ServiceRequestsController {
   private toRow(sr: ServiceRequest) {
     return {
       id: sr.id,
+      sr_code: sr.srCode,
       branch_id: sr.branchId,
       order_source: sr.orderSource,
       status: sr.status,

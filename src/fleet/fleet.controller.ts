@@ -9,12 +9,14 @@ import { Rider } from './rider.entity';
 
 /**
  * Fleet roster (Fleet module). Dispatching riders is Branch Manager day-to-day
- * ops (AGENTS.md §7), and this list backs the dispatch dropdown, so only BM
- * reaches this handler. Scope comes from the verified Principal, never the client.
+ * ops (AGENTS.md §7). Branch Owners have read-only access to the same
+ * branch-scoped roster for their selected branch; operational phone location
+ * remains available only to Branch Managers. Scope comes from the verified
+ * Principal, never the client.
  */
 @Controller('riders')
 @UseGuards(AuthGuard, RolesGuard)
-@Roles('branch-manager')
+@Roles('branch-manager', 'branch-owner')
 export class FleetController {
   constructor(private readonly fleet: FleetService) {}
 
@@ -24,10 +26,14 @@ export class FleetController {
     @Query() query: ListRidersQuery,
   ): Promise<{ riders: ReturnType<FleetController['toRow']>[] }> {
     const rows = await this.fleet.listForBranch(principal, query);
+    const currentOrders = await this.fleet.currentOrdersForRiders(rows);
     return {
       riders: rows.map((r) => ({
         ...this.toRow(r),
-        operational_location: this.fleet.operationalLocationFor(r),
+        current_order: currentOrders.get(r.id) ?? null,
+        ...(principal.role === 'branch-manager'
+          ? { operational_location: this.fleet.operationalLocationFor(r) }
+          : {}),
       })),
     };
   }
@@ -58,6 +64,7 @@ export class FleetController {
       plate: rider.plate,
       status: rider.status,
       created_at: rider.createdAt,
+      updated_at: rider.updatedAt,
     };
   }
 }

@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from '../auth/auth.module';
 import { Branch } from '../branches/branch.entity';
 import { GovernanceModule } from '../governance/governance.module';
+import { ServiceRequest } from '../service-requests/service-request.entity';
 import { UsersModule } from '../users/users.module';
 import { DeliveryRiderInvitationsController } from './delivery-rider-invitations.controller';
 import { DeliveryRiderInvitationsService } from './delivery-rider-invitations.service';
@@ -23,7 +24,14 @@ import { TraccarClient } from './traccar/traccar.client';
  */
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Rider, Vehicle, VehicleMaintenanceLog, Branch]),
+    TypeOrmModule.forFeature([
+      Rider,
+      Vehicle,
+      VehicleMaintenanceLog,
+      Branch,
+      // Read-only dashboard lookup for the rider's assigned Service Request.
+      ServiceRequest,
+    ]),
     AuthModule,
     GovernanceModule,
     UsersModule,

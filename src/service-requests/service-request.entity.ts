@@ -40,6 +40,11 @@ export class ServiceRequest {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
 
+  /** Human-readable Service Request code, assigned by the database sequence
+   * (for example, SR-00001). The UUID above remains the internal identifier. */
+  @Column({ name: 'sr_code', type: 'text' })
+  srCode!: string;
+
   /** Tenancy handle — server-derived from the verified principal, never the
    * client. No FK by design (AGENTS.md §6); integrity is checked in the service. */
   @Column({ name: 'branch_id', type: 'uuid' })

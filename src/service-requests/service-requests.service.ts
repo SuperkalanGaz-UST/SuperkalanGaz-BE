@@ -4,14 +4,18 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   And,
   In,
   IsNull,
   LessThan,
   MoreThanOrEqual,
+  Not,
   Repository,
 } from 'typeorm';
 import { Principal } from '../auth/principal';
@@ -31,8 +35,41 @@ import { ReassignServiceRequestDto } from './dto/reassign-service-request.dto';
 import { LogDelayReasonDto } from './dto/log-delay-reason.dto';
 import { OrderSource, ServiceRequest } from './service-request.entity';
 import { ServiceRequestStatusHistory } from './service-request-status-history.entity';
+import { ServiceRequestDeliveryProof } from './service-request-delivery-proof.entity';
 import { SlaConfiguration, SlaSegment } from './sla-configuration.entity';
 import { PayMongoService } from './paymongo.service';
+import {
+  DELIVERY_PROOF_MAX_BYTES,
+  DeliveryProofMimeType,
+  isDeliveryProofMimeType,
+} from './delivery-proof.constants';
+import { PrivateObjectStorageService, StoredObject } from '../storage/private-object-storage.service';
+
+export interface DeliveryProofUpload {
+  buffer: Buffer;
+  originalname: string;
+  mimetype: string;
+  size: number;
+}
+
+interface PreparedDeliveryProof extends StoredObject {
+  id: string;
+  branchId: string;
+  serviceRequestId: string;
+  riderId: string;
+  originalFileName: string;
+  mimeType: DeliveryProofMimeType;
+  byteSize: number;
+  sha256: string;
+  uploadedAt: Date;
+}
+
+export interface DeliveryProofDownload {
+  data: Buffer;
+  contentType: DeliveryProofMimeType;
+  contentLength: number;
+  fileName: string;
+}
 
 /** Human labels for the delay-reason dropdown categories, used to build the
  * single combined `delay_reason` display string (story BM-011). */
@@ -119,6 +156,13 @@ export class ServiceRequestsService {
     private readonly prices: PricesService,
     private readonly payMongo: PayMongoService,
     private readonly loyalty: LoyaltyService,
+    // Optional keeps isolated legacy unit fixtures that exercise only the
+    // non-upload BM path valid; the NestJS module always supplies both.
+    @Optional()
+    @InjectRepository(ServiceRequestDeliveryProof)
+    private readonly deliveryProofs?: Repository<ServiceRequestDeliveryProof>,
+    @Optional()
+    private readonly objectStorage?: PrivateObjectStorageService,
   ) {}
 
   /**
@@ -364,6 +408,23 @@ export class ServiceRequestsService {
     });
   }
 
+  /** Completed delivery records for staff review. A Branch Owner must provide
+   * the selected branch UUID when multiple assigned branches exist. */
+  async listDeliveryRecords(
+    principal: Principal,
+    requestedBranchId?: string,
+  ): Promise<ServiceRequest[]> {
+    const branchIds = this.proofBranchIds(principal, requestedBranchId);
+    return this.serviceRequests.find({
+      where: {
+        branchId: In(branchIds),
+        deliveredAt: Not(IsNull()),
+        deletedAt: IsNull(),
+      },
+      order: { deliveredAt: 'DESC' },
+    });
+  }
+
   /**
    * Read-only SLA analytics for a Branch Owner. Each real timestamp segment is
    * evaluated independently. GPS-dependent legs remain explicitly unevaluated
@@ -603,7 +664,8 @@ export class ServiceRequestsService {
    *     'Dispatched' or 'En Route'). Enforced authoritatively by the conditional
    *     UPDATE below, so a still-Pending / already-Delivered / Cancelled request
    *     (0 rows affected) is a 409 and two concurrent deliveries can't both win.
-   *  3. Commit: stamp delivered_at + status='Delivered', bump updated_at.
+   *  3. When a Delivery Rider completes the request, the validated proof is
+   *     uploaded first and its metadata is committed with the delivery state.
    *  4. Return the rider to 'Available' so the branch can dispatch them again.
    *
    * En Route / in_transit_at is GPS/hardware-dependent and deferred (AGENTS.md
@@ -621,7 +683,11 @@ export class ServiceRequestsService {
    * is unaffected by any reassignment that happened along the way ("the
    * original SLA breach is not erased").
    */
-  async deliver(principal: Principal, id: string): Promise<ServiceRequest> {
+  async deliver(
+    principal: Principal,
+    id: string,
+    proof?: DeliveryProofUpload,
+  ): Promise<ServiceRequest> {
     const branchIds = this.requireBranches(principal);
 
     // 1. Load, scoped to the caller's branch(es). Out-of-scope / soft-deleted /
@@ -631,10 +697,34 @@ export class ServiceRequestsService {
     });
     if (!serviceRequest) throw new NotFoundException('Service request not found');
 
+    // Branch Managers may complete requests in their branch. A Delivery Rider
+    // must additionally be the authenticated rider assigned to this request;
+    // the client never supplies or selects that identity.
+    let authenticatedRiderId: string | null = serviceRequest.riderId;
+    let existingProof: ServiceRequestDeliveryProof | null = null;
+    if (principal.role === 'driver') {
+      this.requireProofDependencies();
+      const rider = await this.fleet.findByAuthUserInBranch(
+        principal.userId,
+        serviceRequest.branchId,
+      );
+      if (!rider || serviceRequest.riderId !== rider.id) {
+        throw new ForbiddenException('This Service Request is not assigned to you');
+      }
+      authenticatedRiderId = rider.id;
+      existingProof = await this.findLiveProof(id, serviceRequest.branchId);
+      if (!proof && !existingProof) {
+        throw new BadRequestException('A delivery proof photo is required');
+      }
+    }
+
     // Delivery and loyalty credit are deliberately retryable together. If the
     // delivery row committed but the post-commit loyalty write failed, retrying
     // this endpoint repairs the idempotent ledger entry instead of stranding it.
     if (serviceRequest.deliveredAt && serviceRequest.status === 'Delivered') {
+      if (principal.role === 'driver' && !existingProof && proof && authenticatedRiderId) {
+        await this.attachProofToDeliveredRequest(serviceRequest, authenticatedRiderId, proof);
+      }
       await this.recordDeliveredPurchase(serviceRequest);
       return serviceRequest;
     }
@@ -656,19 +746,69 @@ export class ServiceRequestsService {
       deliverySet.paymentStatus = 'Paid';
       deliverySet.paymentPaidAt = now;
     }
-    const result = await this.serviceRequests
-      .createQueryBuilder()
-      .update(ServiceRequest)
-      .set(deliverySet)
-      .where(
-        `id = :id
-          AND branch_id = :branchId
-          AND dispatched_at IS NOT NULL
-          AND delivered_at IS NULL`,
-        { id, branchId: serviceRequest.branchId },
-      )
-      .execute();
-    if (!result.affected) {
+    const preparedProof = proof && authenticatedRiderId
+      ? await this.prepareProof(serviceRequest, authenticatedRiderId, proof)
+      : null;
+
+    let affected = 0;
+    try {
+      if (preparedProof) {
+        // The database transition and proof metadata commit together. The
+        // object upload happened first, so a delivery is never marked complete
+        // before the photo is available to persist.
+        affected = await this.serviceRequests.manager.transaction(async (manager) => {
+          const result = await manager
+            .createQueryBuilder()
+            .update(ServiceRequest)
+            .set(deliverySet)
+            .where(
+              `id = :id
+                AND branch_id = :branchId
+                AND dispatched_at IS NOT NULL
+                AND delivered_at IS NULL`,
+              { id, branchId: serviceRequest.branchId },
+            )
+            .execute();
+          if (!result.affected) return 0;
+
+          const proofs = manager.getRepository(ServiceRequestDeliveryProof);
+          await proofs.save(proofs.create({
+            id: preparedProof.id,
+            serviceRequestId: preparedProof.serviceRequestId,
+            branchId: preparedProof.branchId,
+            riderId: preparedProof.riderId,
+            storagePath: preparedProof.path,
+            originalFileName: preparedProof.originalFileName,
+            mimeType: preparedProof.mimeType,
+            byteSize: preparedProof.byteSize,
+            sha256: preparedProof.sha256,
+            uploadedAt: preparedProof.uploadedAt,
+            deletedAt: null,
+          }));
+          return result.affected;
+        });
+      } else {
+        const result = await this.serviceRequests
+          .createQueryBuilder()
+          .update(ServiceRequest)
+          .set(deliverySet)
+          .where(
+            `id = :id
+              AND branch_id = :branchId
+              AND dispatched_at IS NOT NULL
+              AND delivered_at IS NULL`,
+            { id, branchId: serviceRequest.branchId },
+          )
+          .execute();
+        affected = result.affected ?? 0;
+      }
+    } catch (error) {
+      if (preparedProof) await this.cleanupPreparedProof(preparedProof);
+      throw error;
+    }
+
+    if (!affected) {
+      if (preparedProof) await this.cleanupPreparedProof(preparedProof);
       const concurrentlyDelivered = await this.serviceRequests.findOne({
         where: { id, branchId: In(branchIds), deletedAt: IsNull() },
       });
@@ -728,6 +868,172 @@ export class ServiceRequestsService {
     await this.recordDeliveredPurchase(serviceRequest);
 
     return serviceRequest;
+  }
+
+  /**
+   * Streams a proof only after resolving the Service Request and proof through
+   * the caller's JWT-derived branch scope. The object key never leaves this
+   * service, so clients cannot turn storage paths into cross-branch handles.
+   */
+  async downloadDeliveryProof(
+    principal: Principal,
+    id: string,
+    requestedBranchId?: string,
+  ): Promise<DeliveryProofDownload> {
+    const branchIds = this.proofBranchIds(principal, requestedBranchId);
+    const serviceRequest = await this.serviceRequests.findOne({
+      where: { id, branchId: In(branchIds), deletedAt: IsNull() },
+    });
+    if (!serviceRequest) throw new NotFoundException('Service request not found');
+
+    const proof = await this.findLiveProof(id, serviceRequest.branchId);
+    if (!proof) throw new NotFoundException('Proof of Delivery is not available');
+
+    const { objectStorage } = this.requireProofDependencies();
+    const object = await objectStorage.getObject(proof.storagePath);
+    return {
+      data: object.data,
+      contentType: proof.mimeType as DeliveryProofMimeType,
+      contentLength: object.contentLength,
+      fileName: this.safeOriginalFileName(proof.originalFileName, proof.mimeType),
+    };
+  }
+
+  private requireProofDependencies(): {
+    deliveryProofs: Repository<ServiceRequestDeliveryProof>;
+    objectStorage: PrivateObjectStorageService;
+  } {
+    if (!this.deliveryProofs || !this.objectStorage) {
+      throw new ServiceUnavailableException('Proof of Delivery storage is unavailable');
+    }
+    return {
+      deliveryProofs: this.deliveryProofs,
+      objectStorage: this.objectStorage,
+    };
+  }
+
+  private async findLiveProof(
+    serviceRequestId: string,
+    branchId: string,
+  ): Promise<ServiceRequestDeliveryProof | null> {
+    const { deliveryProofs } = this.requireProofDependencies();
+    return deliveryProofs.findOne({
+      where: { serviceRequestId, branchId, deletedAt: IsNull() },
+    });
+  }
+
+  private async prepareProof(
+    serviceRequest: ServiceRequest,
+    riderId: string,
+    proof: DeliveryProofUpload,
+  ): Promise<PreparedDeliveryProof> {
+    const { objectStorage } = this.requireProofDependencies();
+    const byteSize = proof.buffer.byteLength;
+    if (!byteSize || byteSize > DELIVERY_PROOF_MAX_BYTES || proof.size !== byteSize) {
+      throw new BadRequestException('Proof photo must be 3 MB or smaller');
+    }
+    if (!isDeliveryProofMimeType(proof.mimetype)) {
+      throw new BadRequestException('Proof photo must be a JPEG or PNG image');
+    }
+    if (!this.hasImageSignature(proof.buffer, proof.mimetype)) {
+      throw new BadRequestException('Proof photo is not a valid JPEG or PNG image');
+    }
+
+    const id = randomUUID();
+    const extension = proof.mimetype === 'image/png' ? 'png' : 'jpg';
+    const path = `${serviceRequest.branchId}/${serviceRequest.id}/${id}.${extension}`;
+    const uploadedAt = new Date();
+    await objectStorage.putObject(path, proof.buffer, proof.mimetype);
+
+    return {
+      id,
+      path,
+      branchId: serviceRequest.branchId,
+      serviceRequestId: serviceRequest.id,
+      riderId,
+      originalFileName: this.safeOriginalFileName(proof.originalname, proof.mimetype),
+      mimeType: proof.mimetype,
+      byteSize,
+      sha256: createHash('sha256').update(proof.buffer).digest('hex'),
+      uploadedAt,
+    };
+  }
+
+  private async attachProofToDeliveredRequest(
+    serviceRequest: ServiceRequest,
+    riderId: string,
+    proof: DeliveryProofUpload,
+  ): Promise<void> {
+    const preparedProof = await this.prepareProof(serviceRequest, riderId, proof);
+    try {
+      const attached = await this.serviceRequests.manager.transaction(async (manager) => {
+        const proofs = manager.getRepository(ServiceRequestDeliveryProof);
+        const existing = await proofs.findOne({
+          where: {
+            serviceRequestId: serviceRequest.id,
+            branchId: serviceRequest.branchId,
+            deletedAt: IsNull(),
+          },
+        });
+        if (existing) return false;
+
+        await proofs.save(proofs.create({
+          id: preparedProof.id,
+          serviceRequestId: preparedProof.serviceRequestId,
+          branchId: preparedProof.branchId,
+          riderId: preparedProof.riderId,
+          storagePath: preparedProof.path,
+          originalFileName: preparedProof.originalFileName,
+          mimeType: preparedProof.mimeType,
+          byteSize: preparedProof.byteSize,
+          sha256: preparedProof.sha256,
+          uploadedAt: preparedProof.uploadedAt,
+          deletedAt: null,
+        }));
+        return true;
+      });
+      if (!attached) await this.cleanupPreparedProof(preparedProof);
+    } catch (error) {
+      await this.cleanupPreparedProof(preparedProof);
+      throw error;
+    }
+  }
+
+  private async cleanupPreparedProof(proof: PreparedDeliveryProof): Promise<void> {
+    try {
+      await this.objectStorage?.removeObject(proof.path);
+    } catch {
+      // The database transaction remains authoritative. An orphaned object is
+      // safer than exposing it; an operator can clean it up from the bucket.
+    }
+  }
+
+  private hasImageSignature(buffer: Buffer, mimeType: string): boolean {
+    if (mimeType === 'image/jpeg') {
+      return buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+    }
+    return (
+      mimeType === 'image/png' &&
+      buffer.length >= 8 &&
+      buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    );
+  }
+
+  private safeOriginalFileName(original: string, mimeType: string): string {
+    const fallback = mimeType === 'image/png' ? 'delivery-proof.png' : 'delivery-proof.jpg';
+    const cleaned = original
+      .replace(/[\\/]/g, '_')
+      .replace(/[^a-zA-Z0-9._ -]/g, '_')
+      .trim()
+      .slice(0, 120);
+    return cleaned || fallback;
+  }
+
+  private proofBranchIds(principal: Principal, requestedBranchId?: string): string[] {
+    if (principal.role === 'branch-owner' && principal.branchIds.length > 1 && !requestedBranchId) {
+      throw new BadRequestException('Selected branch is required');
+    }
+    return this.reportBranchIds(principal, requestedBranchId);
   }
 
   private async recordDeliveredPurchase(serviceRequest: ServiceRequest): Promise<void> {
