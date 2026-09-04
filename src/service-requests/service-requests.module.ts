@@ -16,6 +16,7 @@ import { PayMongoController } from './paymongo.controller';
 import { PayMongoService } from './paymongo.service';
 import { ServiceRequestPaymentsService } from './service-request-payments.service';
 import { ServiceRequestDeliveryProof } from './service-request-delivery-proof.entity';
+import { Redemption } from '../loyalty/redemption.entity';
 import { PrivateObjectStorageService } from '../storage/private-object-storage.service';
 
 @Module({
@@ -32,6 +33,7 @@ import { PrivateObjectStorageService } from '../storage/private-object-storage.s
       SlaConfiguration,
       Branch,
       ServiceRequestDeliveryProof,
+      Redemption,
     ]),
     AuthModule,
     LoyaltyModule,

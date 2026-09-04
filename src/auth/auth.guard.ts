@@ -135,7 +135,6 @@ export class AuthGuard implements CanActivate {
     if (claimedRole === 'branch-manager' && orderedBranches.length !== 1) {
       throw new ForbiddenException('Branch Manager must have exactly one active branch');
     }
-
     console.log('[auth] resolved principal', {
       requestPath,
       method: request.method,

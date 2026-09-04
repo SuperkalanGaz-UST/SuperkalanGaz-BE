@@ -25,6 +25,7 @@ import { reportRangeFrom } from '../common/report-range';
 import { CimService } from '../cim/cim.service';
 import { FleetService } from '../fleet/fleet.service';
 import { LoyaltyService } from '../loyalty/loyalty.service';
+import { Redemption } from '../loyalty/redemption.entity';
 import { PricesService } from '../prices/prices.service';
 import { CreateCustomerServiceRequestDto } from './dto/create-customer-service-request.dto';
 import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
@@ -116,6 +117,42 @@ export interface SlaBranchReport {
   orderSources: Record<OrderSource, SlaOrderSourceMetric>;
 }
 
+export interface BranchDashboardMetrics {
+  ordersToday: number;
+  totalOrders: number;
+  completedDeliveries: number;
+  cancelledFailedDeliveries: number;
+  slaBreaches: number;
+  deliveryCompletionRate: number;
+  loyaltyClaimsThisMonth: number;
+  earningsToday: Array<{ hour: string; earnings: number }>;
+  earningsThisMonth: Array<{ week: string; earnings: number }>;
+  topSellingTanks: Array<{ size: string; orders: number }>;
+  orderVolumeTrend: Array<{ month: string; orders: number }>;
+  dailyOrderVolume: Array<{ day: string; orders: number }>;
+  totalRevenue: number;
+  revenueByTank: Array<{ size: string; revenue: number }>;
+  sales: Array<{
+    id: string;
+    date: Date;
+    receipt: string;
+    customer: string;
+    orders: number;
+    spent: number;
+    paid: string;
+  }>;
+}
+
+export interface BranchSalesRecord {
+  id: string;
+  date: Date;
+  receipt: string;
+  customer: string;
+  orders: number;
+  spent: number;
+  paid: string;
+}
+
 /**
  * Service Request intake & queue (SRD module). Covers create (walk-in / phone
  * intake), the branch queue, detail lookup, dispatch/deliver, pre-dispatch
@@ -163,7 +200,176 @@ export class ServiceRequestsService {
     private readonly deliveryProofs?: Repository<ServiceRequestDeliveryProof>,
     @Optional()
     private readonly objectStorage?: PrivateObjectStorageService,
+    @Optional()
+    @InjectRepository(Redemption)
+    private readonly redemptions?: Repository<Redemption>,
   ) {}
+
+  /** Shared branch dashboard calculation used by role-specific report routes. */
+  async getBranchDashboardMetrics(
+    principal: Principal,
+    query: BranchReportQuery,
+  ): Promise<BranchDashboardMetrics> {
+    const branchIds = this.requireBranches(principal);
+    const branchId = query.branchId ?? branchIds[0];
+    if (!branchIds.includes(branchId)) {
+      throw new ForbiddenException('Dashboard branch is outside the caller scope');
+    }
+
+    const { start, endExclusive } = reportRangeFrom(query);
+    const requests = await this.serviceRequests.find({
+      where: {
+        branchId,
+        requestedAt: And(MoreThanOrEqual(start), LessThan(endExclusive)),
+        deletedAt: IsNull(),
+      },
+      order: { requestedAt: 'ASC' },
+    });
+    const trendStart = new Date(start);
+    trendStart.setUTCMonth(trendStart.getUTCMonth() - 5);
+    const trendRequests = await this.serviceRequests.find({
+      where: {
+        branchId,
+        requestedAt: And(MoreThanOrEqual(trendStart), LessThan(endExclusive)),
+        deletedAt: IsNull(),
+      },
+      order: { requestedAt: 'ASC' },
+    });
+    if (!this.redemptions) throw new ServiceUnavailableException('Dashboard metrics are unavailable');
+    const redemptions = await this.redemptions.find({
+      where: {
+        branchId,
+        requestedAt: And(MoreThanOrEqual(start), LessThan(endExclusive)),
+        status: Not(In(['rejected', 'cancelled'])),
+      },
+    });
+
+    const todayKey = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(new Date());
+    const toManilaDate = (date: Date) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(date);
+    const todayRequests = requests.filter((request) => toManilaDate(request.requestedAt) === todayKey);
+    const hourly = new Map<number, number>(Array.from({ length: 11 }, (_, index) => [index + 8, 0]));
+    const weekly = new Map<number, number>(Array.from({ length: 5 }, (_, index) => [index + 1, 0]));
+    const tankCounts = new Map<string, number>();
+    const tankRevenue = new Map<string, number>();
+    const monthlyVolume = new Map<string, number>();
+    const dailyVolume = new Map<string, number>();
+    const eligibleOrders = requests.filter((request) => request.status !== 'Cancelled');
+    const completedOrders = eligibleOrders.filter(
+      (request) => request.status === 'Delivered' || request.deliveredAt !== null,
+    );
+    for (let offset = 5; offset >= 0; offset -= 1) {
+      const month = new Date(start);
+      month.setUTCMonth(month.getUTCMonth() - offset);
+      const key = `${month.getUTCFullYear()}-${String(month.getUTCMonth() + 1).padStart(2, '0')}`;
+      monthlyVolume.set(key, 0);
+    }
+    for (let offset = 6; offset >= 0; offset -= 1) {
+      const day = new Date();
+      day.setUTCDate(day.getUTCDate() - offset);
+      const key = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Manila',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(day);
+      dailyVolume.set(key, 0);
+    }
+    for (const request of requests) {
+      const date = request.requestedAt;
+      if (request.status === 'Cancelled') continue;
+      const amount = request.totalAmount ?? 0;
+      const hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Manila', hour: '2-digit', hour12: false }).format(date));
+      const day = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Manila', day: 'numeric' }).format(date));
+      hourly.set(hour, (hourly.get(hour) ?? 0) + amount);
+      weekly.set(Math.floor((day - 1) / 7) + 1, (weekly.get(Math.floor((day - 1) / 7) + 1) ?? 0) + amount);
+      tankCounts.set(request.cylinderSize, (tankCounts.get(request.cylinderSize) ?? 0) + request.quantity);
+      tankRevenue.set(request.cylinderSize, (tankRevenue.get(request.cylinderSize) ?? 0) + amount);
+      const dayKey = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Manila',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(date);
+      dailyVolume.set(dayKey, (dailyVolume.get(dayKey) ?? 0) + 1);
+    }
+    for (const request of trendRequests) {
+      if (request.status === 'Cancelled') continue;
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Manila',
+        year: 'numeric',
+        month: '2-digit',
+      }).formatToParts(request.requestedAt);
+      const year = parts.find((part) => part.type === 'year')?.value;
+      const month = parts.find((part) => part.type === 'month')?.value;
+      if (year && month) {
+        const key = `${year}-${month}`;
+        monthlyVolume.set(key, (monthlyVolume.get(key) ?? 0) + 1);
+      }
+    }
+
+    const supportedCylinderSizes = ['2.7kg', '5kg', '11kg', '22kg'];
+    const rankedTanks = [...new Set([...supportedCylinderSizes, ...tankCounts.keys()])]
+      .map((size) => ({ size, orders: tankCounts.get(size) ?? 0 }))
+      .sort((a, b) => b.orders - a.orders);
+    const sales = requests.map((request) => ({
+      id: request.id,
+      date: request.requestedAt,
+      receipt: request.srCode,
+      customer: request.customerName,
+      orders: request.quantity,
+      spent: request.totalAmount ?? 0,
+      paid: request.paymentStatus === 'Paid' ? 'Paid' : 'Unpaid',
+    }));
+
+    return {
+      ordersToday: todayRequests.filter((request) => request.status !== 'Cancelled').length,
+      totalOrders: requests.length,
+      completedDeliveries: completedOrders.length,
+      cancelledFailedDeliveries: requests.filter(
+        (request) => request.status === 'Cancelled' || request.status === 'Under Review',
+      ).length,
+      slaBreaches: requests.filter((request) => request.slaBreached).length,
+      deliveryCompletionRate: eligibleOrders.length === 0
+        ? 0
+        : Number(((completedOrders.length / eligibleOrders.length) * 100).toFixed(1)),
+      loyaltyClaimsThisMonth: redemptions.length,
+      earningsToday: [...hourly.entries()].sort(([a], [b]) => a - b).map(([hour, earnings]) => ({ hour: `${hour}:00`, earnings })),
+      earningsThisMonth: [...weekly.entries()].sort(([a], [b]) => a - b).map(([week, earnings]) => ({ week: `Week ${week}`, earnings })),
+      topSellingTanks: rankedTanks,
+      orderVolumeTrend: [...monthlyVolume.entries()].map(([key, orders]) => ({
+        month: new Intl.DateTimeFormat('en-US', { month: 'short', timeZone: 'Asia/Manila' })
+          .format(new Date(`${key}-01T00:00:00+08:00`)),
+        orders,
+      })),
+      dailyOrderVolume: [...dailyVolume.entries()].map(([key, orders]) => ({
+        day: new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'Asia/Manila' })
+          .format(new Date(`${new Date().getFullYear()}-${key}T00:00:00+08:00`)),
+        orders,
+      })),
+      totalRevenue: requests.reduce((sum, request) => sum + (request.totalAmount ?? 0), 0),
+      revenueByTank: [...new Set([...supportedCylinderSizes, ...tankRevenue.keys()])]
+        .map((size) => ({ size, revenue: tankRevenue.get(size) ?? 0 }))
+        .filter((entry) => entry.revenue > 0 || supportedCylinderSizes.includes(entry.size)),
+      sales,
+    };
+  }
+
+  async getBranchSalesRecords(principal: Principal, branchId: string): Promise<BranchSalesRecord[]> {
+    if (!this.requireBranches(principal).includes(branchId)) {
+      throw new ForbiddenException('Sales branch is outside the caller scope');
+    }
+    const requests = await this.serviceRequests.find({
+      where: { branchId, deletedAt: IsNull() },
+      order: { requestedAt: 'DESC' },
+    });
+    return requests.map((request) => ({
+      id: request.id,
+      date: request.requestedAt,
+      receipt: request.srCode,
+      customer: request.customerName,
+      orders: request.quantity,
+      spent: request.totalAmount ?? 0,
+      paid: request.paymentStatus === 'Paid' ? 'Paid' : 'Unpaid',
+    }));
+  }
 
   /**
    * Walk-in / phone intake. The server owns branch_id (the caller's own

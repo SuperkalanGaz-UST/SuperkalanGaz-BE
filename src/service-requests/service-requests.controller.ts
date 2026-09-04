@@ -157,6 +157,25 @@ export class ServiceRequestsController {
     };
   }
 
+  /** Branch Owner dashboard metrics; the service enforces its single branch. */
+  @Get('reports/branch-owner-dashboard')
+  @Roles('branch-owner')
+  async branchOwnerDashboard(
+    @CurrentPrincipal() principal: Principal,
+    @Query() query: BranchReportQuery,
+  ) {
+    return { metrics: await this.serviceRequests.getBranchDashboardMetrics(principal, query) };
+  }
+
+  @Get('reports/branch-owner-sales')
+  @Roles('branch-owner')
+  async branchOwnerSales(
+    @CurrentPrincipal() principal: Principal,
+    @Query('branchId') branchId: string,
+  ) {
+    return { sales: await this.serviceRequests.getBranchSalesRecords(principal, branchId) };
+  }
+
   /** A CIM customer's order history — powers the Customer Directory's
    * click-through detail view (Branch Manager only, branch-scoped). */
   @Get('customers/:customerId')

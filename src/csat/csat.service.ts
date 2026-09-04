@@ -326,6 +326,22 @@ export class CsatService {
       select: { id: true, stars: true, resolutionStatus: true },
     });
 
+    return this.summarizeRatings(rows);
+  }
+
+  /** Same rating aggregation as the BM summary, narrowed to one owned branch. */
+  async getSummaryForBranch(principal: Principal, branchId: string): Promise<CsatSummary> {
+    const [authorizedBranchId] = this.reportBranchIds(principal, branchId);
+    const rows = await this.ratings.find({
+      where: { branchId: authorizedBranchId },
+      select: { id: true, stars: true, resolutionStatus: true },
+    });
+
+    return this.summarizeRatings(rows);
+  }
+
+  private summarizeRatings(rows: Array<Pick<Rating, 'id' | 'stars' | 'resolutionStatus'>>): CsatSummary {
+
     // "Open Complaints" = complaint-band (≤2★) Open ratings the BM must act on.
     // 3–5★ ratings are auto-resolved at submission, but guard here too for any
     // legacy rows created before that rule was introduced.

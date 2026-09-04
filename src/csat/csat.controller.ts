@@ -80,6 +80,25 @@ export class CsatController {
     };
   }
 
+  /** Dashboard-only owner view using the same direct rating summary as BM. */
+  @Get('reports/dashboard-summary')
+  @Roles('branch-owner')
+  async dashboardSummary(
+    @CurrentPrincipal() principal: Principal,
+    @Query() query: BranchReportQuery,
+  ) {
+    const summary = await this.csat.getSummaryForBranch(
+      principal,
+      query.branchId ?? principal.branchIds[0],
+    );
+    return {
+      report: {
+        average_stars: summary.averageStars,
+        total_responses: summary.totalRatings,
+      },
+    };
+  }
+
   /**
    * The follow-up queue (BM-038): low-CSAT (<= 3 stars by default), Open by
    * default, newest first, for the caller's branch(es). Each row carries the
