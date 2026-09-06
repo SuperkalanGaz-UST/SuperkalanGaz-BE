@@ -7,6 +7,7 @@ import { BranchesModule } from './branches/branches.module';
 import { CimModule } from './cim/cim.module';
 import { ExpensesModule } from './expenses/expenses.module';
 import { FleetModule } from './fleet/fleet.module';
+import { InventoryModule } from './inventory/inventory.module';
 import { LoyaltyModule } from './loyalty/loyalty.module';
 import { CsatModule } from './csat/csat.module';
 import { NotificationsModule } from './notifications/notifications.module';
@@ -89,6 +90,7 @@ import { GovernanceModule } from './governance/governance.module';
     NotificationsModule,
     PricesModule,
     GovernanceModule,
+    InventoryModule,
   ],
 })
 export class AppModule {}
