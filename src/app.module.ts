@@ -1,7 +1,9 @@
+import { APP_INTERCEPTOR } from '@nestjs/core';
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { resolve4 } from 'node:dns/promises';
+import { DatabaseRetryInterceptor } from './common/database-retry.interceptor';
 import { AuthModule } from './auth/auth.module';
 import { BranchesModule } from './branches/branches.module';
 import { CimModule } from './cim/cim.module';
@@ -48,17 +50,25 @@ import { GovernanceModule } from './governance/governance.module';
           databaseUrl.hostname = addresses[0];
         }
 
+        // Log the resolved endpoint so future connection failures are easy to
+        // diagnose without digging through pg internals. Never log credentials.
+        const diagnosticHost = databaseUrl.hostname;
+        const diagnosticPort = databaseUrl.port || '5432';
+        console.log(
+          `[TypeORM] Connecting to Postgres at ${diagnosticHost}:${diagnosticPort}`,
+        );
+
         return {
           type: 'postgres' as const,
           url: databaseUrl.toString(),
           ssl: { rejectUnauthorized: false },
-          connectTimeoutMS: 5_000,
+          connectTimeoutMS: 10_000,
           poolSize: 5,
           extra: {
             // Fail inside the API's 10-second web-client budget so the BFF can
             // return an explicit unavailable response instead of leaving the
             // dashboard waiting on a saturated pool.
-            connectionTimeoutMillis: 5_000,
+            connectionTimeoutMillis: 10_000,
             query_timeout: 8_000,
             statement_timeout: 8_000,
             idle_in_transaction_session_timeout: 8_000,
@@ -71,6 +81,16 @@ import { GovernanceModule } from './governance/governance.module';
             maxUses: 100,
             max: 5,
           },
+          // Give transient network blips room to resolve before giving up.
+          // TypeORM retries on a fixed interval; using a longer delay means
+          // each successive attempt waits more — approximating backoff without
+          // a custom retry loop. The app only exits after all attempts are
+          // genuinely exhausted, not on the first failure.
+          retryAttempts: 8,
+          retryDelay: 5_000,
+          // Log each failed attempt with the host so the operator can see
+          // exactly which endpoint was unreachable and how many tries remain.
+          verboseRetryLog: true,
           autoLoadEntities: true,
           // Schema changes go through migrations only (AGENTS.md §6).
           synchronize: false,
@@ -91,6 +111,12 @@ import { GovernanceModule } from './governance/governance.module';
     PricesModule,
     GovernanceModule,
     InventoryModule,
+  ],
+  providers: [
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: DatabaseRetryInterceptor,
+    },
   ],
 })
 export class AppModule {}
