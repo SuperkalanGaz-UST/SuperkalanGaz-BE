@@ -172,8 +172,22 @@ export class ServiceRequestsController {
   async branchOwnerSales(
     @CurrentPrincipal() principal: Principal,
     @Query('branchId') branchId: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('search') search?: string,
+    @Query('status') status?: string,
   ) {
-    return { sales: await this.serviceRequests.getBranchSalesRecords(principal, branchId) };
+    const pageNum = page ? parseInt(page, 10) : 1;
+    const limitNum = limit ? parseInt(limit, 10) : 1000000;
+    
+    return await this.serviceRequests.getBranchSalesRecords(
+      principal, 
+      branchId,
+      pageNum,
+      limitNum,
+      search,
+      status
+    );
   }
 
   /** A CIM customer's order history — powers the Customer Directory's

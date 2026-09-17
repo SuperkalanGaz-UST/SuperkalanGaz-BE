@@ -1,4 +1,4 @@
-import { Body, Controller, HttpCode, Post } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Post, Query } from '@nestjs/common';
 import { AuthRegistrationService } from './auth-registration.service';
 import { RegisterDto } from './dto/register.dto';
 import { ResendSignUpCodeDto } from './dto/resend-sign-up-code.dto';
@@ -39,5 +39,14 @@ export class AuthController {
   ): Promise<{ sent: true }> {
     await this.registrations.resendSignUpCode(dto);
     return { sent: true };
+  }
+
+  /** Checks if an email exists in the system (used for forgot password flow). */
+  @Get('check-email')
+  async checkEmail(
+    @Query('email') email: string,
+  ): Promise<{ exists: boolean }> {
+    if (!email) return { exists: false };
+    return this.registrations.checkEmailExists(email);
   }
 }

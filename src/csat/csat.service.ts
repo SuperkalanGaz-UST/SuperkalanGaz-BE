@@ -320,45 +320,39 @@ export class CsatService {
    */
   async getSummary(principal: Principal): Promise<CsatSummary> {
     const branchIds = this.requireBranches(principal);
-
-    const rows = await this.ratings.find({
-      where: { branchId: In(branchIds) },
-      select: { id: true, stars: true, resolutionStatus: true },
-    });
-
-    return this.summarizeRatings(rows);
+    return this.fetchAggregatedSummary(branchIds);
   }
 
   /** Same rating aggregation as the BM summary, narrowed to one owned branch. */
   async getSummaryForBranch(principal: Principal, branchId: string): Promise<CsatSummary> {
     const [authorizedBranchId] = this.reportBranchIds(principal, branchId);
-    const rows = await this.ratings.find({
-      where: { branchId: authorizedBranchId },
-      select: { id: true, stars: true, resolutionStatus: true },
-    });
-
-    return this.summarizeRatings(rows);
+    return this.fetchAggregatedSummary([authorizedBranchId]);
   }
 
-  private summarizeRatings(rows: Array<Pick<Rating, 'id' | 'stars' | 'resolutionStatus'>>): CsatSummary {
+  private async fetchAggregatedSummary(branchIds: string[]): Promise<CsatSummary> {
+    const result = await this.ratings
+      .createQueryBuilder('rating')
+      .select('COUNT(rating.id)', 'totalRatings')
+      .addSelect(
+        `COALESCE(SUM(CASE WHEN rating.resolution_status = 'Open' AND rating.stars <= :maxStars THEN 1 ELSE 0 END), 0)::int`,
+        'openCount',
+      )
+      .addSelect('AVG(rating.stars)', 'averageStars')
+      .where('rating.branch_id IN (:...branchIds)', { branchIds })
+      .setParameter('maxStars', LOW_CSAT_MAX_STARS)
+      .getRawOne();
 
-    // "Open Complaints" = complaint-band (≤2★) Open ratings the BM must act on.
-    // 3–5★ ratings are auto-resolved at submission, but guard here too for any
-    // legacy rows created before that rule was introduced.
-    const openCount = rows.filter(
-      (r) => r.resolutionStatus === 'Open' && r.stars <= LOW_CSAT_MAX_STARS,
-    ).length;
-    const lowCsatOpenCount = openCount; // same definition, kept for API compat
-    const resolvedCount = rows.length - openCount;
+    const totalRatings = parseInt(result.totalRatings || '0', 10);
+    const openCount = parseInt(result.openCount || '0', 10);
+    const resolvedCount = totalRatings - openCount;
+    const averageStars = totalRatings > 0 ? Number(parseFloat(result.averageStars).toFixed(2)) : null;
 
     return {
       openCount,
       resolvedCount,
-      lowCsatOpenCount,
-      averageStars: rows.length
-        ? Number((rows.reduce((sum, r) => sum + r.stars, 0) / rows.length).toFixed(2))
-        : null,
-      totalRatings: rows.length,
+      lowCsatOpenCount: openCount,
+      averageStars,
+      totalRatings,
     };
   }
 

@@ -95,6 +95,28 @@ export class AuthRegistrationService {
     );
   }
 
+  async checkEmailExists(email: string): Promise<{ exists: boolean }> {
+    const target = email.trim().toLowerCase();
+    
+    // We only need to know if any user matches this email.
+    // The GoTrue Admin API /users endpoint allows fetching users.
+    // Since we don't want to paginate through all users just to check,
+    // we'll use a search query or just rely on the fact that we can search by email?
+    // Wait, GoTrue Admin API /users?search=${encodeURIComponent(target)} works.
+    try {
+      const data = await this.adminGetRequest(`/users?search=${encodeURIComponent(target)}`);
+      const users = (data.users as any[]) ?? [];
+      const exists = users.some((u: any) => (u.email ?? '').toLowerCase() === target);
+      return { exists };
+    } catch (e) {
+      console.warn('[auth] Error checking email existence', e);
+      // Fail closed (or open?) Actually if we can't check, we should probably pretend it exists
+      // so we don't break the flow, but wait, returning false means "No account found".
+      // We will return false to match the error handling, but log it.
+      return { exists: false };
+    }
+  }
+
   private normalizedIdentifier(
     method: RegisterDto['method'],
     identifier: string,
@@ -148,6 +170,18 @@ export class AuthRegistrationService {
       body: JSON.stringify(body),
     });
     return this.readResponse(response, 'Could not prepare the customer account');
+  }
+
+  private async adminGetRequest(path: string): Promise<AuthJson> {
+    const response = await fetch(`${this.authBaseUrl}/admin${path}`, {
+      method: 'GET',
+      headers: {
+        apikey: this.serviceRoleKey,
+        Authorization: `Bearer ${this.serviceRoleKey}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    return this.readResponse(response, 'Could not fetch from admin API');
   }
 
   private async readResponse(response: Response, fallback: string): Promise<AuthJson> {

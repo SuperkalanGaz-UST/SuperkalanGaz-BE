@@ -352,15 +352,38 @@ export class ServiceRequestsService {
     };
   }
 
-  async getBranchSalesRecords(principal: Principal, branchId: string): Promise<BranchSalesRecord[]> {
+  async getBranchSalesRecords(
+    principal: Principal, 
+    branchId: string,
+    page: number = 1,
+    limit: number = 1000000,
+    search?: string,
+    status?: string
+  ): Promise<{ sales: BranchSalesRecord[], totalCount: number }> {
     if (!this.requireBranches(principal).includes(branchId)) {
       throw new ForbiddenException('Sales branch is outside the caller scope');
     }
-    const requests = await this.serviceRequests.find({
-      where: { branchId, deletedAt: IsNull() },
-      order: { requestedAt: 'DESC' },
-    });
-    return requests.map((request) => ({
+    
+    const qb = this.serviceRequests.createQueryBuilder('sr')
+      .where('sr.branch_id = :branchId', { branchId })
+      .andWhere('sr.deleted_at IS NULL');
+      
+    if (search) {
+      qb.andWhere('(sr.sr_code ILIKE :search OR sr.customer_name ILIKE :search)', { search: `%${search}%` });
+    }
+    
+    if (status && status !== 'all') {
+      const paymentStatus = status.toLowerCase() === 'paid' ? 'Paid' : 'Unpaid';
+      qb.andWhere('sr.payment_status = :paymentStatus', { paymentStatus });
+    }
+    
+    qb.orderBy('sr.requested_at', 'DESC')
+      .skip((page - 1) * limit)
+      .take(limit);
+      
+    const [requests, totalCount] = await qb.getManyAndCount();
+    
+    const sales = requests.map((request) => ({
       id: request.id,
       date: request.requestedAt,
       receipt: request.srCode,
@@ -369,6 +392,8 @@ export class ServiceRequestsService {
       spent: request.totalAmount ?? 0,
       paid: request.paymentStatus === 'Paid' ? 'Paid' : 'Unpaid',
     }));
+    
+    return { sales, totalCount };
   }
 
   /**
