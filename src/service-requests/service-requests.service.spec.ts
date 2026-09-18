@@ -1278,5 +1278,21 @@ describe('ServiceRequestsService', () => {
       const totalHourlyOrders = result.hourlyOrderVolume.reduce((sum, entry) => sum + entry.orders, 0);
       expect(totalHourlyOrders).toBe(1);
     });
+
+    it('returns 7 daily earnings buckets summing totalAmount, excluding cancelled requests', async () => {
+      const service = makeDashboardService([
+        { id: 'sr-1', branchId: 'branch-uuid-1', status: 'Pending', requestedAt: new Date('2020-01-07T04:00:00Z'), cylinderSize: '11kg', quantity: 1, totalAmount: 500 },
+        { id: 'sr-cancelled', branchId: 'branch-uuid-1', status: 'Cancelled', requestedAt: new Date('2020-01-05T04:00:00Z'), cylinderSize: '11kg', quantity: 1, totalAmount: 999 },
+      ]);
+
+      const result = await service.getBranchDashboardMetrics(
+        { userId: 'user-1', role: 'branch-manager', branches: ['Alpha'], branchIds: ['branch-uuid-1'] },
+        { from: '2020-01-01', to: '2020-01-07', branchId: 'branch-uuid-1' },
+      );
+
+      expect(result.earningsThisWeek).toHaveLength(7);
+      const totalWeeklyEarnings = result.earningsThisWeek.reduce((sum, entry) => sum + entry.earnings, 0);
+      expect(totalWeeklyEarnings).toBe(500);
+    });
   });
 });

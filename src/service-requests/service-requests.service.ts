@@ -126,6 +126,7 @@ export interface BranchDashboardMetrics {
   deliveryCompletionRate: number;
   loyaltyClaimsThisMonth: number;
   earningsToday: Array<{ hour: string; earnings: number }>;
+  earningsThisWeek: Array<{ day: string; earnings: number }>;
   earningsThisMonth: Array<{ week: string; earnings: number }>;
   topSellingTanks: Array<{ size: string; orders: number }>;
   orderVolumeTrend: Array<{ month: string; orders: number }>;
@@ -255,6 +256,7 @@ export class ServiceRequestsService {
     const monthlyVolume = new Map<string, number>();
     const dailyVolume = new Map<string, number>();
     const hourlyVolume = new Map<number, number>(Array.from({ length: 24 }, (_, hour) => [hour, 0]));
+    const dailyEarnings = new Map<string, number>();
     const eligibleOrders = requests.filter((request) => request.status !== 'Cancelled');
     const completedOrders = eligibleOrders.filter(
       (request) => request.status === 'Delivered' || request.deliveredAt !== null,
@@ -280,6 +282,7 @@ export class ServiceRequestsService {
         day: '2-digit',
       }).format(day);
       dailyVolume.set(key, 0);
+      dailyEarnings.set(key, 0);
     }
     for (const request of requests) {
       const date = request.requestedAt;
@@ -297,6 +300,7 @@ export class ServiceRequestsService {
         day: '2-digit',
       }).format(date);
       dailyVolume.set(dayKey, (dailyVolume.get(dayKey) ?? 0) + 1);
+      dailyEarnings.set(dayKey, (dailyEarnings.get(dayKey) ?? 0) + amount);
       if (toManilaDate(date) === todayKey) {
         hourlyVolume.set(hour, (hourlyVolume.get(hour) ?? 0) + 1);
       }
@@ -343,6 +347,11 @@ export class ServiceRequestsService {
         : Number(((completedOrders.length / eligibleOrders.length) * 100).toFixed(1)),
       loyaltyClaimsThisMonth: redemptions.length,
       earningsToday: [...hourly.entries()].sort(([a], [b]) => a - b).map(([hour, earnings]) => ({ hour: `${hour}:00`, earnings })),
+      earningsThisWeek: [...dailyEarnings.entries()].map(([key, earnings]) => ({
+        day: new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'Asia/Manila' })
+          .format(new Date(`${new Date().getFullYear()}-${key}T00:00:00+08:00`)),
+        earnings,
+      })),
       earningsThisMonth: [...weekly.entries()].sort(([a], [b]) => a - b).map(([week, earnings]) => ({ week: `Week ${week}`, earnings })),
       topSellingTanks: rankedTanks,
       orderVolumeTrend: [...monthlyVolume.entries()].map(([key, orders]) => ({
