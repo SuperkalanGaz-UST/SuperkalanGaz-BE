@@ -44,6 +44,7 @@ export interface BranchRow {
   name: string;
   code: string;
   status: 'active' | 'inactive';
+  region: string | null;
   province: string | null;
   city: string | null;
   address: string | null;
@@ -383,6 +384,7 @@ export class BranchesService {
       name: b.name,
       code: b.code,
       status: b.status,
+      region: b.region,
       province: b.province,
       city: b.city,
       address: b.address,

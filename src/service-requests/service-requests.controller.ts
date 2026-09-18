@@ -25,7 +25,7 @@ import { CancelServiceRequestDto } from './dto/cancel-service-request.dto';
 import { ReassignServiceRequestDto } from './dto/reassign-service-request.dto';
 import { LogDelayReasonDto } from './dto/log-delay-reason.dto';
 import { ServiceRequest } from './service-request.entity';
-import { ServiceRequestsService } from './service-requests.service';
+import { ServiceRequestsService, FranchiseOrderAnalyticsSeries } from './service-requests.service';
 import {
   CheckoutView,
   PaymentView,
@@ -55,6 +55,26 @@ export class ServiceRequestsController {
   ): Promise<{ serviceRequests: ReturnType<ServiceRequestsController['toRow']>[] }> {
     const items = await this.serviceRequests.listForCustomer(principal);
     return { serviceRequests: items.map((item) => this.toRow(item)) };
+  }
+
+  /**
+   * Cross-branch order-volume analytics for the Franchise Administrator dashboard.
+   * Returns monthly order counts (total, delivered, cancelled) per active branch
+   * for the given date window, optionally filtered by region or branchId.
+   * No Principal branch-scope is applied — this is intentionally a global view.
+   */
+  @Get('franchise-analytics')
+  @Roles('franchise-admin')
+  async franchiseAnalytics(
+    @Query('from') from: string,
+    @Query('to') to: string,
+    @Query('branchId') branchId?: string,
+    @Query('region') region?: string,
+  ): Promise<{ series: FranchiseOrderAnalyticsSeries[] }> {
+    const fromDate = from ? new Date(from) : (() => { const d = new Date(); d.setMonth(d.getMonth() - 6); d.setDate(1); d.setHours(0, 0, 0, 0); return d; })();
+    const toDate = to ? new Date(to) : new Date();
+    const series = await this.serviceRequests.franchiseAnalytics(fromDate, toDate, branchId, region);
+    return { series };
   }
 
   @Post('customer')

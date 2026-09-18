@@ -39,10 +39,11 @@ describe('CsatService branch reports', () => {
       ),
     } as unknown as jest.Mocked<Repository<ServiceRequest>>;
     const riders = {} as jest.Mocked<Repository<Rider>>;
+    const branches = {} as jest.Mocked<Repository<any>>;
     const dataSource = {} as jest.Mocked<DataSource>;
 
     return {
-      service: new CsatService(ratings, incidents, serviceRequests, riders, dataSource),
+      service: new CsatService(ratings, incidents, serviceRequests, riders, branches, dataSource),
       ratings,
       incidents,
       serviceRequests,

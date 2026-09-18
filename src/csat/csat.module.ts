@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from '../auth/auth.module';
+import { Branch } from '../branches/branch.entity';
 import { Rating } from './rating.entity';
 import { Incident } from './incident.entity';
 import { ServiceRequest } from '../service-requests/service-request.entity';
@@ -20,7 +21,7 @@ import { CsatService } from './csat.service';
  */
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Rating, Incident, ServiceRequest, Rider]),
+    TypeOrmModule.forFeature([Rating, Incident, ServiceRequest, Rider, Branch]),
     AuthModule,
   ],
   controllers: [CsatController],
