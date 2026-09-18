@@ -19,6 +19,7 @@ import {
 import { Principal } from '../auth/principal';
 import { BranchReportQuery } from '../common/dto/branch-report.query';
 import { reportRangeFrom } from '../common/report-range';
+import { Branch } from '../branches/branch.entity';
 import { Rating } from './rating.entity';
 import { Incident } from './incident.entity';
 import { ServiceRequest } from '../service-requests/service-request.entity';
@@ -117,6 +118,8 @@ export class CsatService {
     private readonly serviceRequests: Repository<ServiceRequest>,
     @InjectRepository(Rider)
     private readonly riders: Repository<Rider>,
+    @InjectRepository(Branch)
+    private readonly branches: Repository<Branch>,
     // The complaint-logging transaction spans two tables (incidents + the linked
     // Service Request's status), so it needs a transaction that covers both.
     private readonly dataSource: DataSource,
@@ -320,45 +323,39 @@ export class CsatService {
    */
   async getSummary(principal: Principal): Promise<CsatSummary> {
     const branchIds = this.requireBranches(principal);
-
-    const rows = await this.ratings.find({
-      where: { branchId: In(branchIds) },
-      select: { id: true, stars: true, resolutionStatus: true },
-    });
-
-    return this.summarizeRatings(rows);
+    return this.fetchAggregatedSummary(branchIds);
   }
 
   /** Same rating aggregation as the BM summary, narrowed to one owned branch. */
   async getSummaryForBranch(principal: Principal, branchId: string): Promise<CsatSummary> {
     const [authorizedBranchId] = this.reportBranchIds(principal, branchId);
-    const rows = await this.ratings.find({
-      where: { branchId: authorizedBranchId },
-      select: { id: true, stars: true, resolutionStatus: true },
-    });
-
-    return this.summarizeRatings(rows);
+    return this.fetchAggregatedSummary([authorizedBranchId]);
   }
 
-  private summarizeRatings(rows: Array<Pick<Rating, 'id' | 'stars' | 'resolutionStatus'>>): CsatSummary {
+  private async fetchAggregatedSummary(branchIds: string[]): Promise<CsatSummary> {
+    const result = await this.ratings
+      .createQueryBuilder('rating')
+      .select('COUNT(rating.id)', 'totalRatings')
+      .addSelect(
+        `COALESCE(SUM(CASE WHEN rating.resolution_status = 'Open' AND rating.stars <= :maxStars THEN 1 ELSE 0 END), 0)::int`,
+        'openCount',
+      )
+      .addSelect('AVG(rating.stars)', 'averageStars')
+      .where('rating.branch_id IN (:...branchIds)', { branchIds })
+      .setParameter('maxStars', LOW_CSAT_MAX_STARS)
+      .getRawOne();
 
-    // "Open Complaints" = complaint-band (≤2★) Open ratings the BM must act on.
-    // 3–5★ ratings are auto-resolved at submission, but guard here too for any
-    // legacy rows created before that rule was introduced.
-    const openCount = rows.filter(
-      (r) => r.resolutionStatus === 'Open' && r.stars <= LOW_CSAT_MAX_STARS,
-    ).length;
-    const lowCsatOpenCount = openCount; // same definition, kept for API compat
-    const resolvedCount = rows.length - openCount;
+    const totalRatings = parseInt(result.totalRatings || '0', 10);
+    const openCount = parseInt(result.openCount || '0', 10);
+    const resolvedCount = totalRatings - openCount;
+    const averageStars = totalRatings > 0 ? Number(parseFloat(result.averageStars).toFixed(2)) : null;
 
     return {
       openCount,
       resolvedCount,
-      lowCsatOpenCount,
-      averageStars: rows.length
-        ? Number((rows.reduce((sum, r) => sum + r.stars, 0) / rows.length).toFixed(2))
-        : null,
-      totalRatings: rows.length,
+      lowCsatOpenCount: openCount,
+      averageStars,
+      totalRatings,
     };
   }
 
@@ -656,4 +653,77 @@ export class CsatService {
     }
     return [requestedBranchId];
   }
+
+  /**
+   * Cross-branch CSAT analytics for the Franchise Administrator dashboard.
+   * Returns monthly weighted-average CSAT scores per branch for the requested date
+   * window, joined with branch name and region. Optional `branchId` or `region`
+   * narrow the result.
+   */
+  async franchiseAnalytics(
+    from: Date,
+    to: Date,
+    branchId?: string,
+    region?: string,
+  ): Promise<FranchiseCsatAnalyticsSeries[]> {
+    const qb = this.ratings
+      .createQueryBuilder('r')
+      .select([
+        `to_char(date_trunc('month', r.submitted_at AT TIME ZONE 'Asia/Manila'), 'YYYY-MM') AS month`,
+        'r.branch_id AS branch_id',
+        'b.name AS branch_name',
+        'b.region AS region',
+        'COUNT(*)::int AS total_ratings',
+        'ROUND(AVG(r.stars)::numeric, 2)::float AS avg_stars',
+      ])
+      .innerJoin(
+        Branch,
+        'b',
+        'b.id = r.branch_id',
+      )
+      .where('r.submitted_at >= :from', { from })
+      .andWhere('r.submitted_at < :to', { to })
+      .andWhere("b.status = 'active'")
+      .groupBy(`date_trunc('month', r.submitted_at AT TIME ZONE 'Asia/Manila')`)
+      .addGroupBy('r.branch_id')
+      .addGroupBy('b.name')
+      .addGroupBy('b.region')
+      .orderBy(`date_trunc('month', r.submitted_at AT TIME ZONE 'Asia/Manila')`, 'ASC');
+
+    if (branchId) {
+      qb.andWhere('r.branch_id = :branchId', { branchId });
+    } else if (region === 'Unassigned') {
+      qb.andWhere('b.region IS NULL');
+    } else if (region) {
+      qb.andWhere('b.region = :region', { region });
+    }
+
+    const rows = await qb.getRawMany<{
+      month: string;
+      branch_id: string;
+      branch_name: string;
+      region: string | null;
+      total_ratings: number;
+      avg_stars: number;
+    }>();
+
+    return rows.map((r) => ({
+      month: r.month,
+      branchId: r.branch_id,
+      branchName: r.branch_name,
+      region: r.region,
+      totalRatings: Number(r.total_ratings),
+      avgStars: Number(r.avg_stars),
+    }));
+  }
+}
+
+/** One data point in the Franchise Admin CSAT analytics series. */
+export interface FranchiseCsatAnalyticsSeries {
+  month: string;
+  branchId: string;
+  branchName: string;
+  region: string | null;
+  totalRatings: number;
+  avgStars: number;
 }

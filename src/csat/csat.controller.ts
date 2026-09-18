@@ -12,7 +12,7 @@ import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
-import { CsatService, CsatSummary, IncidentListItem, RatingListItem } from './csat.service';
+import { CsatService, CsatSummary, FranchiseCsatAnalyticsSeries, IncidentListItem, RatingListItem } from './csat.service';
 import { Rating } from './rating.entity';
 import { Incident } from './incident.entity';
 import { ServiceRequest } from '../service-requests/service-request.entity';
@@ -97,6 +97,25 @@ export class CsatController {
         total_responses: summary.totalRatings,
       },
     };
+  }
+
+  /**
+   * Cross-branch CSAT analytics for the Franchise Administrator dashboard.
+   * Returns monthly weighted-average CSAT scores per active branch for the given
+   * date window, optionally filtered by region or branchId.
+   */
+  @Get('franchise-analytics')
+  @Roles('franchise-admin')
+  async franchiseAnalytics(
+    @Query('from') from: string,
+    @Query('to') to: string,
+    @Query('branchId') branchId?: string,
+    @Query('region') region?: string,
+  ): Promise<{ series: FranchiseCsatAnalyticsSeries[] }> {
+    const fromDate = from ? new Date(from) : (() => { const d = new Date(); d.setMonth(d.getMonth() - 6); d.setDate(1); d.setHours(0, 0, 0, 0); return d; })();
+    const toDate = to ? new Date(to) : new Date();
+    const series = await this.csat.franchiseAnalytics(fromDate, toDate, branchId, region);
+    return { series };
   }
 
   /**

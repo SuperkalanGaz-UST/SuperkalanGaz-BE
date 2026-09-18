@@ -365,15 +365,38 @@ export class ServiceRequestsService {
     };
   }
 
-  async getBranchSalesRecords(principal: Principal, branchId: string): Promise<BranchSalesRecord[]> {
+  async getBranchSalesRecords(
+    principal: Principal, 
+    branchId: string,
+    page: number = 1,
+    limit: number = 1000000,
+    search?: string,
+    status?: string
+  ): Promise<{ sales: BranchSalesRecord[], totalCount: number }> {
     if (!this.requireBranches(principal).includes(branchId)) {
       throw new ForbiddenException('Sales branch is outside the caller scope');
     }
-    const requests = await this.serviceRequests.find({
-      where: { branchId, deletedAt: IsNull() },
-      order: { requestedAt: 'DESC' },
-    });
-    return requests.map((request) => ({
+    
+    const qb = this.serviceRequests.createQueryBuilder('sr')
+      .where('sr.branch_id = :branchId', { branchId })
+      .andWhere('sr.deleted_at IS NULL');
+      
+    if (search) {
+      qb.andWhere('(sr.sr_code ILIKE :search OR sr.customer_name ILIKE :search)', { search: `%${search}%` });
+    }
+    
+    if (status && status !== 'all') {
+      const paymentStatus = status.toLowerCase() === 'paid' ? 'Paid' : 'Unpaid';
+      qb.andWhere('sr.payment_status = :paymentStatus', { paymentStatus });
+    }
+    
+    qb.orderBy('sr.requested_at', 'DESC')
+      .skip((page - 1) * limit)
+      .take(limit);
+      
+    const [requests, totalCount] = await qb.getManyAndCount();
+    
+    const sales = requests.map((request) => ({
       id: request.id,
       date: request.requestedAt,
       receipt: request.srCode,
@@ -382,6 +405,8 @@ export class ServiceRequestsService {
       spent: request.totalAmount ?? 0,
       paid: request.paymentStatus === 'Paid' ? 'Paid' : 'Unpaid',
     }));
+    
+    return { sales, totalCount };
   }
 
   /**
@@ -1816,4 +1841,83 @@ export class ServiceRequestsService {
   private requireBranch(principal: Principal): string {
     return this.requireBranches(principal)[0];
   }
+
+  /**
+   * Cross-branch order-volume analytics for the Franchise Administrator dashboard.
+   * Returns monthly order counts (total, delivered, cancelled) per branch for the
+   * requested date window, joined with branch name and region.  Optional
+   * `branchId` or `region` narrow the result to a single branch or region.
+   */
+  async franchiseAnalytics(
+    from: Date,
+    to: Date,
+    branchId?: string,
+    region?: string,
+  ): Promise<FranchiseOrderAnalyticsSeries[]> {
+    const qb = this.serviceRequests
+      .createQueryBuilder('sr')
+      .select([
+        `to_char(date_trunc('month', sr.requested_at AT TIME ZONE 'Asia/Manila'), 'YYYY-MM') AS month`,
+        'sr.branch_id AS branch_id',
+        'b.name AS branch_name',
+        'b.region AS region',
+        'COUNT(*)::int AS order_count',
+        `SUM(CASE WHEN sr.status = 'Delivered' THEN 1 ELSE 0 END)::int AS delivered_count`,
+        `SUM(CASE WHEN sr.status = 'Cancelled' THEN 1 ELSE 0 END)::int AS cancelled_count`,
+      ])
+      .innerJoin(
+        Branch,
+        'b',
+        'b.id = sr.branch_id',
+      )
+      .where('sr.requested_at >= :from', { from })
+      .andWhere('sr.requested_at < :to', { to })
+      .andWhere('sr.deleted_at IS NULL')
+      .andWhere("b.status = 'active'")
+      .groupBy(`date_trunc('month', sr.requested_at AT TIME ZONE 'Asia/Manila')`)
+      .addGroupBy('sr.branch_id')
+      .addGroupBy('b.name')
+      .addGroupBy('b.region')
+      .orderBy(`date_trunc('month', sr.requested_at AT TIME ZONE 'Asia/Manila')`, 'ASC');
+
+    if (branchId) {
+      qb.andWhere('sr.branch_id = :branchId', { branchId });
+    } else if (region === 'Unassigned') {
+      qb.andWhere('b.region IS NULL');
+    } else if (region) {
+      qb.andWhere('b.region = :region', { region });
+    }
+
+    const rows = await qb.getRawMany<{
+      month: string;
+      branch_id: string;
+      branch_name: string;
+      region: string | null;
+      order_count: number;
+      delivered_count: number;
+      cancelled_count: number;
+    }>();
+
+    return rows.map((r) => ({
+      month: r.month,
+      branchId: r.branch_id,
+      branchName: r.branch_name,
+      region: r.region,
+      orderCount: Number(r.order_count),
+      deliveredCount: Number(r.delivered_count),
+      cancelledCount: Number(r.cancelled_count),
+    }));
+  }
 }
+
+/** One data point in the Franchise Admin order-volume analytics series. */
+export interface FranchiseOrderAnalyticsSeries {
+  month: string;
+  branchId: string;
+  branchName: string;
+  region: string | null;
+  orderCount: number;
+  deliveredCount: number;
+  cancelledCount: number;
+}
+
