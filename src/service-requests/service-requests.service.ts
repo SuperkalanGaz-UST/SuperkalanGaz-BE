@@ -130,6 +130,7 @@ export interface BranchDashboardMetrics {
   topSellingTanks: Array<{ size: string; orders: number }>;
   orderVolumeTrend: Array<{ month: string; orders: number }>;
   dailyOrderVolume: Array<{ day: string; orders: number }>;
+  hourlyOrderVolume: Array<{ hour: string; orders: number }>;
   totalRevenue: number;
   revenueByTank: Array<{ size: string; revenue: number }>;
   sales: Array<{
@@ -253,6 +254,7 @@ export class ServiceRequestsService {
     const tankRevenue = new Map<string, number>();
     const monthlyVolume = new Map<string, number>();
     const dailyVolume = new Map<string, number>();
+    const hourlyVolume = new Map<number, number>(Array.from({ length: 24 }, (_, hour) => [hour, 0]));
     const eligibleOrders = requests.filter((request) => request.status !== 'Cancelled');
     const completedOrders = eligibleOrders.filter(
       (request) => request.status === 'Delivered' || request.deliveredAt !== null,
@@ -263,8 +265,14 @@ export class ServiceRequestsService {
       const key = `${month.getUTCFullYear()}-${String(month.getUTCMonth() + 1).padStart(2, '0')}`;
       monthlyVolume.set(key, 0);
     }
+    // Anchored to the requested range's actual last day, not server "now" —
+    // otherwise this skeleton silently drifts from the data whenever `to`
+    // isn't today (it happened to line up before only because the frontend
+    // always requests a range ending today).
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const rangeEndDate = new Date(endExclusive.getTime() - DAY_MS);
     for (let offset = 6; offset >= 0; offset -= 1) {
-      const day = new Date();
+      const day = new Date(rangeEndDate);
       day.setUTCDate(day.getUTCDate() - offset);
       const key = new Intl.DateTimeFormat('en-CA', {
         timeZone: 'Asia/Manila',
@@ -289,6 +297,9 @@ export class ServiceRequestsService {
         day: '2-digit',
       }).format(date);
       dailyVolume.set(dayKey, (dailyVolume.get(dayKey) ?? 0) + 1);
+      if (toManilaDate(date) === todayKey) {
+        hourlyVolume.set(hour, (hourlyVolume.get(hour) ?? 0) + 1);
+      }
     }
     for (const request of trendRequests) {
       if (request.status === 'Cancelled') continue;
@@ -344,6 +355,8 @@ export class ServiceRequestsService {
           .format(new Date(`${new Date().getFullYear()}-${key}T00:00:00+08:00`)),
         orders,
       })),
+      hourlyOrderVolume: [...hourlyVolume.entries()].sort(([a], [b]) => a - b)
+        .map(([hour, orders]) => ({ hour: `${String(hour).padStart(2, '0')}:00`, orders })),
       totalRevenue: requests.reduce((sum, request) => sum + (request.totalAmount ?? 0), 0),
       revenueByTank: [...new Set([...supportedCylinderSizes, ...tankRevenue.keys()])]
         .map((size) => ({ size, revenue: tankRevenue.get(size) ?? 0 }))

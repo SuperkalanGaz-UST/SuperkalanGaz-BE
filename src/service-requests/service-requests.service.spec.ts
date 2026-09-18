@@ -13,6 +13,7 @@ import { Customer } from '../cim/customer.entity';
 import { FleetService } from '../fleet/fleet.service';
 import { Rider } from '../fleet/rider.entity';
 import { LoyaltyService } from '../loyalty/loyalty.service';
+import { Redemption } from '../loyalty/redemption.entity';
 import { PricesService } from '../prices/prices.service';
 import { PayMongoService } from './paymongo.service';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
@@ -143,6 +144,11 @@ describe('ServiceRequestsService', () => {
       })),
       removeObject: jest.fn(() => Promise.resolve()),
     }) as unknown as jest.Mocked<PrivateObjectStorageService>;
+
+  const makeRedemptions = (rows: Partial<Redemption>[] = []) =>
+    ({
+      find: jest.fn(() => Promise.resolve(rows as Redemption[])),
+    }) as unknown as jest.Mocked<Repository<Redemption>>;
 
   // sla defaults to "no thresholds configured" so every pre-existing call site
   // (which only ever passed the first four args) is unaffected — appended at
@@ -1201,6 +1207,76 @@ describe('ServiceRequestsService', () => {
         }),
       ).rejects.toBeInstanceOf(ForbiddenException);
       expect(repo.find).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getBranchDashboardMetrics', () => {
+    const manilaDateKey = (date: Date) =>
+      new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(date);
+
+    const makeDashboardService = (requests: Partial<ServiceRequest>[]) => {
+      const repo = makeRepo().repo;
+      repo.find = jest.fn(() => Promise.resolve(requests as ServiceRequest[])) as never;
+      return new ServiceRequestsService(
+        repo,
+        makeBranches(),
+        makeHistory(),
+        makeSlaConfig(),
+        makeFleet(null),
+        makeCim(null),
+        makePrices(),
+        makePayMongo(),
+        makeLoyalty(),
+        undefined,
+        undefined,
+        makeRedemptions(),
+      );
+    };
+
+    it("anchors the dailyOrderVolume skeleton to the requested range's end date, not server \"now\"", async () => {
+      // A range entirely in the past, far from whenever this test actually
+      // runs — the pre-fix skeleton was built from `new Date()`, so it would
+      // never overlap a request placed inside a fixed 2020 range.
+      const service = makeDashboardService([
+        { id: 'sr-1', branchId: 'branch-uuid-1', status: 'Pending', requestedAt: new Date('2020-01-07T04:00:00Z'), cylinderSize: '11kg', quantity: 1 },
+      ]);
+
+      const result = await service.getBranchDashboardMetrics(
+        { userId: 'user-1', role: 'branch-manager', branches: ['Alpha'], branchIds: ['branch-uuid-1'] },
+        { from: '2020-01-01', to: '2020-01-07', branchId: 'branch-uuid-1' },
+      );
+
+      // Exactly the 7-day skeleton anchored on the requested range — no stray
+      // extra bucket for a day the (buggy) "now"-anchored skeleton wouldn't
+      // have included.
+      expect(result.dailyOrderVolume).toHaveLength(7);
+      const totalDailyOrders = result.dailyOrderVolume.reduce((sum, entry) => sum + entry.orders, 0);
+      expect(totalDailyOrders).toBe(1);
+    });
+
+    it('returns 24 sorted hourly buckets, counting only today\'s requests', async () => {
+      const now = new Date();
+      const todayKey = manilaDateKey(now);
+      const todayAt9am = new Date(`${todayKey}T09:00:00+08:00`);
+      const tenDaysAgo = new Date(now.getTime() - 10 * 24 * 60 * 60 * 1000);
+
+      const service = makeDashboardService([
+        { id: 'sr-today', branchId: 'branch-uuid-1', status: 'Pending', requestedAt: todayAt9am, cylinderSize: '11kg', quantity: 1 },
+        { id: 'sr-old', branchId: 'branch-uuid-1', status: 'Pending', requestedAt: tenDaysAgo, cylinderSize: '11kg', quantity: 1 },
+      ]);
+
+      const result = await service.getBranchDashboardMetrics(
+        { userId: 'user-1', role: 'branch-manager', branches: ['Alpha'], branchIds: ['branch-uuid-1'] },
+        { from: manilaDateKey(tenDaysAgo), to: todayKey, branchId: 'branch-uuid-1' },
+      );
+
+      expect(result.hourlyOrderVolume).toHaveLength(24);
+      expect(result.hourlyOrderVolume[0].hour).toBe('00:00');
+      expect(result.hourlyOrderVolume[23].hour).toBe('23:00');
+      expect(result.hourlyOrderVolume.find((entry) => entry.hour === '09:00')?.orders).toBe(1);
+      // The 10-day-old request must not leak into any hourly bucket.
+      const totalHourlyOrders = result.hourlyOrderVolume.reduce((sum, entry) => sum + entry.orders, 0);
+      expect(totalHourlyOrders).toBe(1);
     });
   });
 });
