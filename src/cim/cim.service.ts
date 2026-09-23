@@ -48,7 +48,13 @@ export class CimService {
     principal: Principal,
     query: SearchCustomersQuery,
   ): Promise<CustomerListItem[]> {
-    const branchIds = this.requireBranches(principal);
+    let branchIds = this.requireBranches(principal);
+    if (query.branchId) {
+      if (!branchIds.includes(query.branchId)) {
+        throw new ForbiddenException('Branch not assigned to caller');
+      }
+      branchIds = [query.branchId];
+    }
     const term = query.search?.trim();
 
     const customerQuery = this.customers

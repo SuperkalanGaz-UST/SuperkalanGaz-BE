@@ -23,7 +23,7 @@ import { SearchCustomersQuery } from './dto/search-customers.query';
  */
 @Controller('customers')
 @UseGuards(AuthGuard, RolesGuard)
-@Roles('branch-manager')
+@Roles('branch-manager', 'branch-owner')
 export class CimController {
   constructor(private readonly cim: CimService) {}
 
@@ -41,6 +41,7 @@ export class CimController {
   }
 
   @Post()
+  @Roles('branch-manager')
   async create(
     @CurrentPrincipal() principal: Principal,
     @Body() dto: CreateCustomerDto,

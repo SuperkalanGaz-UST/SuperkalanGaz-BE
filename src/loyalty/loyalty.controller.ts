@@ -226,7 +226,7 @@ export class LoyaltyController {
    * points OR commercial 30+1 cycles — never a blend of both).
    */
   @Get('customers/:customerId')
-  @Roles('branch-manager')
+  @Roles('branch-manager', 'branch-owner')
   async customerLedger(
     @CurrentPrincipal() principal: Principal,
     @Param('customerId', ParseUUIDPipe) customerId: string,

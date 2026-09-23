@@ -213,6 +213,7 @@ export class ServiceRequestsController {
   /** A CIM customer's order history — powers the Customer Directory's
    * click-through detail view (Branch Manager only, branch-scoped). */
   @Get('customers/:customerId')
+  @Roles('branch-manager', 'branch-owner')
   async byCustomer(
     @CurrentPrincipal() principal: Principal,
     @Param('customerId', ParseUUIDPipe) customerId: string,

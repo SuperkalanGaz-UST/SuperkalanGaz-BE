@@ -1,5 +1,5 @@
 import { Transform } from 'class-transformer';
-import { IsOptional, IsString, MinLength } from 'class-validator';
+import { IsOptional, IsString, IsUUID, MinLength } from 'class-validator';
 
 /**
  * Query for GET /customers, serving two callers:
@@ -18,4 +18,8 @@ export class SearchCustomersQuery {
   @IsString()
   @MinLength(2)
   search?: string;
+
+  @IsOptional()
+  @IsUUID()
+  branchId?: string;
 }
