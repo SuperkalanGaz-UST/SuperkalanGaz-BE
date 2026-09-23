@@ -347,11 +347,12 @@ export class ServiceRequestsService {
         : Number(((completedOrders.length / eligibleOrders.length) * 100).toFixed(1)),
       loyaltyClaimsThisMonth: redemptions.length,
       earningsToday: [...hourly.entries()].sort(([a], [b]) => a - b).map(([hour, earnings]) => ({ hour: `${hour}:00`, earnings })),
-      earningsThisWeek: [...dailyEarnings.entries()].map(([key, earnings]) => ({
-        day: new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'Asia/Manila' })
-          .format(new Date(`${new Date().getFullYear()}-${key}T00:00:00+08:00`)),
-        earnings,
-      })),
+      earningsThisWeek: [...dailyEarnings.entries()].map(([key, earnings]) => {
+        const d = new Date(`${new Date().getFullYear()}-${key}T00:00:00+08:00`);
+        const weekday = new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'Asia/Manila' }).format(d);
+        const dayNum = new Intl.DateTimeFormat('en-US', { day: 'numeric', timeZone: 'Asia/Manila' }).format(d);
+        return { day: `${weekday} ${dayNum}`, earnings };
+      }),
       earningsThisMonth: [...weekly.entries()].sort(([a], [b]) => a - b).map(([week, earnings]) => ({ week: `Week ${week}`, earnings })),
       topSellingTanks: rankedTanks,
       orderVolumeTrend: [...monthlyVolume.entries()].map(([key, orders]) => ({
@@ -359,11 +360,12 @@ export class ServiceRequestsService {
           .format(new Date(`${key}-01T00:00:00+08:00`)),
         orders,
       })),
-      dailyOrderVolume: [...dailyVolume.entries()].map(([key, orders]) => ({
-        day: new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'Asia/Manila' })
-          .format(new Date(`${new Date().getFullYear()}-${key}T00:00:00+08:00`)),
-        orders,
-      })),
+      dailyOrderVolume: [...dailyVolume.entries()].map(([key, orders]) => {
+        const d = new Date(`${new Date().getFullYear()}-${key}T00:00:00+08:00`);
+        const weekday = new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'Asia/Manila' }).format(d);
+        const dayNum = new Intl.DateTimeFormat('en-US', { day: 'numeric', timeZone: 'Asia/Manila' }).format(d);
+        return { day: `${weekday} ${dayNum}`, orders };
+      }),
       hourlyOrderVolume: [...hourlyVolume.entries()].sort(([a], [b]) => a - b)
         .map(([hour, orders]) => ({ hour: `${String(hour).padStart(2, '0')}:00`, orders })),
       totalRevenue: requests.reduce((sum, request) => sum + (request.totalAmount ?? 0), 0),

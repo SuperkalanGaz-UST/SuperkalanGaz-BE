@@ -81,6 +81,39 @@ export interface CustomerLedgerView {
   activeRedemptions: Redemption[];
 }
 
+export interface BranchLoyaltyOverview {
+  household: {
+    pointsEarnedThisMonth: number;
+    activeMembers: number;
+    expiringPoints: number;
+    membersWithExpiringPoints: number;
+    members: Array<{
+      id: string;
+      name: string;
+      phone: string;
+      pointsBalance: number;
+      expiringIn30Days: number;
+      nextExpiry: Date | null;
+      lastActivity: Date | null;
+      lastActivityType: string | null;
+    }>;
+  };
+  commercial: {
+    qualifyingPurchasesThisMonth: number;
+    activeAccounts: number;
+    nearReward: number;
+    accounts: Array<{
+      id: string;
+      business: string;
+      phone: string;
+      currentCycle: number;
+      completedCycles: number;
+      qualifyingPurchasesThisMonth: number;
+      lastQualifyingPurchase: Date | null;
+    }>;
+  };
+}
+
 /**
  * Loyalty Program Monitoring service (AGENTS.md §8a). Household points and
  * commercial 30+1 use separate accounts and immutable ledgers; only the shared
@@ -990,6 +1023,99 @@ export class LoyaltyService {
     };
   }
 
+  /** Read-only, branch-scoped data for the Branch Owner Rewards dashboard. */
+  async getBranchOverview(
+    principal: Principal,
+    selectedBranchId?: string,
+  ): Promise<BranchLoyaltyOverview> {
+    const branchId = this.requireSelectedBranch(principal, selectedBranchId);
+    const now = new Date();
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const thirtyDaysFromNow = new Date(now);
+    thirtyDaysFromNow.setUTCDate(thirtyDaysFromNow.getUTCDate() + 30);
+
+    const customers = await this.redemptions.manager
+      .createQueryBuilder()
+      .select(['c.id AS id', 'c.name AS name', 'c.contact_number AS phone', 'c.account_type AS "accountType"'])
+      .from('cim.customers', 'c')
+      .where('c.branch_id = :branchId', { branchId })
+      .andWhere('c.deleted_at IS NULL')
+      .getRawMany<{ id: string; name: string; phone: string; accountType: string }>();
+
+    const householdCustomers = customers.filter((customer) => customer.accountType === 'household');
+    const commercialCustomers = customers.filter((customer) => customer.accountType === 'commercial');
+    const householdAccounts = await this.accounts.find({ where: { branchId } });
+    for (const account of householdAccounts) await this.expireHouseholdAccount(account.id);
+    const currentHouseholdAccounts = await this.accounts.find({ where: { branchId } });
+    const transactions = await this.ledger.find({ where: { branchId }, order: { createdAt: 'ASC' } });
+    const transactionsByCustomer = new Map<string, HouseholdPointTransaction[]>();
+    for (const transaction of transactions) {
+      const customerTransactions = transactionsByCustomer.get(transaction.customerId) ?? [];
+      customerTransactions.push(transaction);
+      transactionsByCustomer.set(transaction.customerId, customerTransactions);
+    }
+    const accountByCustomer = new Map(currentHouseholdAccounts.map((account) => [account.customerId, account]));
+    const householdMembers = householdCustomers
+      .filter((customer) => accountByCustomer.has(customer.id))
+      .map((customer) => {
+        const customerTransactions = transactionsByCustomer.get(customer.id) ?? [];
+        const lots = this.remainingPointLots(customerTransactions);
+        const expiringLots = lots.filter((lot) =>
+          lot.remaining > 0 && lot.expiresAt && lot.expiresAt > now && lot.expiresAt <= thirtyDaysFromNow,
+        );
+        const latest = [...customerTransactions].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
+        const futureLots = lots.filter((lot) => lot.remaining > 0 && lot.expiresAt && lot.expiresAt > now);
+        futureLots.sort((a, b) => a.expiresAt!.getTime() - b.expiresAt!.getTime());
+        return {
+          id: customer.id,
+          name: customer.name,
+          phone: customer.phone,
+          pointsBalance: accountByCustomer.get(customer.id)!.pointsBalance,
+          expiringIn30Days: expiringLots.reduce((total, lot) => total + lot.remaining, 0),
+          nextExpiry: futureLots[0]?.expiresAt ?? null,
+          lastActivity: latest?.createdAt ?? null,
+          lastActivityType: latest?.type ?? null,
+        };
+      });
+    const commercialAccounts = await this.commercialAccounts.find({ where: { branchId } });
+    const commercialPurchases = await this.commercialPurchases.find({ where: { branchId }, order: { countedAt: 'DESC' } });
+    const commercialCustomerById = new Map(commercialCustomers.map((customer) => [customer.id, customer]));
+    const commercialRows = commercialAccounts
+      .filter((account) => commercialCustomerById.has(account.customerId))
+      .map((account) => {
+        const purchases = commercialPurchases.filter((purchase) => purchase.customerId === account.customerId);
+        const monthlyPurchases = purchases.filter((purchase) => purchase.countedAt >= monthStart && purchase.countedAt <= now);
+        const customer = commercialCustomerById.get(account.customerId)!;
+        return {
+          id: customer.id,
+          business: customer.name,
+          phone: customer.phone,
+          currentCycle: account.currentCycleCount,
+          completedCycles: account.completedCycles,
+          qualifyingPurchasesThisMonth: monthlyPurchases.length,
+          lastQualifyingPurchase: purchases[0]?.countedAt ?? null,
+        };
+      });
+
+    return {
+      household: {
+        pointsEarnedThisMonth: transactions
+          .filter((transaction) => transaction.type === 'earn' && transaction.earnedAt && transaction.earnedAt >= monthStart && transaction.earnedAt <= now)
+          .reduce((total, transaction) => total + transaction.pointsDelta, 0),
+        activeMembers: householdMembers.length,
+        expiringPoints: householdMembers.reduce((total, member) => total + member.expiringIn30Days, 0),
+        membersWithExpiringPoints: householdMembers.filter((member) => member.expiringIn30Days > 0).length,
+        members: householdMembers,
+      },
+      commercial: {
+        qualifyingPurchasesThisMonth: commercialRows.reduce((total, row) => total + row.qualifyingPurchasesThisMonth, 0),
+        activeAccounts: commercialRows.length,
+        nearReward: commercialRows.filter((row) => row.currentCycle >= 25 && row.currentCycle < 30).length,
+        accounts: commercialRows,
+      },
+    };
+  }
+
   /** Toggle the caller's branch loyalty Dual Authorization setting (BM-013). */
   async updateSettings(
     principal: Principal,
@@ -1525,6 +1651,33 @@ export class LoyaltyService {
       });
       if (account) await this.expireHouseholdPointsInTx(manager, account, new Date());
     });
+  }
+
+  private remainingPointLots(transactions: HouseholdPointTransaction[]): Array<{
+    remaining: number;
+    expiresAt: Date | null;
+  }> {
+    const lots: Array<{ id: string; remaining: number; expiresAt: Date | null }> = [];
+    for (const transaction of transactions) {
+      if (transaction.type === 'earn' && transaction.pointsDelta > 0) {
+        lots.push({ id: transaction.id, remaining: transaction.pointsDelta, expiresAt: transaction.expiresAt });
+        continue;
+      }
+      if (transaction.type === 'expire' && transaction.sourcePointTransactionId) {
+        const source = lots.find((lot) => lot.id === transaction.sourcePointTransactionId);
+        if (source) source.remaining = 0;
+        continue;
+      }
+      if (transaction.pointsDelta >= 0) continue;
+      let debit = -transaction.pointsDelta;
+      for (const lot of lots) {
+        if (debit === 0) break;
+        const consumed = Math.min(lot.remaining, debit);
+        lot.remaining -= consumed;
+        debit -= consumed;
+      }
+    }
+    return lots;
   }
 
   /** Apply due expiry once per earn row. Redemptions consume the oldest earn lots

@@ -17,7 +17,7 @@ import { CatalogItem } from './catalog-item.entity';
 import { CommercialPurchaseRecord } from './commercial-purchase-record.entity';
 import { HouseholdPointTransaction } from './household-point-transaction.entity';
 import { Redemption } from './redemption.entity';
-import { LedgerView, LoyaltyService, RedemptionListItem } from './loyalty.service';
+import { BranchLoyaltyOverview, LedgerView, LoyaltyService, RedemptionListItem } from './loyalty.service';
 import { CreateRedemptionDto } from './dto/create-redemption.dto';
 import { CreateCommercialRedemptionDto } from './dto/create-commercial-redemption.dto';
 import { RejectRedemptionDto } from './dto/reject-redemption.dto';
@@ -250,6 +250,15 @@ export class LoyaltyController {
         point_rates: s.pointRates,
       },
     };
+  }
+
+  @Get('overview')
+  @Roles('branch-owner')
+  async overview(
+    @CurrentPrincipal() principal: Principal,
+    @Query() query: BranchSelectionQuery,
+  ): Promise<{ overview: BranchLoyaltyOverview }> {
+    return { overview: await this.loyalty.getBranchOverview(principal, query.branchId) };
   }
 
   /**
