@@ -133,14 +133,15 @@ export class UsersService {
     dto: UpdateOwnProfileDto,
   ): Promise<OwnProfile> {
     const target = this.ownProfileFromPrincipal(principal);
+    // Only self-service fields go in this write. role/branch_ids/branches/status
+    // must NEVER be re-derived from the token and written back here: the token
+    // can be stale (issued before an admin demoted/deactivated this user), and
+    // doing so would silently resurrect revoked access on every profile save
+    // (H1 fix — this endpoint is reachable by every role on every save).
     const nextMetadata: Record<string, unknown> = {
       username: target.username,
       display_name: dto.name ?? target.displayName,
-      role: target.role,
-      branch_ids: target.branchIds,
-      branches: target.branches,
       phone: dto.phone !== undefined ? dto.phone : target.phone,
-      status: target.status,
     };
 
     await this.goTrue.updateUser(principal.userId, {

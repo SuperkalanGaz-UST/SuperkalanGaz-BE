@@ -1,4 +1,5 @@
 import {
+  IsIn,
   IsInt,
   IsNotEmpty,
   IsOptional,
@@ -7,6 +8,7 @@ import {
   registerDecorator,
   ValidationArguments,
 } from 'class-validator';
+import { CYLINDER_SIZES, CylinderSize } from '../../prices/dto/update-prices.dto';
 
 /**
  * Class-level guard: a PATCH must change SOMETHING. Every field below is
@@ -56,12 +58,12 @@ export class EditServiceRequestDto {
   @IsNotEmpty()
   deliveryAddress?: string;
 
-  // Plain string for MVP (e.g. "11kg"); a products/pricing catalog is deferred
-  // (AGENTS.md §13), so this stays free text — mirrors create.
+  // Canonical shared-catalog key, same allowlist as create — the service
+  // re-looks-up the effective price and recomputes unitPrice/totalAmount
+  // whenever this or quantity changes (never trust a client-supplied price).
   @IsOptional()
-  @IsString()
-  @IsNotEmpty()
-  cylinderSize?: string;
+  @IsIn([...CYLINDER_SIZES])
+  cylinderSize?: CylinderSize;
 
   @IsOptional()
   @IsInt()
