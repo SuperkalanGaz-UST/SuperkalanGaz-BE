@@ -1522,16 +1522,34 @@ export class ServiceRequestsService {
         set.deliveryAddress = next;
       }
     }
-    if (dto.cylinderSize !== undefined) {
-      const next = dto.cylinderSize.trim();
-      if (next !== serviceRequest.cylinderSize) {
-        changes.push(`cylinder_size "${serviceRequest.cylinderSize}" → "${next}"`);
-        set.cylinderSize = next;
+    // cylinderSize/quantity are priced fields — never patch either without
+    // re-deriving unitPrice/totalAmount from the live catalog (H2 fix: an
+    // edit must never leave a stale price snapshot on the order).
+    if (dto.cylinderSize !== undefined || dto.quantity !== undefined) {
+      const nextCylinderSize = dto.cylinderSize ?? serviceRequest.cylinderSize;
+      const nextQuantity = dto.quantity ?? serviceRequest.quantity;
+
+      if (
+        nextCylinderSize !== serviceRequest.cylinderSize ||
+        nextQuantity !== serviceRequest.quantity
+      ) {
+        const product = await this.prices.findByCylinderSize(nextCylinderSize);
+        const nextTotal = Number((product.unitPrice * nextQuantity).toFixed(2));
+
+        if (product.cylinderSize !== serviceRequest.cylinderSize) {
+          changes.push(
+            `cylinder_size "${serviceRequest.cylinderSize}" → "${product.cylinderSize}"`,
+          );
+          set.cylinderSize = product.cylinderSize;
+        }
+        if (nextQuantity !== serviceRequest.quantity) {
+          changes.push(`quantity ${serviceRequest.quantity} → ${nextQuantity}`);
+          set.quantity = nextQuantity;
+        }
+        changes.push(`total_amount ${serviceRequest.totalAmount} → ${nextTotal}`);
+        set.unitPrice = product.unitPrice;
+        set.totalAmount = nextTotal;
       }
-    }
-    if (dto.quantity !== undefined && dto.quantity !== serviceRequest.quantity) {
-      changes.push(`quantity ${serviceRequest.quantity} → ${dto.quantity}`);
-      set.quantity = dto.quantity;
     }
     if (dto.specialInstructions !== undefined) {
       const next = dto.specialInstructions.trim() || null;

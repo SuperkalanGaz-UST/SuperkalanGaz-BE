@@ -58,16 +58,15 @@ describe('UsersService self-service account updates', () => {
       phone: '+639189876543',
     });
 
+    // H1 regression: role/branch_ids/branches/status must NEVER appear in this
+    // write — they'd be re-derived from a possibly-stale token and could
+    // silently resurrect revoked access (see UsersService.updateOwnProfile).
     expect(goTrue.updateUser).toHaveBeenCalledWith(principal.userId, {
       email: 'franchise.admin@superkalan.com',
       app_metadata: {
         username: 'admin',
         display_name: 'Franchise Admin',
-        role: 'franchise-admin',
-        branch_ids: [],
-        branches: [],
         phone: '+639189876543',
-        status: 'Active',
       },
     });
     expect(goTrue.getUser).not.toHaveBeenCalled();
