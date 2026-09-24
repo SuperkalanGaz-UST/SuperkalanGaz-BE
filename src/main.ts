@@ -1,5 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import helmet from 'helmet';
 import { AppModule } from './app.module';
 
 async function bootstrap(): Promise<void> {
@@ -7,6 +8,10 @@ async function bootstrap(): Promise<void> {
   // the parsed JSON body so signature verification never hashes re-serialized
   // data (CU-017 AC4).
   const app = await NestFactory.create(AppModule, { rawBody: true });
+
+  // CSP/X-Frame-Options/etc — this API only serves JSON, so the default
+  // policy set is fine as-is.
+  app.use(helmet());
 
   // The web dashboard calls us cross-origin with a Bearer token (no cookies).
   const webOrigins = (process.env.WEB_ORIGIN ?? 'http://localhost:3000')
