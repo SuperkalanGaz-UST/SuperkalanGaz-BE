@@ -732,6 +732,8 @@ describe('ServiceRequestsService', () => {
       deliveryAddress: '123 Rizal St',
       cylinderSize: '11kg',
       quantity: 2,
+      unitPrice: 500,
+      totalAmount: 1000,
       specialInstructions: null,
     }) as ServiceRequest;
 
@@ -778,6 +780,40 @@ describe('ServiceRequestsService', () => {
       expect(saved.note).toContain('quantity 2 → 3');
       // Untouched fields are absent from the note.
       expect(saved.note).not.toContain('cylinder_size');
+    });
+
+    it('H2: recomputes unitPrice/totalAmount from the live catalog when cylinderSize or quantity changes, ignoring any client-supplied price', async () => {
+      const { repo, qb } = makeRepo(1);
+      repo.findOne = jest.fn(() => Promise.resolve(editablePendingSr())) as never;
+      const history = makeHistory();
+      const prices = makePrices(); // findByCylinderSize always returns unitPrice 650
+      const service = new ServiceRequestsService(
+        repo,
+        makeBranches(),
+        history,
+        makeSlaConfig(),
+        makeFleet(null),
+        makeCim(null),
+        prices,
+        makePayMongo(),
+        makeLoyalty(),
+      );
+
+      const result = await service.edit(principal(['branch-uuid-1']), 'sr-1', {
+        cylinderSize: '22kg',
+        quantity: 5,
+      });
+
+      // Price is re-derived from the catalog (650/unit), never trusted from the
+      // client and never left at the stale 500/unit snapshot.
+      expect(prices.findByCylinderSize).toHaveBeenCalledWith('22kg');
+      expect(result.unitPrice).toBe(650);
+      expect(result.totalAmount).toBe(3250); // 650 * 5, not the stale 500 * 5
+      expect(qb.execute).toHaveBeenCalledTimes(1);
+      const saved = history.create.mock.calls[0][0] as ServiceRequestStatusHistory;
+      expect(saved.note).toContain('cylinder_size "11kg" → "22kg"');
+      expect(saved.note).toContain('quantity 2 → 5');
+      expect(saved.note).toContain('total_amount 1000 → 3250');
     });
 
     it('409s when already dispatched (0 rows affected) and writes no history', async () => {
