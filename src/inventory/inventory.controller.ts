@@ -20,6 +20,14 @@ export class InventoryController {
     return { stockLevels: views.map((view) => this.toRow(view)) };
   }
 
+  @Post('stock-checks')
+  async logStockCheck(
+    @CurrentPrincipal() principal: Principal,
+  ): Promise<{ success: boolean }> {
+    await this.inventory.logStockCheck(principal);
+    return { success: true };
+  }
+
   @Post('stock-levels/intake')
   async intake(
     @CurrentPrincipal() principal: Principal,

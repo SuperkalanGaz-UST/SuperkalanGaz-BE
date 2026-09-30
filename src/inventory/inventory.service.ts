@@ -6,6 +6,7 @@ import { LpgProduct } from '../prices/lpg-product.entity';
 import { PricesService } from '../prices/prices.service';
 import { IntakeStockDto } from './dto/intake-stock.dto';
 import { StockLevel } from './stock-level.entity';
+import { StockCheckLog } from './stock-check-log.entity';
 
 /** One row per product the branch could stock — merges the shared LPG
  * catalog (source of truth for which products exist) with the branch's own
@@ -33,6 +34,8 @@ export class InventoryService {
   constructor(
     @InjectRepository(StockLevel)
     private readonly stockLevels: Repository<StockLevel>,
+    @InjectRepository(StockCheckLog)
+    private readonly stockCheckLogs: Repository<StockCheckLog>,
     private readonly prices: PricesService,
   ) {}
 
@@ -54,6 +57,15 @@ export class InventoryService {
       }
     }
     return views;
+  }
+
+  async logStockCheck(principal: Principal): Promise<void> {
+    const branchId = this.requireBranches(principal)[0];
+    await this.stockCheckLogs.insert({
+      branchId,
+      checkedBy: principal.userId,
+      checkedAt: new Date(),
+    });
   }
 
   /**
@@ -81,25 +93,33 @@ export class InventoryService {
     userId: string,
   ): Promise<StockLevel> {
     const now = new Date();
-    await this.stockLevels
-      .createQueryBuilder()
-      .insert()
-      .into(StockLevel)
-      .values({
+    await this.stockLevels.manager.transaction(async (manager) => {
+      await manager
+        .createQueryBuilder()
+        .insert()
+        .into(StockLevel)
+        .values({
+          branchId,
+          productId,
+          currentQty: qty,
+          updatedBy: userId,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .onConflict(
+          `(branch_id, product_id) WHERE deleted_at IS NULL DO UPDATE SET
+            current_qty = LEAST(stock_levels.current_qty + EXCLUDED.current_qty, stock_levels.capacity_qty),
+            updated_by = EXCLUDED.updated_by,
+            updated_at = EXCLUDED.updated_at`,
+        )
+        .execute();
+
+      await manager.insert(StockCheckLog, {
         branchId,
-        productId,
-        currentQty: qty,
-        updatedBy: userId,
-        createdAt: now,
-        updatedAt: now,
-      })
-      .onConflict(
-        `(branch_id, product_id) WHERE deleted_at IS NULL DO UPDATE SET
-          current_qty = LEAST(stock_levels.current_qty + EXCLUDED.current_qty, stock_levels.capacity_qty),
-          updated_by = EXCLUDED.updated_by,
-          updated_at = EXCLUDED.updated_at`,
-      )
-      .execute();
+        checkedBy: userId,
+        checkedAt: now,
+      });
+    });
 
     return this.stockLevels.findOneByOrFail({ branchId, productId, deletedAt: IsNull() });
   }

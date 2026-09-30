@@ -17,6 +17,7 @@ import {
   MoreThanOrEqual,
   Not,
   Repository,
+  DataSource,
 } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
@@ -92,18 +93,27 @@ type ThresholdMap = Partial<Record<SlaSegment, number>>;
 export type ReportSlaSegment =
   | 'request_to_dispatch'
   | 'dispatch_to_in_transit'
-  | 'in_transit_to_delivery';
+  | 'in_transit_to_delivery'
+  | 'dispatch_to_delivery';
 
 export interface SlaReportMetric {
   evaluated: number;
   compliant: number;
   breached: number;
   complianceRate: number | null;
+  totalMinutes: number;
+  averageMinutes: number | null;
 }
 
 export interface SlaOrderSourceMetric extends SlaReportMetric {
   total: number;
   notEvaluated: number;
+}
+
+export interface DailyStockCheckMetric {
+  distinctDaysChecked: number;
+  totalDaysInPeriod: number;
+  complianceRate: number | 'no data';
 }
 
 export interface SlaBranchReport {
@@ -115,6 +125,7 @@ export interface SlaBranchReport {
   overallComplianceRate: number | null;
   segments: Record<ReportSlaSegment, SlaReportMetric>;
   orderSources: Record<OrderSource, SlaOrderSourceMetric>;
+  dailyStockCheck: DailyStockCheckMetric;
 }
 
 export interface BranchDashboardMetrics {
@@ -195,6 +206,7 @@ export class ServiceRequestsService {
     private readonly prices: PricesService,
     private readonly payMongo: PayMongoService,
     private readonly loyalty: LoyaltyService,
+    private readonly dataSource: DataSource,
     // Optional keeps isolated legacy unit fixtures that exercise only the
     // non-upload BM path valid; the NestJS module always supplies both.
     @Optional()
@@ -707,6 +719,7 @@ export class ServiceRequestsService {
       request_to_dispatch: this.emptySlaMetric(),
       dispatch_to_in_transit: this.emptySlaMetric(),
       in_transit_to_delivery: this.emptySlaMetric(),
+      dispatch_to_delivery: this.emptySlaMetric(),
     };
     const orderSources: SlaBranchReport['orderSources'] = {
       'Mobile App': { ...this.emptySlaMetric(), total: 0, notEvaluated: 0 },
@@ -743,10 +756,11 @@ export class ServiceRequestsService {
       ];
 
       for (const input of segmentInputs) {
-        const threshold = thresholds[input.key];
+        const threshold = thresholds[input.key as SlaSegment];
         if (threshold == null || !input.from || !input.to) continue;
-        const compliant = this.minutesBetween(input.from, input.to) <= threshold;
-        this.recordSlaOutcome(segments[input.key], compliant);
+        const mins = this.minutesBetween(input.from, input.to);
+        const compliant = mins <= threshold;
+        this.recordSlaOutcome(segments[input.key], compliant, mins);
         overallResults.push(compliant);
       }
 
@@ -756,9 +770,10 @@ export class ServiceRequestsService {
       if (!request.inTransitAt && request.dispatchedAt && request.deliveredAt) {
         const endToEnd = thresholds.end_to_end;
         if (endToEnd != null) {
-          overallResults.push(
-            this.minutesBetween(request.dispatchedAt, request.deliveredAt) <= endToEnd,
-          );
+          const mins = this.minutesBetween(request.dispatchedAt, request.deliveredAt);
+          const compliant = mins <= endToEnd;
+          overallResults.push(compliant);
+          this.recordSlaOutcome(segments.dispatch_to_delivery, compliant, mins);
         }
       }
 
@@ -771,7 +786,10 @@ export class ServiceRequestsService {
 
       const compliant = overallResults.every(Boolean);
       evaluatedRequests += 1;
-      this.recordSlaOutcome(sourceMetric, compliant);
+      
+      // Calculate total end-to-end minutes if possible, or 0
+      const totalMins = request.requestedAt && request.deliveredAt ? this.minutesBetween(request.requestedAt, request.deliveredAt) : 0;
+      this.recordSlaOutcome(sourceMetric, compliant, totalMins);
       if (compliant) withinSla += 1;
       else breaches += 1;
     }
@@ -788,6 +806,32 @@ export class ServiceRequestsService {
       overallComplianceRate: this.complianceRate(withinSla, evaluatedRequests),
       segments,
       orderSources,
+      dailyStockCheck: await this.calculateDailyStockCheck(branchIds, start, endExclusive),
+    };
+  }
+
+  private async calculateDailyStockCheck(branchIds: string[], start: Date, endExclusive: Date): Promise<DailyStockCheckMetric> {
+    const totalDays = Math.round((endExclusive.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
+    if (totalDays === 0) return { distinctDaysChecked: 0, totalDaysInPeriod: 0, complianceRate: 'no data' };
+    
+    // Query distinct days in Manila time where the branch checked stock
+    const stockCheckResult = await this.dataSource.query(
+      `
+      SELECT COUNT(DISTINCT (checked_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Manila')::date) as "daysChecked"
+      FROM inventory.stock_check_logs
+      WHERE branch_id = ANY($1)
+        AND checked_at >= $2
+        AND checked_at < $3
+      `,
+      [branchIds, start, endExclusive]
+    );
+    const distinctDaysChecked = parseInt(stockCheckResult[0].daysChecked, 10);
+    const complianceRate = distinctDaysChecked === 0 ? 'no data' : Number(((distinctDaysChecked / totalDays) * 100).toFixed(1));
+
+    return {
+      distinctDaysChecked,
+      totalDaysInPeriod: totalDays,
+      complianceRate,
     };
   }
 
@@ -1709,17 +1753,19 @@ export class ServiceRequestsService {
   }
 
   private emptySlaMetric(): SlaReportMetric {
-    return { evaluated: 0, compliant: 0, breached: 0, complianceRate: null };
+    return { evaluated: 0, compliant: 0, breached: 0, complianceRate: null, totalMinutes: 0, averageMinutes: null };
   }
 
-  private recordSlaOutcome(metric: SlaReportMetric, compliant: boolean): void {
+  private recordSlaOutcome(metric: SlaReportMetric, compliant: boolean, minutes: number): void {
     metric.evaluated += 1;
+    metric.totalMinutes += minutes;
     if (compliant) metric.compliant += 1;
     else metric.breached += 1;
   }
 
   private finishSlaMetric(metric: SlaReportMetric): void {
     metric.complianceRate = this.complianceRate(metric.compliant, metric.evaluated);
+    metric.averageMinutes = metric.evaluated === 0 ? null : Number((metric.totalMinutes / metric.evaluated).toFixed(1));
   }
 
   private complianceRate(compliant: number, evaluated: number): number | null {

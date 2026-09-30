@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { IsIn, IsInt, IsOptional, Max, Min } from 'class-validator';
+import { IsIn, IsInt, IsISO8601, IsOptional, Max, Min } from 'class-validator';
 
 /** Resolution filters for the CSAT queue: the two lifecycle states plus 'all'
  * (no filter). Single source of truth, reused by the validator below. */
@@ -30,4 +30,12 @@ export class ListRatingsQuery {
   @IsOptional()
   @IsIn(RESOLUTION_FILTERS as unknown as string[])
   resolution?: ResolutionFilter;
+
+  @IsOptional()
+  @IsISO8601()
+  from?: string;
+
+  @IsOptional()
+  @IsISO8601()
+  to?: string;
 }

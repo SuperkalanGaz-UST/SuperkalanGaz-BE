@@ -8,6 +8,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import {
   And,
+  Between,
   DataSource,
   In,
   IsNull,
@@ -136,6 +137,13 @@ export class CsatService {
     principal: Principal,
     query: ListRatingsQuery,
   ): Promise<RatingListItem[]> {
+    if ((query.from && !query.to) || (!query.from && query.to)) {
+      throw new BadRequestException('Both from and to must be provided together');
+    }
+    if (query.from && query.to && new Date(query.from).getTime() > new Date(query.to).getTime()) {
+      throw new BadRequestException('from date must not be later than to date');
+    }
+
     const branchIds = this.requireBranches(principal);
 
     // Only filter by star range if explicitly requested. When maxStars is
@@ -151,9 +159,12 @@ export class CsatService {
           ? { stars: LessThanOrEqual(query.maxStars) }
           : {}),
         ...(resolution === 'all' ? {} : { resolutionStatus: resolution }),
+        ...(query.from && query.to
+          ? { submittedAt: Between(new Date(query.from), new Date(query.to)) }
+          : {}),
       },
       order: { submittedAt: 'DESC' },
-      take: 200,
+      take: query.from && query.to ? 10000 : 200,
     });
     if (ratings.length === 0) return [];
 

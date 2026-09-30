@@ -143,7 +143,7 @@ export class ServiceRequestsController {
 
   /** Branch Owner read-only Service Level Management analytics. */
   @Get('reports/sla')
-  @Roles('branch-owner')
+  @Roles('branch-manager', 'branch-owner')
   async slaReport(
     @CurrentPrincipal() principal: Principal,
     @Query() query: BranchReportQuery,
@@ -163,6 +163,7 @@ export class ServiceRequestsController {
           compliant_requests: metric.compliant,
           breached_requests: metric.breached,
           compliance_rate: metric.complianceRate,
+          average_minutes: metric.averageMinutes,
         })),
         order_sources: Object.entries(report.orderSources).map(([source, metric]) => ({
           source,
@@ -173,6 +174,11 @@ export class ServiceRequestsController {
           not_evaluated: metric.notEvaluated,
           compliance_rate: metric.complianceRate,
         })),
+        daily_stock_check: {
+          distinct_days_checked: report.dailyStockCheck.distinctDaysChecked,
+          total_days_in_period: report.dailyStockCheck.totalDaysInPeriod,
+          compliance_rate: report.dailyStockCheck.complianceRate,
+        },
       },
     };
   }
