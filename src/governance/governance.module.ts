@@ -6,27 +6,22 @@ import { NotificationsModule } from '../notifications/notifications.module';
 import { PricesModule } from '../prices/prices.module';
 import { SlaConfiguration } from '../service-requests/sla-configuration.entity';
 import { UsersModule } from '../users/users.module';
-import { GovernanceAuditEvent } from './governance-audit-event.entity';
-import { GovernanceAuditService } from './governance-audit.service';
+import { GovernanceAuditModule } from './governance-audit.module';
 import { GovernanceController } from './governance.controller';
 import { GovernanceRequest } from './governance-request.entity';
 import { GovernanceService } from './governance.service';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([
-      GovernanceRequest,
-      GovernanceAuditEvent,
-      Branch,
-      SlaConfiguration,
-    ]),
+    TypeOrmModule.forFeature([GovernanceRequest, Branch, SlaConfiguration]),
     AuthModule,
     UsersModule,
     PricesModule,
     NotificationsModule,
+    GovernanceAuditModule,
   ],
   controllers: [GovernanceController],
-  providers: [GovernanceService, GovernanceAuditService],
-  exports: [GovernanceAuditService],
+  providers: [GovernanceService],
+  exports: [GovernanceAuditModule],
 })
 export class GovernanceModule {}

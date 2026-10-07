@@ -4,6 +4,7 @@ import {
   IsOptional,
   IsString,
   Matches,
+  MaxLength,
   MinLength,
 } from 'class-validator';
 
@@ -24,8 +25,12 @@ export class RegisterDto {
   })
   identifier!: string;
 
+  // L5 fix: was MinLength(6), weaker than every other password rule in the
+  // app (invitations/settings all require 8) — this is the public signup
+  // endpoint, the one place a weak minimum matters most.
   @IsString()
-  @MinLength(6)
+  @MinLength(8)
+  @MaxLength(72)
   password!: string;
 
   @IsString()

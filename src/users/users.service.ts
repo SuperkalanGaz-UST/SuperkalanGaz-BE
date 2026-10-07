@@ -14,6 +14,7 @@ import {
 } from '../auth/branch-scope';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
+import { GovernanceAuditService } from '../governance/governance-audit.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { ListUsersQuery } from './dto/list-users.query';
 import { UpdateOwnProfileDto } from './dto/update-own-profile.dto';
@@ -95,6 +96,7 @@ export class UsersService {
     private readonly goTrue: GoTrueAdminService,
     @InjectRepository(Branch)
     private readonly branchRepository: Repository<Branch>,
+    private readonly audit: GovernanceAuditService,
   ) {}
 
   /**
@@ -260,6 +262,20 @@ export class UsersService {
       await this.goTrue.updateUser(id, {
         ...(dto.email ? { email: dto.email } : {}),
         ...(dto.password ? { password: dto.password } : {}),
+      });
+      // M1 fix: a password/email reset here is a silent account takeover path
+      // (no re-auth, no notification) unless it lands in the immutable audit
+      // trail. Never record the password itself — only that it changed.
+      await this.audit.record({
+        category: 'admin-account',
+        action: 'admin-credential-change',
+        actor: principal,
+        affectedRecordType: 'user',
+        affectedRecordId: id,
+        afterState: {
+          passwordReset: !!dto.password,
+          ...(dto.email ? { emailChangedTo: dto.email } : {}),
+        },
       });
     }
 

@@ -83,10 +83,11 @@ export class ServiceRequestsController {
     @CurrentPrincipal() principal: Principal,
     @Body() dto: CreateCustomerServiceRequestDto,
   ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
+    // L4 fix: this used to log the full dto (customer name, contact number,
+    // delivery address) — never log PII, even to local stdout.
     console.log('[service-requests] createCustomerOrder request', {
       userId: principal.userId,
       role: principal.role,
-      dto,
       branchId: dto.branchId,
     });
     const row = await this.serviceRequests.createForCustomer(principal, dto);

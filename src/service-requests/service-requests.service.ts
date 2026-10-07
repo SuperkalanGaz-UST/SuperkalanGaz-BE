@@ -513,11 +513,11 @@ export class ServiceRequestsService {
     if (!principal.accountType) {
       throw new ForbiddenException('Customer account type is missing');
     }
+    // L4 fix: never log PII (customer name was previously included here).
     console.log('[service-requests-service] createForCustomer input', {
       userId: principal.userId,
       role: principal.role,
       branchId: dto.branchId,
-      customerName: dto.customerName,
       quantity: dto.quantity,
       cylinderSize: dto.cylinderSize,
     });
