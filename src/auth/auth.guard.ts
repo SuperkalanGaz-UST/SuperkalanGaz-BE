@@ -52,7 +52,11 @@ export class AuthGuard implements CanActivate {
     // Role/branch scope/status come from app_metadata — written only by our
     // service-role GoTrue calls, so the client cannot widen its own access.
     const claims = (payload.app_metadata ?? {}) as Record<string, unknown>;
-    const requestPath = request.originalUrl || request.url || '';
+    // L11 fix: `request.path` is Express's routed path with the query string
+    // already stripped — matching on `originalUrl` (which includes it) meant
+    // a query string on this one route silently fell through to a 403 instead
+    // of matching. Fails closed either way, but this is the correct match.
+    const requestPath = request.path || request.originalUrl || request.url || '';
     const isCustomerPublicBranchLookup = request.method === 'GET' && requestPath.endsWith('/api/branches/public');
     const claimedRole = typeof claims.role === 'string'
       ? claims.role
@@ -61,14 +65,6 @@ export class AuthGuard implements CanActivate {
         : undefined;
 
     if (!isRole(claimedRole)) {
-      console.log('[auth] denied account without CRM role', {
-        requestPath,
-        method: request.method,
-        claims: {
-          role: claims.role,
-          status: claims.status,
-        },
-      });
       throw new ForbiddenException('No CRM role for this account');
     }
     const allowPendingInvitation =
@@ -135,12 +131,6 @@ export class AuthGuard implements CanActivate {
     if (claimedRole === 'branch-manager' && orderedBranches.length !== 1) {
       throw new ForbiddenException('Branch Manager must have exactly one active branch');
     }
-    console.log('[auth] resolved principal', {
-      requestPath,
-      method: request.method,
-      role: claimedRole,
-      userId: payload.sub,
-    });
 
     const principal: Principal = {
       userId: payload.sub,

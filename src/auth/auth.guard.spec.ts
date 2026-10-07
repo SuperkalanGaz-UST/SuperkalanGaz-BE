@@ -154,4 +154,31 @@ describe('AuthGuard UUID branch scope', () => {
       ForbiddenException,
     );
   });
+
+  it('L11: still recognizes the public branch lookup when the request carries a query string', async () => {
+    // originalUrl includes the query string; path does not. Matching on
+    // originalUrl meant a request like /api/branches/public?x=1 silently
+    // stopped being recognized as the public lookup. path is the fix.
+    const request = {
+      headers: {},
+      method: 'GET',
+      path: '/api/branches/public',
+      originalUrl: '/api/branches/public?x=1',
+    } as Partial<Request>;
+    const jwt = {
+      verify: jest.fn().mockResolvedValue({ sub: 'customer-1', app_metadata: {} }),
+    } as unknown as SupabaseJwtService;
+    const branches = { find: jest.fn().mockResolvedValue([]) } as unknown as Repository<Branch>;
+    const reflector = {
+      getAllAndOverride: jest.fn().mockReturnValue(false),
+    } as unknown as Reflector;
+    const guard = new AuthGuard(jwt, reflector, branches);
+    // The Bearer header must still be present for the guard to get this far;
+    // what's under test is the role-less claim being treated as 'customer'.
+    (request as Record<string, unknown>).headers = { authorization: 'Bearer token' };
+
+    await expect(guard.canActivate(contextFor(request))).resolves.toBe(true);
+    const principal = (request as Record<string, unknown>)[REQUEST_PRINCIPAL] as Principal;
+    expect(principal.role).toBe('customer');
+  });
 });
