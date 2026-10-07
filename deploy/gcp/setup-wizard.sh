@@ -377,7 +377,7 @@ fi
 
 open_url "https://cloud.google.com/products/calculator"
 step "Estimate the entire planned cost through the trial-credit expiry: 24/7 VM, disk, external IPv4, Cloud Run, network, image storage, logs, backup and restore testing."
-step "Enter the estimate from the calculator as a draft only; preserve a separate reserve. A preliminary plan suggested US$70–120 cost and US$150 reserve, not a quote or approval."
+step "Enter the estimate from the calculator as a draft only; preserve a separate reserve. A preliminary plan suggested US\$70–120 cost and US\$150 reserve, not a quote or approval."
 ask_fresh GCP_COST_ESTIMATE_USD "Full-window estimated cost (USD; recalculate now):"
 while [[ ! "$GCP_COST_ESTIMATE_USD" =~ ^[0-9]+([.][0-9]{1,2})?$ ]]; do
   warn "Enter a non-negative amount, for example 120 or 120.00."
