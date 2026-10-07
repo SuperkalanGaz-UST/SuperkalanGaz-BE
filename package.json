@@ -7,7 +7,7 @@
     "build": "nest build",
     "start": "nest start",
     "start:dev": "nest start --watch",
-    "start:prod": "node dist/main",
+    "start:prod": "npm run build && node dist/main.js",
     "seed:store-locations": "nest build && node dist/seeds/known-store-locations.seeder",
     "seed:loyalty-demo": "nest build && node dist/seeds/loyalty-demo.seeder",
     "seed:csat-demo": "nest build && node dist/seeds/csat-demo.seeder",

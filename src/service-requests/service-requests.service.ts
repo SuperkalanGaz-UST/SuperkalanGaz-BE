@@ -967,9 +967,8 @@ export class ServiceRequestsService {
    *     uploaded first and its metadata is committed with the delivery state.
    *  4. Return the rider to 'Available' so the branch can dispatch them again.
    *
-   * En Route / in_transit_at is GPS/hardware-dependent and deferred (AGENTS.md
-   * §8) — a request may be delivered with in_transit_at still NULL; that is
-   * expected and NOT backfilled here.
+   * Delivery Riders must have started the delivery (En Route). Branch Managers
+   * retain manual completion for Walk-in/Phone requests with no assigned rider.
    *
    * PANEL-CHECK: BM-007's CSAT rating prompt to the customer is a customer MOBILE
    * concern (customers are mobile-only, AGENTS.md §7) — it is deliberately NOT
@@ -996,11 +995,16 @@ export class ServiceRequestsService {
     });
     if (!serviceRequest) throw new NotFoundException('Service request not found');
 
-    // Branch Managers may complete requests in their branch. A Delivery Rider
-    // must additionally be the authenticated rider assigned to this request;
-    // the client never supplies or selects that identity.
+    if (principal.role !== 'driver' && principal.role !== 'branch-manager') {
+      throw new ForbiddenException('Only the assigned Delivery Rider or Branch Manager can complete delivery');
+    }
+    if (principal.role === 'branch-manager' &&
+        (serviceRequest.orderSource !== 'Walk-in/Phone' || serviceRequest.riderId !== null)) {
+      throw new ForbiddenException('Rider deliveries must be completed by the assigned rider with a proof photo');
+    }
+
+    // The client never supplies or selects the completing rider's identity.
     let authenticatedRiderId: string | null = serviceRequest.riderId;
-    let existingProof: ServiceRequestDeliveryProof | null = null;
     if (principal.role === 'driver') {
       this.requireProofDependencies();
       const rider = await this.fleet.findByAuthUserInBranch(
@@ -1011,21 +1015,24 @@ export class ServiceRequestsService {
         throw new ForbiddenException('This Service Request is not assigned to you');
       }
       authenticatedRiderId = rider.id;
-      existingProof = await this.findLiveProof(id, serviceRequest.branchId);
-      if (!proof && !existingProof) {
+      if (serviceRequest.deliveredAt || serviceRequest.status !== 'En Route') {
+        throw new ConflictException('Only an On the way order can be completed with delivery proof');
+      }
+      if (!proof) {
         throw new BadRequestException('A delivery proof photo is required');
       }
     }
 
-    // Delivery and loyalty credit are deliberately retryable together. If the
-    // delivery row committed but the post-commit loyalty write failed, retrying
-    // this endpoint repairs the idempotent ledger entry instead of stranding it.
+    // Retain the existing idempotent loyalty repair for manual deliveries.
+    // Rider proof submissions reject duplicates before reaching this path.
     if (serviceRequest.deliveredAt && serviceRequest.status === 'Delivered') {
-      if (principal.role === 'driver' && !existingProof && proof && authenticatedRiderId) {
-        await this.attachProofToDeliveredRequest(serviceRequest, authenticatedRiderId, proof);
-      }
       await this.recordDeliveredPurchase(serviceRequest);
       return serviceRequest;
+    }
+
+    if (!serviceRequest.dispatchedAt || serviceRequest.deliveredAt ||
+        !['Dispatched', 'En Route'].includes(serviceRequest.status)) {
+      throw new ConflictException('Service request is not out for delivery');
     }
 
     // 2 + 3. Commit atomically: only a request that is out for delivery
@@ -1033,6 +1040,9 @@ export class ServiceRequestsService {
     //    request is not out for delivery (still Pending, already Delivered, or
     //    Cancelled) — or a concurrent deliver already won — so treat it as the
     //    conflict, mirroring the dispatch race guard (AGENTS.md §8.2).
+    const preparedProof = proof && authenticatedRiderId
+      ? await this.prepareProof(serviceRequest, authenticatedRiderId, proof)
+      : null;
     const now = new Date();
     const deliverySet: Partial<ServiceRequest> = {
       deliveredAt: now,
@@ -1045,31 +1055,36 @@ export class ServiceRequestsService {
       deliverySet.paymentStatus = 'Paid';
       deliverySet.paymentPaidAt = now;
     }
-    const preparedProof = proof && authenticatedRiderId
-      ? await this.prepareProof(serviceRequest, authenticatedRiderId, proof)
-      : null;
-
     let affected = 0;
     try {
-      if (preparedProof) {
-        // The database transition and proof metadata commit together. The
-        // object upload happened first, so a delivery is never marked complete
-        // before the photo is available to persist.
-        affected = await this.serviceRequests.manager.transaction(async (manager) => {
-          const result = await manager
-            .createQueryBuilder()
-            .update(ServiceRequest)
-            .set(deliverySet)
-            .where(
-              `id = :id
-                AND branch_id = :branchId
-                AND dispatched_at IS NOT NULL
-                AND delivered_at IS NULL`,
-              { id, branchId: serviceRequest.branchId },
-            )
-            .execute();
-          if (!result.affected) return 0;
+      // The database transition and proof metadata commit together. The
+      // object upload happened first, so a delivery is never marked complete
+      // before the photo is available to persist.
+      affected = await this.serviceRequests.manager.transaction(async (manager) => {
+        const result = await manager
+          .createQueryBuilder()
+          .update(ServiceRequest)
+          .set(deliverySet)
+          .where(
+            `id = :id
+              AND branch_id = :branchId
+              AND dispatched_at IS NOT NULL
+              AND delivered_at IS NULL
+              AND status = :expectedStatus
+              AND ${principal.role === 'driver'
+                ? 'rider_id = :riderId'
+                : 'rider_id IS NULL AND order_source = :orderSource'}`,
+            {
+              id, branchId: serviceRequest.branchId,
+              expectedStatus: serviceRequest.status,
+              riderId: authenticatedRiderId,
+              orderSource: 'Walk-in/Phone',
+            },
+          )
+          .execute();
+        if (!result.affected) return 0;
 
+        if (preparedProof) {
           const proofs = manager.getRepository(ServiceRequestDeliveryProof);
           await proofs.save(proofs.create({
             id: preparedProof.id,
@@ -1084,23 +1099,21 @@ export class ServiceRequestsService {
             uploadedAt: preparedProof.uploadedAt,
             deletedAt: null,
           }));
-          return result.affected;
-        });
-      } else {
-        const result = await this.serviceRequests
-          .createQueryBuilder()
-          .update(ServiceRequest)
-          .set(deliverySet)
-          .where(
-            `id = :id
-              AND branch_id = :branchId
-              AND dispatched_at IS NOT NULL
-              AND delivered_at IS NULL`,
-            { id, branchId: serviceRequest.branchId },
-          )
-          .execute();
-        affected = result.affected ?? 0;
-      }
+        }
+        const history = manager.getRepository(ServiceRequestStatusHistory);
+        await history.save(history.create({
+          serviceRequestId: id,
+          branchId: serviceRequest.branchId,
+          fromStatus: serviceRequest.status,
+          toStatus: 'Delivered',
+          changedBy: principal.userId,
+          changedAt: now,
+          note: principal.role === 'driver'
+            ? 'Delivery Rider submitted proof of delivery'
+            : 'Branch Manager marked Walk-in/Phone order delivered',
+        }));
+        return result.affected;
+      });
     } catch (error) {
       if (preparedProof) await this.cleanupPreparedProof(preparedProof);
       throw error;
@@ -1111,7 +1124,9 @@ export class ServiceRequestsService {
       const concurrentlyDelivered = await this.serviceRequests.findOne({
         where: { id, branchId: In(branchIds), deletedAt: IsNull() },
       });
-      if (concurrentlyDelivered?.deliveredAt && concurrentlyDelivered.status === 'Delivered') {
+      if (principal.role === 'branch-manager' &&
+          concurrentlyDelivered?.deliveredAt && concurrentlyDelivered.status === 'Delivered' &&
+          concurrentlyDelivered.orderSource === 'Walk-in/Phone' && concurrentlyDelivered.riderId === null) {
         await this.recordDeliveredPurchase(concurrentlyDelivered);
         return concurrentlyDelivered;
       }
@@ -1256,46 +1271,6 @@ export class ServiceRequestsService {
       sha256: createHash('sha256').update(proof.buffer).digest('hex'),
       uploadedAt,
     };
-  }
-
-  private async attachProofToDeliveredRequest(
-    serviceRequest: ServiceRequest,
-    riderId: string,
-    proof: DeliveryProofUpload,
-  ): Promise<void> {
-    const preparedProof = await this.prepareProof(serviceRequest, riderId, proof);
-    try {
-      const attached = await this.serviceRequests.manager.transaction(async (manager) => {
-        const proofs = manager.getRepository(ServiceRequestDeliveryProof);
-        const existing = await proofs.findOne({
-          where: {
-            serviceRequestId: serviceRequest.id,
-            branchId: serviceRequest.branchId,
-            deletedAt: IsNull(),
-          },
-        });
-        if (existing) return false;
-
-        await proofs.save(proofs.create({
-          id: preparedProof.id,
-          serviceRequestId: preparedProof.serviceRequestId,
-          branchId: preparedProof.branchId,
-          riderId: preparedProof.riderId,
-          storagePath: preparedProof.path,
-          originalFileName: preparedProof.originalFileName,
-          mimeType: preparedProof.mimeType,
-          byteSize: preparedProof.byteSize,
-          sha256: preparedProof.sha256,
-          uploadedAt: preparedProof.uploadedAt,
-          deletedAt: null,
-        }));
-        return true;
-      });
-      if (!attached) await this.cleanupPreparedProof(preparedProof);
-    } catch (error) {
-      await this.cleanupPreparedProof(preparedProof);
-      throw error;
-    }
   }
 
   private async cleanupPreparedProof(proof: PreparedDeliveryProof): Promise<void> {

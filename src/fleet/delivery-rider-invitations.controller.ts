@@ -85,6 +85,24 @@ export class DeliveryRiderInvitationsController {
     return { message: 'Verification code sent' };
   }
 
+  @Get('session/details')
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles('driver')
+  @AllowPendingInvitation()
+  async sessionDetails(@CurrentPrincipal() principal: Principal) {
+    return this.invitations.detailsForSession(principal);
+  }
+
+  @Post('session/confirm-details')
+  @HttpCode(200)
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles('driver')
+  @AllowPendingInvitation()
+  async confirmSessionDetails(@CurrentPrincipal() principal: Principal) {
+    await this.invitations.confirmDetailsForSession(principal);
+    return { message: 'Delivery Rider details confirmed' };
+  }
+
   @Get('session/mobile-verification')
   @UseGuards(AuthGuard, RolesGuard)
   @Roles('driver')
@@ -170,6 +188,19 @@ export class DeliveryRiderInvitationsController {
   ) {
     return {
       invitation: await this.invitations.revoke(principal, id, dto.reason),
+    };
+  }
+
+  @Patch(':id/deactivate')
+  @UseGuards(AuthGuard, RolesGuard)
+  @Roles('branch-owner')
+  async deactivate(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: RevokeDeliveryRiderInvitationDto,
+  ) {
+    return {
+      invitation: await this.invitations.deactivate(principal, id, dto.reason),
     };
   }
 }

@@ -4,6 +4,7 @@ import { ExecutionContext } from '@nestjs/common/interfaces';
 import { Request } from 'express';
 import { Repository } from 'typeorm';
 import { Branch } from '../branches/branch.entity';
+import { GoTrueAdminService } from '../users/gotrue-admin.service';
 import { AuthGuard } from './auth.guard';
 import { Principal, REQUEST_PRINCIPAL } from './principal';
 import { SupabaseJwtService } from './supabase-jwt.service';
@@ -20,6 +21,12 @@ function contextFor(request: Partial<Request>): ExecutionContext {
 }
 
 describe('AuthGuard UUID branch scope', () => {
+  const goTrue = {
+    getUser: jest.fn().mockResolvedValue({
+      app_metadata: { status: 'Pending' },
+      banned_until: null,
+    }),
+  } as unknown as GoTrueAdminService;
   beforeEach(() => {
     jest.spyOn(console, 'log').mockImplementation(() => undefined);
   });
@@ -51,7 +58,7 @@ describe('AuthGuard UUID branch scope', () => {
     const reflector = {
       getAllAndOverride: jest.fn().mockReturnValue(false),
     } as unknown as Reflector;
-    const guard = new AuthGuard(jwt, reflector, branches);
+    const guard = new AuthGuard(jwt, reflector, branches, goTrue);
 
     await expect(guard.canActivate(contextFor(request))).resolves.toBe(true);
     const principal = (request as Record<string, unknown>)[REQUEST_PRINCIPAL] as Principal;
@@ -84,7 +91,7 @@ describe('AuthGuard UUID branch scope', () => {
     const reflector = {
       getAllAndOverride: jest.fn().mockReturnValue(false),
     } as unknown as Reflector;
-    const guard = new AuthGuard(jwt, reflector, branches);
+    const guard = new AuthGuard(jwt, reflector, branches, goTrue);
 
     await expect(guard.canActivate(contextFor(request))).rejects.toBeInstanceOf(
       ForbiddenException,
@@ -116,7 +123,7 @@ describe('AuthGuard UUID branch scope', () => {
     const reflector = {
       getAllAndOverride: jest.fn().mockReturnValue(true),
     } as unknown as Reflector;
-    const guard = new AuthGuard(jwt, reflector, branches);
+    const guard = new AuthGuard(jwt, reflector, branches, goTrue);
 
     await expect(guard.canActivate(contextFor(request))).resolves.toBe(true);
     const principal = (request as Record<string, unknown>)[REQUEST_PRINCIPAL] as Principal;
@@ -148,8 +155,36 @@ describe('AuthGuard UUID branch scope', () => {
     const reflector = {
       getAllAndOverride: jest.fn().mockReturnValue(false),
     } as unknown as Reflector;
-    const guard = new AuthGuard(jwt, reflector, branches);
+    const guard = new AuthGuard(jwt, reflector, branches, goTrue);
 
+    await expect(guard.canActivate(contextFor(request))).rejects.toBeInstanceOf(
+      ForbiddenException,
+    );
+  });
+
+  it('rejects a deactivated rider even when the JWT still says Active', async () => {
+    const request = {
+      headers: { authorization: 'Bearer token' },
+      method: 'GET',
+      originalUrl: '/api/delivery-rider/me',
+    } as Partial<Request>;
+    const jwt = {
+      verify: jest.fn().mockResolvedValue({
+        sub: 'driver-1',
+        app_metadata: { role: 'driver', status: 'Active', branch_ids: [firstBranchId] },
+      }),
+    } as unknown as SupabaseJwtService;
+    const branches = { find: jest.fn() } as unknown as Repository<Branch>;
+    const reflector = {
+      getAllAndOverride: jest.fn().mockReturnValue(false),
+    } as unknown as Reflector;
+    const inactiveGoTrue = {
+      getUser: jest.fn().mockResolvedValue({
+        app_metadata: { status: 'Inactive' }, banned_until: null,
+      }),
+    } as unknown as GoTrueAdminService;
+
+    const guard = new AuthGuard(jwt, reflector, branches, inactiveGoTrue);
     await expect(guard.canActivate(contextFor(request))).rejects.toBeInstanceOf(
       ForbiddenException,
     );

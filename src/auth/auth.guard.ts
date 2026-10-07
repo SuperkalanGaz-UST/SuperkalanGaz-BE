@@ -10,6 +10,7 @@ import { Reflector } from '@nestjs/core';
 import { Request } from 'express';
 import { In, Repository } from 'typeorm';
 import { Branch } from '../branches/branch.entity';
+import { GoTrueAdminService } from '../users/gotrue-admin.service';
 import {
   hasMetadataBranchIds,
   metadataBranchIds,
@@ -34,6 +35,7 @@ export class AuthGuard implements CanActivate {
     private readonly reflector: Reflector,
     @InjectRepository(Branch)
     private readonly branches: Repository<Branch>,
+    private readonly goTrue: GoTrueAdminService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -84,6 +86,20 @@ export class AuthGuard implements CanActivate {
       !allowPendingInvitation
     ) {
       throw new ForbiddenException('This account is inactive');
+    }
+
+    // A previously issued JWT can still say Active after account deactivation.
+    // Read the live Auth record for riders so a ban takes effect on the next API request.
+    if (claimedRole === 'driver') {
+      const live = await this.goTrue.getUser(payload.sub);
+      const liveStatus = live?.app_metadata.status;
+      const bannedUntil = live?.banned_until
+        ? new Date(live.banned_until).getTime()
+        : 0;
+      if (!live || bannedUntil > Date.now() ||
+          (liveStatus !== 'Active' && !(allowPendingInvitation && liveStatus === 'Pending'))) {
+        throw new ForbiddenException('This account is inactive');
+      }
     }
 
     const claimedBranchIds = metadataBranchIds(claims);
