@@ -1,7 +1,8 @@
-import { APP_INTERCEPTOR } from '@nestjs/core';
+import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { resolve4 } from 'node:dns/promises';
 import { DatabaseRetryInterceptor } from './common/database-retry.interceptor';
 import { AuthModule } from './auth/auth.module';
@@ -29,6 +30,12 @@ import { GovernanceModule } from './governance/governance.module';
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    // M3 fix: no route had any request-rate limiting. This generous global
+    // default (120 req/min/IP) exists to stop runaway loops and brute force,
+    // not to throttle normal dashboard polling; individual public auth/
+    // invitation routes layer a much tighter limit via @Throttle (see their
+    // controllers) since they are the realistic abuse targets.
+    ThrottlerModule.forRoot([{ name: 'default', ttl: 60_000, limit: 120 }]),
     TypeOrmModule.forRootAsync({
       inject: [ConfigService],
       useFactory: async (config: ConfigService) => {
@@ -61,6 +68,12 @@ import { GovernanceModule } from './governance/governance.module';
         return {
           type: 'postgres' as const,
           url: databaseUrl.toString(),
+          // M6 (partial — see audit/PR notes): `rejectUnauthorized: true`
+          // was tested live against this Supabase pooler and failed with
+          // "self-signed certificate in certificate chain" — the connection
+          // needs a pinned CA, not just this flag, so flipping it blindly
+          // would have broken connectivity in every environment. Left as-is
+          // until the correct CA bundle is sourced and verified.
           ssl: { rejectUnauthorized: false },
           connectTimeoutMS: 10_000,
           poolSize: 5,
@@ -116,6 +129,10 @@ import { GovernanceModule } from './governance/governance.module';
     {
       provide: APP_INTERCEPTOR,
       useClass: DatabaseRetryInterceptor,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard,
     },
   ],
 })

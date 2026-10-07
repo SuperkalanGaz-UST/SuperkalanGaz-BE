@@ -10,6 +10,7 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import {
@@ -29,18 +30,25 @@ import {
   VerifyDeliveryRiderSessionMobileDto,
 } from './dto/delivery-rider-invitation.dto';
 
+/** M3 fix: unauthenticated and, per-request, does a full GoTrue user-list scan
+ * to find the invitation token — a much tighter limit than the app-wide
+ * default applies, since a legitimate caller only ever needs a few of these. */
+const PUBLIC_INVITATION_THROTTLE = { default: { limit: 10, ttl: 60_000 } };
+
 @Controller('delivery-rider-invitations')
 export class DeliveryRiderInvitationsController {
   constructor(private readonly invitations: DeliveryRiderInvitationsService) {}
 
   /** Public only because possession of the high-entropy, expiring token is required. */
   @Get('acceptance')
+  @Throttle(PUBLIC_INVITATION_THROTTLE)
   async acceptance(@Query() dto: DeliveryRiderInvitationTokenDto) {
     return this.invitations.acceptance(dto.token);
   }
 
   @Post('account')
   @HttpCode(200)
+  @Throttle(PUBLIC_INVITATION_THROTTLE)
   async createAccount(@Body() dto: CreateDeliveryRiderAccountDto) {
     await this.invitations.createAccount(dto.token, dto.password);
     return { message: 'Delivery Rider account password created' };
@@ -48,6 +56,7 @@ export class DeliveryRiderInvitationsController {
 
   @Post('accept')
   @HttpCode(200)
+  @Throttle(PUBLIC_INVITATION_THROTTLE)
   async accept(@Body() dto: DeliveryRiderInvitationTokenDto) {
     await this.invitations.accept(dto.token);
     return { message: 'Delivery Rider account activated' };

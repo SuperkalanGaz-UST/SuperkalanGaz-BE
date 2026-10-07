@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from '../auth/auth.module';
 import { Branch } from '../branches/branch.entity';
+import { CimModule } from '../cim/cim.module';
 import { GovernanceModule } from '../governance/governance.module';
 import { ServiceRequest } from '../service-requests/service-request.entity';
 import { UsersModule } from '../users/users.module';
@@ -35,6 +36,7 @@ import { TraccarClient } from './traccar/traccar.client';
     AuthModule,
     GovernanceModule,
     UsersModule,
+    CimModule,
   ],
   controllers: [
     FleetController,

@@ -2,8 +2,13 @@ import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
+import { GovernanceAuditService } from '../governance/governance-audit.service';
 import { GoTrueAdminService, GoTrueUser } from './gotrue-admin.service';
 import { UsersService } from './users.service';
+
+/** M1: every test constructs a fresh no-op audit mock unless it asserts on it. */
+const makeAudit = () =>
+  ({ record: jest.fn().mockResolvedValue(undefined) }) as unknown as jest.Mocked<GovernanceAuditService>;
 
 describe('UsersService self-service account updates', () => {
   const principal: Principal = {
@@ -48,6 +53,7 @@ describe('UsersService self-service account updates', () => {
     service = new UsersService(
       goTrue as unknown as GoTrueAdminService,
       branchRepository,
+      makeAudit(),
     );
   });
 
@@ -123,13 +129,93 @@ describe('UsersService governance boundaries', () => {
         { id: branchId, name: 'Quezon City', status: 'active' },
       ]),
     } as unknown as Repository<Branch>;
-    const service = new UsersService(goTrue, branchRepository);
+    const service = new UsersService(goTrue, branchRepository, makeAudit());
 
     await expect(
       service.update(principal, owner.id, {
         branchIds: ['22222222-2222-4222-8222-222222222222'],
       }),
     ).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it('M1: audits a credential change but never records the raw password', async () => {
+    const target: GoTrueUser = {
+      id: 'b54295ca-2d97-4c77-8a31-c06ded29d93f',
+      email: 'manager@superkalan.com',
+      app_metadata: {
+        role: 'branch-manager',
+        branch_ids: [branchId],
+        branches: ['Quezon City'],
+        status: 'Active',
+      },
+      user_metadata: {},
+      banned_until: null,
+      created_at: '2026-01-10T00:00:00.000Z',
+    };
+    const goTrue = {
+      getUser: jest.fn().mockResolvedValue(target),
+      updateUser: jest.fn().mockResolvedValue(undefined),
+    } as unknown as GoTrueAdminService;
+    const branchRepository = {
+      find: jest.fn().mockResolvedValue([
+        { id: branchId, name: 'Quezon City', status: 'active' },
+      ]),
+    } as unknown as Repository<Branch>;
+    const audit = makeAudit();
+    const service = new UsersService(goTrue, branchRepository, audit);
+    const faPrincipal: Principal = {
+      userId: 'fa-1',
+      role: 'franchise-admin',
+      displayName: 'Franchise Admin',
+      branches: [],
+      branchIds: [],
+    };
+
+    await service.update(faPrincipal, target.id, { password: 'new-password-123' });
+
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        category: 'admin-account',
+        action: 'admin-credential-change',
+        actor: faPrincipal,
+        affectedRecordType: 'user',
+        affectedRecordId: target.id,
+        afterState: { passwordReset: true },
+      }),
+    );
+    const [[recordedCall]] = audit.record.mock.calls;
+    expect(JSON.stringify(recordedCall)).not.toContain('new-password-123');
+  });
+
+  it('does not audit when the update touches no credential field', async () => {
+    const target: GoTrueUser = {
+      id: 'b54295ca-2d97-4c77-8a31-c06ded29d93f',
+      email: 'manager@superkalan.com',
+      app_metadata: {
+        role: 'branch-manager',
+        branch_ids: [branchId],
+        branches: ['Quezon City'],
+        status: 'Active',
+      },
+      user_metadata: {},
+      banned_until: null,
+      created_at: '2026-01-10T00:00:00.000Z',
+    };
+    const goTrue = {
+      getUser: jest.fn().mockResolvedValue(target),
+      updateUser: jest.fn().mockResolvedValue(undefined),
+    } as unknown as GoTrueAdminService;
+    const branchRepository = {
+      find: jest.fn().mockResolvedValue([
+        { id: branchId, name: 'Quezon City', status: 'active' },
+      ]),
+    } as unknown as Repository<Branch>;
+    const audit = makeAudit();
+    const service = new UsersService(goTrue, branchRepository, audit);
+
+    await service.update(principal, target.id, { phone: '+639171234567' });
+
+    expect(audit.record).not.toHaveBeenCalled();
   });
 });
 
@@ -145,7 +231,7 @@ describe('UsersService multi-branch owner scope', () => {
     const branchRepository = {
       find: jest.fn(),
     } as unknown as Repository<Branch>;
-    const service = new UsersService(goTrue, branchRepository);
+    const service = new UsersService(goTrue, branchRepository, makeAudit());
     const owner: Principal = {
       userId: 'owner',
       role: 'branch-owner',
@@ -194,7 +280,7 @@ describe('UsersService multi-branch owner scope', () => {
         { id: outsideBranchId, name: 'Outside', status: 'active' },
       ]),
     } as unknown as Repository<Branch>;
-    const service = new UsersService(goTrue, branchRepository);
+    const service = new UsersService(goTrue, branchRepository, makeAudit());
     const owner: Principal = {
       userId: 'owner',
       role: 'branch-owner',
