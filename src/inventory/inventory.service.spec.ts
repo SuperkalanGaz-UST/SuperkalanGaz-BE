@@ -5,6 +5,7 @@ import { LpgProduct } from '../prices/lpg-product.entity';
 import { PricesService } from '../prices/prices.service';
 import { InventoryService } from './inventory.service';
 import { StockLevel } from './stock-level.entity';
+import { StockCheckLog } from './stock-check-log.entity';
 
 describe('InventoryService', () => {
   const product = (overrides: Partial<LpgProduct> = {}): LpgProduct =>
@@ -24,7 +25,12 @@ describe('InventoryService', () => {
       onConflict: jest.fn().mockReturnThis(),
       execute: jest.fn(() => Promise.resolve({})),
     };
+    const manager = {
+      createQueryBuilder: jest.fn(() => ({ insert: jest.fn(() => insertQb) })),
+      insert: jest.fn().mockResolvedValue({}),
+    };
     const repo = {
+      manager: { transaction: jest.fn(async (work: (value: typeof manager) => Promise<void>) => work(manager)) },
       find: jest.fn(() => Promise.resolve(opts?.found ?? [])),
       findOneByOrFail: jest.fn(() =>
         Promise.resolve(
@@ -41,11 +47,13 @@ describe('InventoryService', () => {
       ),
       createQueryBuilder: jest.fn(() => ({ insert: jest.fn(() => insertQb) })),
     } as unknown as jest.Mocked<Repository<StockLevel>>;
-    return { repo, insertQb };
+    return { repo, insertQb, manager };
   };
 
   const makePrices = (products: LpgProduct[]) =>
     ({ list: jest.fn(() => Promise.resolve(products)) }) as unknown as PricesService;
+
+  const stockCheckLogs = {} as Repository<StockCheckLog>;
 
   const principal = (branchIds: string[] = ['branch-1']): Principal => ({
     userId: 'manager-1',
@@ -57,7 +65,7 @@ describe('InventoryService', () => {
   describe('listForBranch', () => {
     it('defaults a product with no stock_levels row to zero stock and server defaults', async () => {
       const { repo } = makeRepo({ found: [] });
-      const service = new InventoryService(repo, makePrices([product()]));
+      const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
 
       const views = await service.listForBranch(principal());
 
@@ -85,7 +93,7 @@ describe('InventoryService', () => {
         capacityQty: 60,
       } as StockLevel;
       const { repo } = makeRepo({ found: [existing] });
-      const service = new InventoryService(repo, makePrices([product()]));
+      const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
 
       const [view] = await service.listForBranch(principal());
 
@@ -97,7 +105,7 @@ describe('InventoryService', () => {
 
     it('rejects a principal with no active branch', async () => {
       const { repo } = makeRepo();
-      const service = new InventoryService(repo, makePrices([product()]));
+      const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
 
       await expect(service.listForBranch(principal([]))).rejects.toThrow(ForbiddenException);
     });
@@ -106,7 +114,7 @@ describe('InventoryService', () => {
   describe('intake', () => {
     it('inserts with an ON CONFLICT increment and returns the merged view', async () => {
       const { repo, insertQb } = makeRepo();
-      const service = new InventoryService(repo, makePrices([product()]));
+      const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
 
       const view = await service.intake(principal(), { productId: 'product-11kg', receivedQty: 20 });
 
@@ -121,7 +129,7 @@ describe('InventoryService', () => {
 
     it('uses the caller\'s first branch when the principal has more than one', async () => {
       const { repo, insertQb } = makeRepo();
-      const service = new InventoryService(repo, makePrices([product()]));
+      const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
 
       await service.intake(principal(['branch-1', 'branch-2']), {
         productId: 'product-11kg',
@@ -135,7 +143,7 @@ describe('InventoryService', () => {
 
     it('404s on a product id the shared catalog does not recognize', async () => {
       const { repo } = makeRepo();
-      const service = new InventoryService(repo, makePrices([product()]));
+      const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
 
       await expect(
         service.intake(principal(), { productId: 'unknown-product', receivedQty: 5 }),

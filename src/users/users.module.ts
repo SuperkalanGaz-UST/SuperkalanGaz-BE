@@ -2,7 +2,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from '../auth/auth.module';
 import { Branch } from '../branches/branch.entity';
-import { GoTrueAdminService } from './gotrue-admin.service';
+import { GovernanceAuditModule } from '../governance/governance-audit.module';
 import { StaffRegistrationController } from './staff-registration.controller';
 import { StaffRegistrationService } from './staff-registration.service';
 import { UsersController } from './users.controller';
