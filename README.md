@@ -76,6 +76,16 @@ client follows the same pending-session activation pattern used for Franchise
 Administrator invitations. Only explicitly decorated Delivery Rider onboarding
 endpoints accept the pending JWT.
 
+## GCP deployment
+
+The current manual Cloud Run API and Compute Engine Traccar deployment artifacts
+are in [deploy/gcp](deploy/gcp). Review each deployment README and complete the
+free-credit, network, migration, TLS, backup, and manual-release gates before
+creating resources. The presence of these files does not mean GCP is provisioned.
+Run `./deploy/gcp/setup-wizard.sh` from this repository to collect the preflight
+inputs and, if explicitly confirmed, store Supabase secrets in Secret Manager.
+The wizard stops before VM, firewall, image, Cloud Run, or release deployment.
+
 ## Temporary Proof of Delivery storage
 
 Create a private Supabase Storage bucket named `delivery-proofs` (or set
