@@ -84,7 +84,9 @@ free-credit, network, migration, TLS, backup, and manual-release gates before
 creating resources. The presence of these files does not mean GCP is provisioned.
 Run `./deploy/gcp/setup-wizard.sh` from this repository to collect the preflight
 inputs and, if explicitly confirmed, store Supabase secrets in Secret Manager.
-The wizard stops before VM, firewall, image, Cloud Run, or release deployment.
+The wizard stops before VM, firewall, image, Cloud Run, or release deployment;
+project-scoped Billing alerts remain a manual pre-provisioning step after the
+final cost review.
 
 ## Temporary Proof of Delivery storage
 

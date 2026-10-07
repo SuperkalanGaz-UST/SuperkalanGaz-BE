@@ -407,7 +407,9 @@ write_env GCP_COST_ESTIMATE_USD "$GCP_COST_ESTIMATE_USD"
 write_env GCP_CREDIT_RESERVE_USD "$GCP_CREDIT_RESERVE_USD"
 write_env GCP_CREDIT_ARITHMETIC_GATE "$GCP_CREDIT_ARITHMETIC_GATE"
 write_env GCP_COST_REVIEW_STATUS NEEDS_FINAL_OWNER_APPROVAL
+write_env GCP_BUDGET_ALERTS_STATUS NEEDS_MANUAL_SETUP
 say "This records a draft cost review only. It does not approve provisioning or paid continuation."
+note "After the owner approves the final estimate, create a project-scoped Billing budget alert before provisioning. Alerts notify; they do not automatically stop Compute Engine charges."
 
 stage "Verify the SinoTrack ST-901 variant"
 open_url "https://www.traccar.org/devices/"
@@ -637,7 +639,7 @@ fi
 
 stage "Final preflight and stop"
 say "The setup wizard has finished collecting preflight information. It has not provisioned or deployed the application."
-note "Before any release: resolve the secure VPC and firewall design; approve the exact total-cost estimate/reserve and cutoff; verify the ST-901 port; review the Supabase connection/pool budget; verify the database migration state; test build, containers, backup and restore; then separately approve deployment."
+note "Before any release: resolve the secure VPC and firewall design; approve the exact total-cost estimate/reserve and cutoff; create and verify Billing budget alerts; verify the ST-901 port; review the Supabase connection/pool budget; verify the database migration state; test build, containers, backup and restore; then separately approve deployment."
 warn "This wizard will not create a VM, firewall rule, image, Cloud Run service, billing budget, or release. It does not approve paid continuation after trial credits end."
 say "Local non-secret setup values: $ENV_FILE"
 finish
