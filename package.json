@@ -50,6 +50,9 @@
     "ts-jest": "^29.2.5",
     "typescript": "^5.7.2"
   },
+  "overrides": {
+    "multer": "^2.4.0"
+  },
   "jest": {
     "moduleFileExtensions": [
       "js",

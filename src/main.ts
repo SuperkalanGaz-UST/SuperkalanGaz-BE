@@ -22,9 +22,12 @@ async function bootstrap(): Promise<void> {
   // localhost and 127.0.0.1 are the same machine but distinct CORS origins, so a
   // dashboard opened at 127.0.0.1:3000 would otherwise be blocked (the browser
   // fetch throws and login shows "Could not reach the server"). Accept any
-  // loopback origin in addition to the explicitly configured ones.
+  // loopback origin in addition to the explicitly configured ones — but only
+  // outside production (L9 fix): a production deploy has no legitimate reason
+  // to be reached from a caller's own loopback address.
+  const allowLoopbackOrigins = process.env.NODE_ENV !== 'production';
   const isLoopbackOrigin = (origin: string): boolean =>
-    /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+    allowLoopbackOrigins && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
 
   app.enableCors({
     origin: (

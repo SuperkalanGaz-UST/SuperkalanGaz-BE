@@ -6,6 +6,7 @@ import {
   IsOptional,
   IsString,
   IsUUID,
+  MaxLength,
   MinLength,
 } from 'class-validator';
 
@@ -13,8 +14,10 @@ export class CreateUserDto {
   @IsEmail()
   email!: string;
 
+  // L5 fix: was MinLength(6), weaker than the rest of the app's password rules.
   @IsString()
-  @MinLength(6)
+  @MinLength(8)
+  @MaxLength(72)
   password!: string;
 
   @IsOptional()
