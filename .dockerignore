@@ -11,3 +11,4 @@ coverage
 *.log
 **/certs
 **/backups
+deploy/gcp/.local

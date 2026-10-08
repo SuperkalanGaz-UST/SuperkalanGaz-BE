@@ -1,3 +1,5 @@
 .env
-/certs/
+/.runtime/
 /backups/
+/certs/
+__pycache__/

@@ -2,6 +2,7 @@ import { ForbiddenException } from '@nestjs/common';
 import { describe, expect, it, jest } from '@jest/globals';
 import { DataSource, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
+import { Branch } from '../branches/branch.entity';
 import { Rider } from '../fleet/rider.entity';
 import { ServiceRequest } from '../service-requests/service-request.entity';
 import { CsatService } from './csat.service';
@@ -39,7 +40,7 @@ describe('CsatService branch reports', () => {
       ),
     } as unknown as jest.Mocked<Repository<ServiceRequest>>;
     const riders = {} as jest.Mocked<Repository<Rider>>;
-    const branches = {} as jest.Mocked<Repository<any>>;
+    const branches = {} as jest.Mocked<Repository<Branch>>;
     const dataSource = {} as jest.Mocked<DataSource>;
 
     return {

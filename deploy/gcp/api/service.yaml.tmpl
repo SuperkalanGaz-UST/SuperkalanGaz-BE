@@ -16,12 +16,14 @@ spec:
         autoscaling.knative.dev/minScale: "0"
         autoscaling.knative.dev/maxScale: "2"
         run.googleapis.com/cpu-throttling: "true"
+        # Fractional NGINX CPU requires gen1 and single-request concurrency.
+        run.googleapis.com/execution-environment: gen1
         run.googleapis.com/vpc-access-egress: private-ranges-only
         run.googleapis.com/network-interfaces: '__VPC_NETWORKS_JSON__'
         run.googleapis.com/container-dependencies: '{"nginx":["api"]}'
     spec:
       serviceAccountName: __RUNTIME_SERVICE_ACCOUNT__
-      containerConcurrency: 20
+      containerConcurrency: 1
       timeoutSeconds: 60
       containers:
         - name: nginx
@@ -33,6 +35,14 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+          # Check the proxy and its upstream, not merely an open NGINX socket.
+          startupProbe:
+            httpGet:
+              path: /api/health/ready
+              port: 8080
+            timeoutSeconds: 10
+            periodSeconds: 10
+            failureThreshold: 24
         - name: api
           image: __API_IMAGE__
           env:
@@ -51,6 +61,7 @@ spec:
                 secretKeyRef:
                   name: __SUPABASE_SECRET_KEY_SECRET__
                   key: __SUPABASE_SECRET_KEY_SECRET_VERSION__
+__OPTIONAL_SECRET_ENV__
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -76,9 +87,9 @@ spec:
             httpGet:
               path: /api/health/ready
               port: 3001
-            timeoutSeconds: 2
-            periodSeconds: 5
-            failureThreshold: 36
+            timeoutSeconds: 10
+            periodSeconds: 10
+            failureThreshold: 24
           livenessProbe:
             httpGet:
               path: /api/health/live
@@ -90,6 +101,7 @@ spec:
             - name: supabase-db-ca
               mountPath: /var/run/secrets/supabase
               readOnly: true
+__OPTIONAL_CA_MOUNT__
       volumes:
         - name: supabase-db-ca
           secret:
@@ -97,3 +109,7 @@ spec:
             items:
               - key: __SUPABASE_DB_CA_SECRET_VERSION__
                 path: root.crt
+                # CA certificates are public trust material; USER node must read
+                # this root-owned multi-container secret mount (0444 decimal).
+                mode: 292
+__OPTIONAL_CA_VOLUME__

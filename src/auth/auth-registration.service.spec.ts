@@ -217,6 +217,7 @@ describe('AuthRegistrationService', () => {
       getOrThrow: jest.fn((key: string) =>
         ({
           SUPABASE_URL: 'https://project.supabase.co',
+          SUPABASE_ANON_KEY: 'legacy-anon-jwt',
           SUPABASE_SERVICE_ROLE_KEY: 'legacy-service-role-jwt',
         })[key],
       ),

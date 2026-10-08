@@ -1,0 +1,11 @@
+[Unit]
+Description=Traccar final export and container cutoff
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/superkalan-traccar
+EnvironmentFile=/opt/superkalan-traccar/backup.env
+UMask=0077
+ExecStart=/bin/bash /opt/superkalan-traccar/scripts/vm-cutoff.sh
+TimeoutStartSec=1800

@@ -411,10 +411,10 @@ write_env GCP_BUDGET_ALERTS_STATUS NEEDS_MANUAL_SETUP
 say "This records a draft cost review only. It does not approve provisioning or paid continuation."
 note "After the owner approves the final estimate, create a project-scoped Billing budget alert before provisioning. Alerts notify; they do not automatically stop Compute Engine charges."
 
-stage "Verify the SinoTrack ST-901 variant"
+stage "Verify the SinoTrack ST-901 listener"
 open_url "https://www.traccar.org/devices/"
-step "Check the tracker label or ask the seller which exact variant/protocol the unit supports. The product listing alone only confirms ST-901."
-step "Traccar's catalog distinguishes standard ST-901 (H02/TCP 5013) and ST-901 A+ (JT808/TCP 5015). Do not open a firewall port in this wizard."
+step "The user confirms the unit is the standard ST-901. Traccar maps this model to H02/TCP 5013; ST-901 A+ uses JT808/TCP 5015. Confirm the actual unit is configured for H02 before any firewall change."
+step "This wizard records the candidate listener only. It does not open a firewall port."
 ask GCP_ST901_VARIANT "Enter standard, a+, or unknown (lowercase):"
 variant_input="$(printf '%s' "$GCP_ST901_VARIANT" | tr '[:upper:]' '[:lower:]')"
 while [[ "$variant_input" != "standard" && "$variant_input" != "a+" && "$variant_input" != "unknown" ]]; do
