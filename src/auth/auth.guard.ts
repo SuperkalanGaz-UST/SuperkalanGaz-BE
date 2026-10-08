@@ -10,6 +10,7 @@ import { Reflector } from '@nestjs/core';
 import { Request } from 'express';
 import { In, Repository } from 'typeorm';
 import { Branch } from '../branches/branch.entity';
+import { GoTrueAdminService } from '../users/gotrue-admin.service';
 import {
   hasMetadataBranchIds,
   metadataBranchIds,
@@ -34,6 +35,7 @@ export class AuthGuard implements CanActivate {
     private readonly reflector: Reflector,
     @InjectRepository(Branch)
     private readonly branches: Repository<Branch>,
+    private readonly goTrue: GoTrueAdminService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -52,7 +54,11 @@ export class AuthGuard implements CanActivate {
     // Role/branch scope/status come from app_metadata — written only by our
     // service-role GoTrue calls, so the client cannot widen its own access.
     const claims = (payload.app_metadata ?? {}) as Record<string, unknown>;
-    const requestPath = request.originalUrl || request.url || '';
+    // L11 fix: `request.path` is Express's routed path with the query string
+    // already stripped — matching on `originalUrl` (which includes it) meant
+    // a query string on this one route silently fell through to a 403 instead
+    // of matching. Fails closed either way, but this is the correct match.
+    const requestPath = request.path || request.originalUrl || request.url || '';
     const isCustomerPublicBranchLookup = request.method === 'GET' && requestPath.endsWith('/api/branches/public');
     const claimedRole = typeof claims.role === 'string'
       ? claims.role
@@ -61,14 +67,6 @@ export class AuthGuard implements CanActivate {
         : undefined;
 
     if (!isRole(claimedRole)) {
-      console.log('[auth] denied account without CRM role', {
-        requestPath,
-        method: request.method,
-        claims: {
-          role: claims.role,
-          status: claims.status,
-        },
-      });
       throw new ForbiddenException('No CRM role for this account');
     }
     const allowPendingInvitation =
@@ -84,6 +82,20 @@ export class AuthGuard implements CanActivate {
       !allowPendingInvitation
     ) {
       throw new ForbiddenException('This account is inactive');
+    }
+
+    // A previously issued JWT can still say Active after account deactivation.
+    // Read the live Auth record for riders so a ban takes effect on the next API request.
+    if (claimedRole === 'driver') {
+      const live = await this.goTrue.getUser(payload.sub);
+      const liveStatus = live?.app_metadata.status;
+      const bannedUntil = live?.banned_until
+        ? new Date(live.banned_until).getTime()
+        : 0;
+      if (!live || bannedUntil > Date.now() ||
+          (liveStatus !== 'Active' && !(allowPendingInvitation && liveStatus === 'Pending'))) {
+        throw new ForbiddenException('This account is inactive');
+      }
     }
 
     const claimedBranchIds = metadataBranchIds(claims);
@@ -135,12 +147,6 @@ export class AuthGuard implements CanActivate {
     if (claimedRole === 'branch-manager' && orderedBranches.length !== 1) {
       throw new ForbiddenException('Branch Manager must have exactly one active branch');
     }
-    console.log('[auth] resolved principal', {
-      requestPath,
-      method: request.method,
-      role: claimedRole,
-      userId: payload.sub,
-    });
 
     const principal: Principal = {
       userId: payload.sub,

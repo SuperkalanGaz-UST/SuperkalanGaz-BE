@@ -53,7 +53,12 @@ export class GoTrueAdminService {
     this.authUrl = `${supabaseUrl}/auth/v1`;
     this.baseUrl = `${supabaseUrl}/auth/v1/admin`;
     this.serviceKey = config.getOrThrow<string>('SUPABASE_SERVICE_ROLE_KEY');
-    this.publicKey = config.get<string>('SUPABASE_ANON_KEY') || this.serviceKey;
+    // M5 fix: this used to fall back to the service-role key when the anon key
+    // was unset, which silently handed the privileged key to a code path meant
+    // for public, unauthenticated calls (and GoTrue's anon-tier abuse
+    // protections never apply to a service-role caller). Fail at startup
+    // instead of degrading security at runtime.
+    this.publicKey = config.getOrThrow<string>('SUPABASE_ANON_KEY');
   }
 
   /** Creates an auth user; CRM claims are passed in `app_metadata`. */

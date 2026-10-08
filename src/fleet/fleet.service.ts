@@ -17,6 +17,7 @@ import {
 } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
+import { CimService } from '../cim/cim.service';
 import { ServiceRequest } from '../service-requests/service-request.entity';
 import { ConnectVehicleGpsDto } from './dto/connect-vehicle-gps.dto';
 import { CreateVehicleDto } from './dto/create-vehicle.dto';
@@ -54,6 +55,7 @@ export class FleetService {
     private readonly traccar: TraccarClient,
     @InjectRepository(ServiceRequest)
     private readonly serviceRequests: Repository<ServiceRequest>,
+    private readonly cim: CimService,
   ) {}
 
   /**
@@ -369,13 +371,40 @@ export class FleetService {
     });
   }
 
-  /**
-   * Look up a rider by id globally (used for customers viewing their assigned rider).
-   */
-  async findById(riderId: string): Promise<Rider | null> {
+  /** Unscoped lookup — never expose this directly to a controller; use findByIdForCaller. */
+  private async findById(riderId: string): Promise<Rider | null> {
     return this.riders.findOne({
       where: { id: riderId, deletedAt: IsNull() },
     });
+  }
+
+  /**
+   * Role-scoped rider detail lookup for `GET /riders/:id` (M4 fix — this used
+   * to hand back ANY rider, in ANY branch, to ANY branch-manager or customer,
+   * with no ownership check at all). A Branch Manager only sees their own
+   * branch's roster; a customer only sees a rider they actually have (or had)
+   * an order with. Returns null — the controller turns that into a 404 — for
+   * anything outside the caller's authorized scope, same as a genuine miss.
+   */
+  async findByIdForCaller(principal: Principal, riderId: string): Promise<Rider | null> {
+    if (principal.role === 'branch-manager') {
+      const branchId = this.requireSingleBranch(principal);
+      return this.findInBranch(riderId, branchId);
+    }
+    const owned = await this.riderBelongsToCustomer(riderId, principal.userId);
+    return owned ? this.findById(riderId) : null;
+  }
+
+  /** True once this rider has appeared on at least one of this customer's own orders. */
+  private async riderBelongsToCustomer(riderId: string, authUserId: string): Promise<boolean> {
+    const profileIds = await this.cim.profileIdsForAuthUser(authUserId);
+    // Legacy pre-CIM-migration orders stored the auth id directly as customerId
+    // (mirrors ServiceRequestsService.listForCustomer's own fallback).
+    const ownedCustomerIds = [...new Set([authUserId, ...profileIds])];
+    const count = await this.serviceRequests.count({
+      where: { riderId, customerId: In(ownedCustomerIds), deletedAt: IsNull() },
+    });
+    return count > 0;
   }
 
   /**

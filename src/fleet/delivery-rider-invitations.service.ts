@@ -39,7 +39,8 @@ export type DeliveryRiderInvitationStatus =
   | 'Pending'
   | 'Expired'
   | 'Revoked'
-  | 'Accepted';
+  | 'Accepted'
+  | 'Inactive';
 
 export interface DeliveryRiderInvitationView {
   invitationId: string;
@@ -225,27 +226,30 @@ export class DeliveryRiderInvitationsService {
         recipientName: metadataString(current, 'display_name') ?? current.email,
       });
     }
-    if (this.statusFor(current) === 'Accepted') {
+    if (metadataString(current, META.acceptedAt)) {
       throw new ConflictException('This invitation has already been accepted');
-    }
-    if (isEmailVerified(current)) {
-      throw new ConflictException(
-        'The email is already verified; the recipient can continue in the mobile app',
-      );
     }
     if (!current.email) throw new BadRequestException('Invitation email is missing');
 
     const rawToken = randomBytes(32).toString('base64url');
     const recipientName = metadataString(current, 'display_name') ?? current.email;
-    const resent = await this.goTrue.inviteUser(
-      current.email,
-      recipientName,
-      this.invitationRedirect(rawToken),
-    );
-    if (resent.id !== current.id) {
-      throw new ConflictException('The invitation identity changed unexpectedly');
+    let resent = current;
+    if (isEmailVerified(current)) {
+      await this.goTrue.sendExistingUserLink(
+        current.email,
+        this.invitationRedirect(rawToken),
+      );
+    } else {
+      resent = await this.goTrue.inviteUser(
+        current.email,
+        recipientName,
+        this.invitationRedirect(rawToken),
+      );
+      if (resent.id !== current.id) {
+        throw new ConflictException('The invitation identity changed unexpectedly');
+      }
     }
-    const sentAt = resent.confirmation_sent_at ?? new Date().toISOString();
+    const sentAt = new Date().toISOString();
     const expiresAt = this.expiresFrom(new Date()).toISOString();
     const appMetadata = {
       ...current.app_metadata,
@@ -285,7 +289,7 @@ export class DeliveryRiderInvitationsService {
     if (current.app_metadata.status === 'Revoked') {
       throw new ConflictException('This invitation has already been revoked');
     }
-    if (this.statusFor(current) === 'Accepted') {
+    if (metadataString(current, META.acceptedAt)) {
       throw new ConflictException('An accepted invitation cannot be revoked');
     }
     const revokedAt = new Date().toISOString();
@@ -316,6 +320,58 @@ export class DeliveryRiderInvitationsService {
       reason,
     });
     return invitation;
+  }
+
+  async deactivate(
+    principal: Principal,
+    id: string,
+    reason: string,
+  ): Promise<DeliveryRiderInvitationView> {
+    const current = await this.requireManagedInvitation(principal, id);
+    if (!metadataString(current, META.acceptedAt)) {
+      throw new ConflictException('This Delivery Rider has not accepted the invitation');
+    }
+    if (current.app_metadata.status === 'Inactive') {
+      throw new ConflictException('This Delivery Rider account is already inactive');
+    }
+    const branchId = this.userBranchId(current)!;
+    const rider = await this.riders.findOne({
+      where: { authUserId: id, branchId },
+    });
+    if (rider?.status === 'On Delivery') {
+      throw new ConflictException('Complete or reassign the active delivery before deactivating this Delivery Rider');
+    }
+
+    const appMetadata = { ...current.app_metadata, status: 'Inactive' };
+    await this.goTrue.banUser(id);
+    await this.goTrue.updateUser(id, { app_metadata: appMetadata });
+    if (rider) {
+      await this.riders.update(
+        { id: rider.id, branchId },
+        {
+          status: 'Offline',
+          operationalLatitude: null,
+          operationalLongitude: null,
+          operationalAccuracyM: null,
+          operationalLocationCapturedAt: null,
+          operationalLocationReceivedAt: null,
+          updatedAt: new Date(),
+        },
+      );
+    }
+    const branch = await this.requiredInvitationBranch(current);
+    await this.audit.record({
+      category: 'security',
+      action: 'delivery-rider-account-deactivated',
+      actor: principal,
+      affectedRecordType: 'delivery-rider-account',
+      affectedRecordId: id,
+      branchId,
+      beforeState: { status: this.statusFor(current) },
+      afterState: { status: 'Inactive', availability: rider ? 'Offline' : null },
+      reason,
+    });
+    return this.toView({ ...current, app_metadata: appMetadata }, branch.name);
   }
 
   async acceptance(token: string): Promise<DeliveryRiderInvitationView> {
@@ -353,6 +409,48 @@ export class DeliveryRiderInvitationsService {
       );
     }
     await this.sendMobileCodeForInvitation(user);
+  }
+
+  async detailsForSession(principal: Principal): Promise<DeliveryRiderInvitationView> {
+    const user = await this.accountForDetailsConfirmation(principal);
+    const branch = await this.requiredInvitationBranch(user);
+    return this.toView(user, branch.name);
+  }
+
+  async confirmDetailsForSession(principal: Principal): Promise<void> {
+    const user = await this.accountForDetailsConfirmation(principal);
+    await this.requiredInvitationBranch(user);
+    if (user.app_metadata.status === 'Active') return;
+
+    // Reuse the existing onboarding marker without asserting phone verification.
+    const appMetadata = {
+      ...user.app_metadata,
+      [META.mobileVerifiedAt]: metadataString(user, META.mobileVerifiedAt) ?? new Date().toISOString(),
+      [META.mobileVerificationMethod]: 'details-confirmation',
+    };
+    await this.goTrue.updateUser(user.id, { app_metadata: appMetadata });
+    await this.activateDeliveryRider({ ...user, app_metadata: appMetadata });
+  }
+
+  private async accountForDetailsConfirmation(principal: Principal): Promise<GoTrueUser> {
+    if (principal.role !== 'driver' || !['Pending', 'Active'].includes(principal.status ?? '')) {
+      throw new ForbiddenException('A Delivery Rider account is required');
+    }
+    const user = await this.goTrue.getUser(principal.userId);
+    const branchId = user ? this.userBranchId(user) : null;
+    if (
+      !user || user.id !== principal.userId ||
+      !this.isDeliveryRiderInvitation(user) ||
+      !['Pending', 'Active'].includes(String(user.app_metadata.status)) ||
+      metadataString(user, META.revokedAt) ||
+      !metadataString(user, META.accountCreatedAt) ||
+      !metadataString(user, META.acceptedAt) ||
+      !branchId ||
+      !principal.branchIds.includes(branchId)
+    ) {
+      throw new ForbiddenException('This account cannot confirm Delivery Rider details');
+    }
+    return user;
   }
 
   async mobileVerificationForSession(
@@ -573,7 +671,9 @@ export class DeliveryRiderInvitationsService {
       beforeState: {
         status: 'Pending',
         mobileVerification:
-          mobileVerificationMethod === 'placeholder' ? 'Placeholder' : 'Verified',
+          mobileVerificationMethod === 'details-confirmation'
+            ? 'Details Confirmed'
+            : mobileVerificationMethod === 'placeholder' ? 'Placeholder' : 'Verified',
       },
       afterState: {
         status: 'Active',
@@ -821,6 +921,7 @@ export class DeliveryRiderInvitationsService {
   }
 
   private statusFor(user: GoTrueUser): DeliveryRiderInvitationStatus {
+    if (user.app_metadata.status === 'Inactive') return 'Inactive';
     if (user.app_metadata.status === 'Active' || metadataString(user, META.acceptedAt)) {
       return 'Accepted';
     }
@@ -858,7 +959,7 @@ export class DeliveryRiderInvitationsService {
   private invitationRedirect(token: string): string {
     const base = (
       this.config.get<string>('DELIVERY_RIDER_INVITATION_REDIRECT_URL') ??
-      'superkalan://delivery-rider-invitation'
+      `${this.config.get<string>('WEB_ORIGIN')?.split(',')[0]?.trim() || 'http://localhost:3000'}/delivery-rider-invitation`
     ).replace(/[?&]token=[^&#]*/i, '');
     return `${base}${base.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`;
   }

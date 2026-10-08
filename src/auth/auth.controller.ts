@@ -1,7 +1,13 @@
-import { Body, Controller, Get, HttpCode, Post, Query } from '@nestjs/common';
+import { Body, Controller, HttpCode, Post } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { AuthRegistrationService } from './auth-registration.service';
 import { RegisterDto } from './dto/register.dto';
 import { ResendSignUpCodeDto } from './dto/resend-sign-up-code.dto';
+
+/** M3 fix: these are unauthenticated and trigger OTP email/SMS sends, so a
+ * much tighter limit than the app-wide default applies — a legitimate caller
+ * never needs more than a handful of these per minute. */
+const PUBLIC_AUTH_THROTTLE = { default: { limit: 5, ttl: 60_000 } };
 
 /**
  * Public auth endpoints that do NOT require a Bearer token.
@@ -27,6 +33,7 @@ export class AuthController {
    */
   @Post('register')
   @HttpCode(200)
+  @Throttle(PUBLIC_AUTH_THROTTLE)
   async register(@Body() dto: RegisterDto): Promise<{ needsConfirmation: boolean }> {
     return this.registrations.register(dto);
   }
@@ -34,19 +41,11 @@ export class AuthController {
   /** Sends a replacement signup code for either customer account type. */
   @Post('resend-signup-code')
   @HttpCode(200)
+  @Throttle(PUBLIC_AUTH_THROTTLE)
   async resendSignUpCode(
     @Body() dto: ResendSignUpCodeDto,
   ): Promise<{ sent: true }> {
     await this.registrations.resendSignUpCode(dto);
     return { sent: true };
-  }
-
-  /** Checks if an email exists in the system (used for forgot password flow). */
-  @Get('check-email')
-  async checkEmail(
-    @Query('email') email: string,
-  ): Promise<{ exists: boolean }> {
-    if (!email) return { exists: false };
-    return this.registrations.checkEmailExists(email);
   }
 }

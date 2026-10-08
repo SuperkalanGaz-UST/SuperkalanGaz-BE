@@ -30,6 +30,7 @@ describe('DeliveryRiderInvitationsService', () => {
   function setup(options: {
     verificationMode?: 'sms' | 'placeholder';
     nodeEnv?: string;
+    redirectUrl?: string | null;
   } = {}) {
     const user: GoTrueUser = {
       id: '33333333-3333-4333-8333-333333333333',
@@ -85,7 +86,8 @@ describe('DeliveryRiderInvitationsService', () => {
     const riders = {
       create: jest.fn((value: Partial<Rider>) => value as Rider),
       save: jest.fn(async () => savedRider),
-      findOne: jest.fn(async () => null),
+      findOne: jest.fn(async (): Promise<Rider | null> => null),
+      update: jest.fn(async () => ({ affected: 1 })),
     } as unknown as Repository<Rider>;
     const audit = {
       record: jest.fn(async () => undefined),
@@ -93,7 +95,11 @@ describe('DeliveryRiderInvitationsService', () => {
     const config = {
       get: jest.fn((key: string) =>
         key === 'DELIVERY_RIDER_INVITATION_REDIRECT_URL'
-          ? 'superkalan://delivery-rider-invitation'
+          ? options.redirectUrl === undefined
+            ? 'superkalan://delivery-rider-invitation'
+            : options.redirectUrl
+          : key === 'WEB_ORIGIN'
+            ? 'http://localhost:3000'
           : key === 'DELIVERY_RIDER_INVITATION_EXPIRY_HOURS'
             ? '48'
             : key === 'DELIVERY_RIDER_MOBILE_VERIFICATION_MODE'
@@ -113,6 +119,49 @@ describe('DeliveryRiderInvitationsService', () => {
     return { service, user, goTrue, riders, audit, redirect: () => redirectUrl };
   }
 
+  function acceptedDriver(user: GoTrueUser): Principal {
+    user.app_metadata = {
+      role: 'driver', status: 'Pending', branch_ids: [branchId],
+      delivery_rider_invited_by: owner.userId,
+      delivery_rider_account_created_at: new Date().toISOString(),
+      delivery_rider_invitation_accepted_at: new Date().toISOString(),
+    };
+    return { userId: user.id, role: 'driver', status: 'Pending', branches: [branch.name], branchIds: [branchId] };
+  }
+
+  it.each(['sms', 'placeholder'] as const)('confirms own details in %s mode without phone verification', async (verificationMode) => {
+    const { service, user, goTrue, riders, audit } = setup({ verificationMode, nodeEnv: 'production' });
+    const driver = acceptedDriver(user);
+    await expect(service.detailsForSession(driver)).resolves.toMatchObject({ invitationId: user.id });
+    await service.confirmDetailsForSession(driver);
+    expect(user.app_metadata.status).toBe('Active');
+    expect(user.app_metadata.delivery_rider_mobile_verified_at).toEqual(expect.any(String));
+    expect(user.app_metadata.delivery_rider_mobile_verification_method).toBe('details-confirmation');
+    expect(goTrue.requestPhoneOtp).not.toHaveBeenCalled();
+    expect(goTrue.verifyPhoneOtp).not.toHaveBeenCalled();
+    expect(goTrue.updateUser.mock.calls.every(([id, attrs]) => id === driver.userId && !('phone_confirm' in attrs))).toBe(true);
+    expect(riders.create).toHaveBeenCalledWith(expect.objectContaining({ authUserId: driver.userId, branchId, status: 'Offline' }));
+    expect(audit.record).toHaveBeenCalledWith(expect.objectContaining({
+      beforeState: expect.objectContaining({ mobileVerification: 'Details Confirmed' }),
+    }));
+    await service.confirmDetailsForSession(driver);
+    expect(riders.save).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['role', 'identity', 'branch', 'unaccepted', 'revoked', 'inactive'] as const)('rejects %s details confirmation', async (reason) => {
+    const { service, user, goTrue, riders } = setup();
+    const driver = acceptedDriver(user);
+    if (reason === 'role') driver.role = 'customer';
+    if (reason === 'identity') driver.userId = owner.userId;
+    if (reason === 'branch') driver.branchIds = [];
+    if (reason === 'unaccepted') delete user.app_metadata.delivery_rider_invitation_accepted_at;
+    if (reason === 'revoked') user.app_metadata.delivery_rider_invitation_revoked_at = new Date().toISOString();
+    if (reason === 'inactive') user.app_metadata.status = 'Inactive';
+    await expect(service.confirmDetailsForSession(driver)).rejects.toBeInstanceOf(ForbiddenException);
+    expect(goTrue.updateUser).not.toHaveBeenCalled();
+    expect(riders.save).not.toHaveBeenCalled();
+  });
+
   it('fails closed when a Branch Owner tries to choose a branch outside the JWT scope', async () => {
     const { service, goTrue } = setup();
 
@@ -125,6 +174,42 @@ describe('DeliveryRiderInvitationsService', () => {
       }),
     ).rejects.toBeInstanceOf(ForbiddenException);
     expect(goTrue.inviteUser).not.toHaveBeenCalled();
+  });
+
+  it('uses web registration when no invitation redirect is configured', async () => {
+    const { service, redirect } = setup({ redirectUrl: null });
+    await service.create(owner, {
+      recipientName: 'Ana Rider',
+      email: 'rider@example.com',
+      mobile: '+639171234567',
+      branchId,
+    });
+
+    expect(new URL(redirect()).origin).toBe('http://localhost:3000');
+    expect(new URL(redirect()).pathname).toBe('/delivery-rider-invitation');
+    expect(new URL(redirect()).searchParams.get('token')).toBeTruthy();
+  });
+
+  it('resends a registration link after email verification but before password creation', async () => {
+    const { service, user, goTrue, redirect } = setup({ redirectUrl: null });
+    await service.create(owner, {
+      recipientName: 'Ana Rider',
+      email: 'rider@example.com',
+      mobile: '+639171234567',
+      branchId,
+    });
+    const firstToken = new URL(redirect()).searchParams.get('token');
+
+    await service.resend(owner, user.id);
+    const newToken = new URL(redirect()).searchParams.get('token');
+
+    expect(goTrue.sendExistingUserLink).toHaveBeenCalledWith(user.email, redirect());
+    expect(newToken).toBeTruthy();
+    expect(newToken).not.toBe(firstToken);
+    await expect(service.acceptance(newToken!)).resolves.toMatchObject({
+      emailVerified: true,
+      accountCreated: false,
+    });
   });
 
   it('accepts the web invitation first, then activates after app mobile verification', async () => {
@@ -390,6 +475,67 @@ describe('DeliveryRiderInvitationsService', () => {
         afterState: expect.objectContaining({ status: 'Pending' }),
       }),
     );
+  });
+
+  it('deactivates an accepted rider while retaining the roster and audit history', async () => {
+    const { service, user, goTrue, riders, audit } = setup();
+    user.app_metadata = {
+      role: 'driver', status: 'Active', branch_id: branchId,
+      branch_ids: [branchId], branches: [branch.name],
+      delivery_rider_invited_by: owner.userId,
+      delivery_rider_invitation_accepted_at: '2026-08-30T02:00:00.000Z',
+    };
+    jest.spyOn(riders, 'findOne').mockResolvedValueOnce({
+      id: '44444444-4444-4444-8444-444444444444', status: 'Available',
+    } as Rider);
+
+    const deactivated = await service.deactivate(owner, user.id, 'No longer assigned');
+
+    expect(deactivated.status).toBe('Inactive');
+    expect(goTrue.banUser).toHaveBeenCalledWith(user.id);
+    expect(user.app_metadata.status).toBe('Inactive');
+    expect(riders.update).toHaveBeenCalledWith(
+      { id: '44444444-4444-4444-8444-444444444444', branchId },
+      expect.objectContaining({ status: 'Offline', operationalLatitude: null }),
+    );
+    expect(audit.record).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'delivery-rider-account-deactivated',
+      branchId,
+      reason: 'No longer assigned',
+    }));
+  });
+
+  it('rejects deactivation during an active delivery', async () => {
+    const { service, user, goTrue, riders } = setup();
+    user.app_metadata = {
+      role: 'driver', status: 'Active', branch_id: branchId,
+      branch_ids: [branchId], branches: [branch.name],
+      delivery_rider_invited_by: owner.userId,
+      delivery_rider_invitation_accepted_at: '2026-08-30T02:00:00.000Z',
+    };
+    jest.spyOn(riders, 'findOne').mockResolvedValueOnce({ status: 'On Delivery' } as Rider);
+
+    await expect(service.deactivate(owner, user.id, 'No longer assigned')).rejects.toThrow(
+      'Complete or reassign the active delivery',
+    );
+    expect(goTrue.banUser).not.toHaveBeenCalled();
+  });
+
+  it('does not let an owner deactivate a rider outside their branch', async () => {
+    const { service, user, goTrue } = setup();
+    user.app_metadata = {
+      role: 'driver', status: 'Active', branch_id: branchId,
+      branch_ids: [branchId], branches: [branch.name],
+      delivery_rider_invited_by: owner.userId,
+      delivery_rider_invitation_accepted_at: '2026-08-30T02:00:00.000Z',
+    };
+
+    await expect(service.deactivate(
+      { ...owner, branchIds: ['99999999-9999-4999-8999-999999999999'] },
+      user.id,
+      'No longer assigned',
+    )).rejects.toThrow('Delivery Rider invitation not found');
+    expect(goTrue.banUser).not.toHaveBeenCalled();
   });
 
   it('does not reissue an accepted Delivery Rider account', async () => {

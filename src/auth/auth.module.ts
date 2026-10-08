@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { Branch } from '../branches/branch.entity';
+import { GoTrueAdminService } from '../users/gotrue-admin.service';
 import { AuthRegistrationService } from './auth-registration.service';
 import { AuthController } from './auth.controller';
 import { AuthGuard } from './auth.guard';
@@ -16,10 +17,11 @@ import { SupabaseJwtService } from './supabase-jwt.service';
   providers: [
     AuthRegistrationService,
     SupabaseJwtService,
+    GoTrueAdminService,
     AuthGuard,
     CustomerBootstrapGuard,
     RolesGuard,
   ],
-  exports: [SupabaseJwtService, AuthGuard, CustomerBootstrapGuard, RolesGuard, TypeOrmModule],
+  exports: [SupabaseJwtService, GoTrueAdminService, AuthGuard, CustomerBootstrapGuard, RolesGuard, TypeOrmModule],
 })
 export class AuthModule {}

@@ -2,6 +2,7 @@ import { ConflictException, ForbiddenException, NotFoundException } from '@nestj
 import { Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
+import { CimService } from '../cim/cim.service';
 import { ServiceRequest } from '../service-requests/service-request.entity';
 import { FleetService } from './fleet.service';
 import { Rider } from './rider.entity';
@@ -69,7 +70,7 @@ describe('FleetService', () => {
       ),
     }) as unknown as jest.Mocked<Repository<Branch>>;
 
-  const makeServiceRequestRepo = (updateAffected = 1) => {
+  const makeServiceRequestRepo = (updateAffected = 1, riderOrderCount = 0) => {
     const execute = jest.fn(() => Promise.resolve({ affected: updateAffected }));
     const qb = {
       update: jest.fn().mockReturnThis(),
@@ -79,10 +80,16 @@ describe('FleetService', () => {
     };
     return {
       findOne: jest.fn(() => Promise.resolve(null)),
+      count: jest.fn(() => Promise.resolve(riderOrderCount)),
       createQueryBuilder: jest.fn(() => qb),
       __qb: qb,
     } as unknown as jest.Mocked<Repository<ServiceRequest>> & { __qb: typeof qb };
   };
+
+  const makeCim = (profileIds: string[] = []) =>
+    ({
+      profileIdsForAuthUser: jest.fn(() => Promise.resolve(profileIds)),
+    }) as unknown as jest.Mocked<CimService>;
 
   const makeTraccar = () =>
     ({
@@ -102,6 +109,7 @@ describe('FleetService', () => {
     branchRepo = makeBranchRepo(),
     traccar = makeTraccar(),
     serviceRequestRepo = makeServiceRequestRepo(),
+    cim = makeCim(),
   ) => new FleetService(
     riderRepo,
     vehicleRepo,
@@ -109,6 +117,7 @@ describe('FleetService', () => {
     branchRepo,
     traccar,
     serviceRequestRepo,
+    cim,
   );
 
   const principal = (branchIds: string[]): Principal => ({
@@ -765,5 +774,96 @@ describe('FleetService', () => {
     await expect(
       service.resetPms(principal(['branch-uuid-1']), 'vehicle-1'),
     ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  describe('findByIdForCaller (M4)', () => {
+    const rider: Rider = {
+      id: 'rider-1',
+      authUserId: null,
+      branchId: 'branch-uuid-1',
+      name: 'Juan Dela Cruz',
+      plate: 'NBH-1234',
+      status: 'Available',
+      operationalLatitude: null,
+      operationalLongitude: null,
+      operationalAccuracyM: null,
+      operationalLocationCapturedAt: null,
+      operationalLocationReceivedAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      deletedAt: null,
+    };
+
+    const makeRiderLookupRepo = () =>
+      ({
+        findOne: jest.fn(
+          ({ where }: { where: { id?: string; branchId?: string } }) => {
+            const matchesId = where.id === rider.id;
+            const matchesBranch =
+              where.branchId === undefined || where.branchId === rider.branchId;
+            return Promise.resolve(matchesId && matchesBranch ? rider : null);
+          },
+        ),
+      }) as unknown as jest.Mocked<Repository<Rider>>;
+
+    it('a Branch Manager sees a rider in their own branch', async () => {
+      const service = makeService(makeRiderLookupRepo());
+
+      const found = await service.findByIdForCaller(principal(['branch-uuid-1']), rider.id);
+
+      expect(found?.id).toBe(rider.id);
+    });
+
+    it('a Branch Manager cannot see a rider in a different branch', async () => {
+      const service = makeService(makeRiderLookupRepo());
+
+      const found = await service.findByIdForCaller(principal(['branch-uuid-2']), rider.id);
+
+      expect(found).toBeNull();
+    });
+
+    it('a customer with an order linked to this rider can see it', async () => {
+      const customer: Principal = {
+        userId: 'customer-auth-1',
+        role: 'customer',
+        branches: [],
+        branchIds: [],
+      };
+      const serviceRequestRepo = makeServiceRequestRepo(1, 1); // 1 matching order
+      const service = makeService(
+        makeRiderLookupRepo(),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        serviceRequestRepo,
+      );
+
+      const found = await service.findByIdForCaller(customer, rider.id);
+
+      expect(found?.id).toBe(rider.id);
+    });
+
+    it('a customer with no order linked to this rider cannot see it (the original gap)', async () => {
+      const customer: Principal = {
+        userId: 'customer-auth-1',
+        role: 'customer',
+        branches: [],
+        branchIds: [],
+      };
+      const serviceRequestRepo = makeServiceRequestRepo(1, 0); // 0 matching orders
+      const service = makeService(
+        makeRiderLookupRepo(),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        serviceRequestRepo,
+      );
+
+      const found = await service.findByIdForCaller(customer, rider.id);
+
+      expect(found).toBeNull();
+    });
   });
 });
