@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.*
+**/.env
+**/.env.*
+.npmrc
+node_modules
+dist
+coverage
+*.log
+**/certs
+**/backups

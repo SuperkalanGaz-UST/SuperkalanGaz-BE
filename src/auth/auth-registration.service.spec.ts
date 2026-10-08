@@ -5,8 +5,8 @@ import { RegisterDto } from './dto/register.dto';
 
 const configValues: Record<string, string> = {
   SUPABASE_URL: 'https://project.supabase.co',
-  SUPABASE_ANON_KEY: 'anon-key',
-  SUPABASE_SERVICE_ROLE_KEY: 'service-key',
+  SUPABASE_PUBLISHABLE_KEY: 'sb_publishable_project-key',
+  SUPABASE_SECRET_KEY: 'sb_secret_project-key',
 };
 
 function response(body: Record<string, unknown>, ok = true): Response {
@@ -64,7 +64,7 @@ describe('AuthRegistrationService', () => {
       'https://project.supabase.co/auth/v1/signup',
       expect.objectContaining({
         method: 'POST',
-        headers: expect.objectContaining({ apikey: 'anon-key' }),
+        headers: expect.objectContaining({ apikey: 'sb_publishable_project-key' }),
         body: JSON.stringify({
           email: 'customer@example.com',
           password: 'secret12',
@@ -77,23 +77,25 @@ describe('AuthRegistrationService', () => {
         }),
       }),
     );
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).not.toHaveProperty('Authorization');
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
       'https://project.supabase.co/auth/v1/admin/users/customer-id',
       expect.objectContaining({
         method: 'PUT',
-        headers: expect.objectContaining({ apikey: 'service-key' }),
-          body: JSON.stringify({
-            app_metadata: {
-              role: 'customer',
-              branch_ids: [],
-              branches: [],
-              status: 'Active',
-              account_type: 'household',
-            },
-          }),
+        headers: expect.objectContaining({ apikey: 'sb_secret_project-key' }),
+        body: JSON.stringify({
+          app_metadata: {
+            role: 'customer',
+            branch_ids: [],
+            branches: [],
+            status: 'Active',
+            account_type: 'household',
+          },
+        }),
       }),
     );
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).not.toHaveProperty('Authorization');
   });
 
   it('requests SMS signup for commercial customers', async () => {
@@ -201,5 +203,42 @@ describe('AuthRegistrationService', () => {
     await expect(
       service.resendSignUpCode({ method: 'email', identifier: 'user@example.com' }),
     ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('preserves Bearer headers for legacy JWT keys during migration', async () => {
+    const legacyConfig = {
+      get: jest.fn((key: string) =>
+        ({
+          SUPABASE_URL: 'https://project.supabase.co',
+          SUPABASE_ANON_KEY: 'legacy-anon-jwt',
+          SUPABASE_SERVICE_ROLE_KEY: 'legacy-service-role-jwt',
+        })[key],
+      ),
+      getOrThrow: jest.fn((key: string) =>
+        ({
+          SUPABASE_URL: 'https://project.supabase.co',
+          SUPABASE_SERVICE_ROLE_KEY: 'legacy-service-role-jwt',
+        })[key],
+      ),
+    } as unknown as ConfigService;
+    const legacyService = new AuthRegistrationService(legacyConfig);
+    fetchMock.mockResolvedValueOnce(
+      response({ id: 'customer-id', identities: [{ id: 'identity-id' }] }),
+    ).mockResolvedValueOnce(response({ id: 'customer-id' }));
+
+    await legacyService.register(registration());
+
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toEqual(
+      expect.objectContaining({
+        apikey: 'legacy-anon-jwt',
+        Authorization: 'Bearer legacy-anon-jwt',
+      }),
+    );
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).toEqual(
+      expect.objectContaining({
+        apikey: 'legacy-service-role-jwt',
+        Authorization: 'Bearer legacy-service-role-jwt',
+      }),
+    );
   });
 });

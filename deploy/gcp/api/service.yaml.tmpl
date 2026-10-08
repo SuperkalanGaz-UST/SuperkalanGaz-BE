@@ -1,0 +1,99 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: superkalan-crm-api
+  labels:
+    cloud.googleapis.com/location: asia-southeast1
+  annotations:
+    run.googleapis.com/launch-stage: BETA
+    run.googleapis.com/description: Superkalan Gaz NestJS API behind an NGINX ingress sidecar
+    run.googleapis.com/ingress: all
+    run.googleapis.com/invoker-iam-disabled: "true"
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "2"
+        run.googleapis.com/cpu-throttling: "true"
+        run.googleapis.com/vpc-access-egress: private-ranges-only
+        run.googleapis.com/network-interfaces: '__VPC_NETWORKS_JSON__'
+        run.googleapis.com/container-dependencies: '{"nginx":["api"]}'
+    spec:
+      serviceAccountName: __RUNTIME_SERVICE_ACCOUNT__
+      containerConcurrency: 20
+      timeoutSeconds: 60
+      containers:
+        - name: nginx
+          image: __NGINX_IMAGE__
+          ports:
+            - name: http1
+              containerPort: 8080
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+        - name: api
+          image: __API_IMAGE__
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: PORT
+              value: "3001"
+            - name: WEB_ORIGIN
+              value: __WEB_ORIGIN__
+            - name: SUPABASE_URL
+              value: __SUPABASE_URL__
+            - name: SUPABASE_PUBLISHABLE_KEY
+              value: __SUPABASE_PUBLISHABLE_KEY__
+            - name: SUPABASE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: __SUPABASE_SECRET_KEY_SECRET__
+                  key: __SUPABASE_SECRET_KEY_SECRET_VERSION__
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: __DATABASE_SECRET__
+                  key: __DATABASE_SECRET_VERSION__
+            - name: DATABASE_SSL
+              value: "true"
+            - name: DATABASE_SSL_REJECT_UNAUTHORIZED
+              value: "true"
+            - name: DATABASE_SSL_CA_CERT_PATH
+              value: /var/run/secrets/supabase/root.crt
+            - name: DATABASE_RESOLVE_POOLER_IPV4
+              value: "false"
+            - name: SUPABASE_STORAGE_BUCKET
+              value: delivery-proofs
+            - name: DELIVERY_RIDER_MOBILE_VERIFICATION_MODE
+              value: sms
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /api/health/ready
+              port: 3001
+            timeoutSeconds: 2
+            periodSeconds: 5
+            failureThreshold: 36
+          livenessProbe:
+            httpGet:
+              path: /api/health/live
+              port: 3001
+            timeoutSeconds: 5
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - name: supabase-db-ca
+              mountPath: /var/run/secrets/supabase
+              readOnly: true
+      volumes:
+        - name: supabase-db-ca
+          secret:
+            secretName: __SUPABASE_DB_CA_SECRET__
+            items:
+              - key: __SUPABASE_DB_CA_SECRET_VERSION__
+                path: root.crt

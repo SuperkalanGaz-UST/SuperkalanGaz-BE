@@ -4,6 +4,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { resolve4 } from 'node:dns/promises';
+import { readFileSync } from 'node:fs';
 import { DatabaseRetryInterceptor } from './common/database-retry.interceptor';
 import { AuthModule } from './auth/auth.module';
 import { BranchesModule } from './branches/branches.module';
@@ -19,6 +20,7 @@ import { ReferenceModule } from './reference/reference.module';
 import { ServiceRequestsModule } from './service-requests/service-requests.module';
 import { UsersModule } from './users/users.module';
 import { GovernanceModule } from './governance/governance.module';
+import { HealthModule } from './health/health.module';
 
 /**
  * Modular monolith root (AGENTS.md §4). Supabase PostgreSQL is accessed through
@@ -40,6 +42,32 @@ import { GovernanceModule } from './governance/governance.module';
       inject: [ConfigService],
       useFactory: async (config: ConfigService) => {
         const databaseUrl = new URL(config.getOrThrow<string>('DATABASE_URL'));
+        const databaseSsl = config.get<string>('DATABASE_SSL', 'true') !== 'false';
+        const databaseSslRejectUnauthorized =
+          config.get<string>('DATABASE_SSL_REJECT_UNAUTHORIZED', 'true') !== 'false';
+        const databaseSslCaCertPath = config.get<string>('DATABASE_SSL_CA_CERT_PATH');
+        const nodeEnvironment = config.get<string>('NODE_ENV', 'development');
+
+        if (
+          nodeEnvironment === 'production' &&
+          (!databaseSsl || !databaseSslRejectUnauthorized || !databaseSslCaCertPath)
+        ) {
+          throw new Error(
+            'Production Postgres connections require TLS verification and the Supabase CA certificate',
+          );
+        }
+
+        // node-postgres replaces the explicit ssl object when SSL parameters are
+        // present in a connection string. Remove those parameters so the CA and
+        // certificate-verification settings below remain authoritative.
+        for (const key of [...databaseUrl.searchParams.keys()]) {
+          if (['sslmode', 'sslrootcert', 'sslcert', 'sslkey'].includes(key.toLowerCase())) {
+            databaseUrl.searchParams.delete(key);
+          }
+        }
+        const databaseSslCaCert = databaseSslCaCertPath
+          ? readFileSync(databaseSslCaCertPath, 'utf8')
+          : undefined;
 
         if (config.get<string>('DATABASE_RESOLVE_POOLER_IPV4') === 'true') {
           if (!databaseUrl.hostname.endsWith('.pooler.supabase.com')) {
@@ -68,13 +96,18 @@ import { GovernanceModule } from './governance/governance.module';
         return {
           type: 'postgres' as const,
           url: databaseUrl.toString(),
-          // M6 (partial — see audit/PR notes): `rejectUnauthorized: true`
-          // was tested live against this Supabase pooler and failed with
-          // "self-signed certificate in certificate chain" — the connection
-          // needs a pinned CA, not just this flag, so flipping it blindly
-          // would have broken connectivity in every environment. Left as-is
-          // until the correct CA bundle is sourced and verified.
-          ssl: { rejectUnauthorized: false },
+          // Production must verify the server certificate. A local-only
+          // compatibility override remains available for a network that cannot
+          // complete TLS, but the startup guard above prevents that weakening
+          // from reaching a production deployment.
+          ...(databaseSsl
+            ? {
+                ssl: {
+                  rejectUnauthorized: databaseSslRejectUnauthorized,
+                  ...(databaseSslCaCert ? { ca: databaseSslCaCert } : {}),
+                },
+              }
+            : {}),
           connectTimeoutMS: 10_000,
           poolSize: 5,
           extra: {
@@ -111,6 +144,7 @@ import { GovernanceModule } from './governance/governance.module';
       },
     }),
     AuthModule,
+    HealthModule,
     UsersModule,
     BranchesModule,
     ReferenceModule,

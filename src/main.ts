@@ -51,7 +51,9 @@ async function bootstrap(): Promise<void> {
   // never trust raw client input for scoping decisions (AGENTS.md §12).
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
 
-  await app.listen(Number(process.env.PORT ?? 3001));
+  // Cloud Run reaches sidecars over the instance network; binding loopback
+  // would make the API unreachable from the NGINX ingress container.
+  await app.listen(Number(process.env.PORT ?? 3001), '0.0.0.0');
 }
 
 void bootstrap();

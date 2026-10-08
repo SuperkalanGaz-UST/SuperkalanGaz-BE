@@ -2,6 +2,7 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RegisterDto } from './dto/register.dto';
 import { ResendSignUpCodeDto } from './dto/resend-sign-up-code.dto';
+import { supabaseApiKeyHeaders } from '../common/utils/supabase-api-key-headers';
 
 type AuthJson = Record<string, unknown>;
 
@@ -14,17 +15,19 @@ type AuthJson = Record<string, unknown>;
 export class AuthRegistrationService {
   private readonly authBaseUrl: string;
   private readonly publishableKey: string;
-  private readonly serviceRoleKey: string;
+  private readonly secretKey: string;
 
   constructor(config: ConfigService) {
     const supabaseUrl = config.getOrThrow<string>('SUPABASE_URL').replace(/\/$/, '');
     this.authBaseUrl = `${supabaseUrl}/auth/v1`;
-    this.serviceRoleKey = config.getOrThrow<string>('SUPABASE_SERVICE_ROLE_KEY');
-    // M5 fix: this used to fall back to the service-role key when the anon key
-    // was unset, which silently handed the privileged key to public signup/OTP
-    // calls (and GoTrue's anon-tier abuse protections never apply to a
-    // service-role caller). Fail at startup instead of degrading at runtime.
-    this.publishableKey = config.getOrThrow<string>('SUPABASE_ANON_KEY').trim();
+    this.secretKey =
+      config.get<string>('SUPABASE_SECRET_KEY')?.trim() ||
+      config.getOrThrow<string>('SUPABASE_SERVICE_ROLE_KEY').trim();
+    // Keep public Auth calls on the least-privileged key so Supabase's public
+    // signup and OTP protections apply; never fall back to the admin key.
+    this.publishableKey =
+      config.get<string>('SUPABASE_PUBLISHABLE_KEY')?.trim() ||
+      config.getOrThrow<string>('SUPABASE_ANON_KEY').trim();
   }
 
   async register(dto: RegisterDto): Promise<{ needsConfirmation: boolean }> {
@@ -128,8 +131,7 @@ export class AuthRegistrationService {
     const response = await fetch(`${this.authBaseUrl}${path}`, {
       method: 'POST',
       headers: {
-        apikey: this.publishableKey,
-        Authorization: `Bearer ${this.publishableKey}`,
+        ...supabaseApiKeyHeaders(this.publishableKey),
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
@@ -141,13 +143,23 @@ export class AuthRegistrationService {
     const response = await fetch(`${this.authBaseUrl}/admin${path}`, {
       method: 'PUT',
       headers: {
-        apikey: this.serviceRoleKey,
-        Authorization: `Bearer ${this.serviceRoleKey}`,
+        ...supabaseApiKeyHeaders(this.secretKey),
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
     });
     return this.readResponse(response, 'Could not prepare the customer account');
+  }
+
+  private async adminGetRequest(path: string): Promise<AuthJson> {
+    const response = await fetch(`${this.authBaseUrl}/admin${path}`, {
+      method: 'GET',
+      headers: {
+        ...supabaseApiKeyHeaders(this.secretKey),
+        'Content-Type': 'application/json',
+      },
+    });
+    return this.readResponse(response, 'Could not fetch from admin API');
   }
 
   private async readResponse(response: Response, fallback: string): Promise<AuthJson> {

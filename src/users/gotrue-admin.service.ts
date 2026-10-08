@@ -1,11 +1,12 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { supabaseApiKeyHeaders } from '../common/utils/supabase-api-key-headers';
 
 /**
  * Thin client for the Supabase Auth (GoTrue) Admin REST API. In this system ALL
  * identity lives in auth.users: credentials/email as first-class fields and the
  * CRM claims (role, branch scope, status, display fields) in `app_metadata`.
- * `app_metadata` is writable ONLY through this service-role client — never by the
+ * `app_metadata` is writable ONLY through this privileged server client — never by the
  * signed-in user (unlike `user_metadata`) — so it is the safe home for the
  * tenancy scope the guards trust (AGENTS.md §5, §6). There is NO public.profiles
  * mirror table. We call GoTrue with plain fetch rather than the Supabase JS SDK:
@@ -45,20 +46,19 @@ export interface GoTrueUser {
 export class GoTrueAdminService {
   private readonly authUrl: string;
   private readonly baseUrl: string;
-  private readonly serviceKey: string;
+  private readonly secretKey: string;
   private readonly publicKey: string;
 
   constructor(config: ConfigService) {
     const supabaseUrl = config.getOrThrow<string>('SUPABASE_URL').replace(/\/$/, '');
     this.authUrl = `${supabaseUrl}/auth/v1`;
     this.baseUrl = `${supabaseUrl}/auth/v1/admin`;
-    this.serviceKey = config.getOrThrow<string>('SUPABASE_SERVICE_ROLE_KEY');
-    // M5 fix: this used to fall back to the service-role key when the anon key
-    // was unset, which silently handed the privileged key to a code path meant
-    // for public, unauthenticated calls (and GoTrue's anon-tier abuse
-    // protections never apply to a service-role caller). Fail at startup
-    // instead of degrading security at runtime.
-    this.publicKey = config.getOrThrow<string>('SUPABASE_ANON_KEY');
+    this.secretKey =
+      config.get<string>('SUPABASE_SECRET_KEY')?.trim() ||
+      config.getOrThrow<string>('SUPABASE_SERVICE_ROLE_KEY').trim();
+    this.publicKey =
+      config.get<string>('SUPABASE_PUBLISHABLE_KEY')?.trim() ||
+      config.getOrThrow<string>('SUPABASE_ANON_KEY').trim();
   }
 
   /** Creates an auth user; CRM claims are passed in `app_metadata`. */
@@ -188,14 +188,13 @@ export class GoTrueAdminService {
     path: string,
     body?: GoTrueUserAttrs | Record<string, unknown>,
     baseUrl = this.baseUrl,
-    authKey = this.serviceKey,
+    authKey = this.secretKey,
   ): Promise<Record<string, unknown>> {
     const res = await fetch(`${baseUrl}${path}`, {
       method,
       signal: AbortSignal.timeout(8_000),
       headers: {
-        apikey: authKey,
-        Authorization: `Bearer ${authKey}`,
+        ...supabaseApiKeyHeaders(authKey),
         'Content-Type': 'application/json',
       },
       ...(body ? { body: JSON.stringify(body) } : {}),

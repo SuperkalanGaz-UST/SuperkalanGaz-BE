@@ -4,6 +4,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { supabaseApiKeyHeaders } from '../common/utils/supabase-api-key-headers';
 
 export interface StoredObject {
   path: string;
@@ -23,12 +24,15 @@ export interface DownloadedObject {
 @Injectable()
 export class PrivateObjectStorageService {
   private readonly supabaseUrl: string | null;
-  private readonly serviceKey: string | null;
+  private readonly secretKey: string | null;
   private readonly bucket: string;
 
   constructor(config: ConfigService) {
     this.supabaseUrl = config.get<string>('SUPABASE_URL')?.replace(/\/$/, '') ?? null;
-    this.serviceKey = config.get<string>('SUPABASE_SERVICE_ROLE_KEY') ?? null;
+    this.secretKey =
+      config.get<string>('SUPABASE_SECRET_KEY')?.trim() ||
+      config.get<string>('SUPABASE_SERVICE_ROLE_KEY')?.trim() ||
+      null;
     this.bucket = config.get<string>('SUPABASE_STORAGE_BUCKET') ?? 'delivery-proofs';
   }
 
@@ -82,7 +86,7 @@ export class PrivateObjectStorageService {
     extraHeaders: Record<string, string> = {},
     body?: Buffer,
   ): Promise<Response> {
-    if (!this.supabaseUrl || !this.serviceKey) {
+    if (!this.supabaseUrl || !this.secretKey) {
       throw new ServiceUnavailableException('Proof storage is not configured');
     }
 
@@ -92,8 +96,7 @@ export class PrivateObjectStorageService {
       {
         method,
         headers: {
-          Authorization: `Bearer ${this.serviceKey}`,
-          apikey: this.serviceKey,
+          ...supabaseApiKeyHeaders(this.secretKey),
           ...extraHeaders,
         },
         // Node's fetch accepts Buffer bodies at runtime; the project targets

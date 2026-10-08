@@ -30,6 +30,14 @@ constraints must never be violated.
 
 Sections below are tagged `[api]`, `[web]`, `[mobile]`, or `[all]` where they apply.
 
+At the start of every task, read the workspace [docs index](../docs/index.md) and
+[references index](../docs/references/index.md). Follow them to relevant product,
+architecture, or decision documents; check each document's `sources` and linked primary
+references before relying on a claim. This repository's rules and the workspace
+[AGENTS.md](../AGENTS.md) still govern code; Jira project `SK` remains the source of
+truth for behavior. The shared docs are references, not authorization to implement
+deferred work.
+
 ---
 
 ## 3. Golden Rules (read first) `[all]`
