@@ -13,7 +13,8 @@ export function checkWindow(now = Date.now()) {
 }
 
 function execute(args) {
-  return execFileSync('gcloud', [...args, '--quiet'], {
+  // Global flags must precede --container, which starts container-scoped parsing.
+  return execFileSync('gcloud', ['--quiet', ...args], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 600_000,
   }).trim();
 }
