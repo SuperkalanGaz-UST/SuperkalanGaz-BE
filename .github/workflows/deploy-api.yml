@@ -1,0 +1,114 @@
+name: Deploy API to Cloud Run
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-run-api-production
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT_ID: traccar-510507
+  GCP_REGION: asia-southeast1
+  REGISTRY: asia-southeast1-docker.pkg.dev/traccar-510507/superkalan-crm
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      ready: ${{ steps.baseline.outputs.ready }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - run: node --test deploy/gcp/api/continuous-deploy.test.mjs
+      - id: baseline
+        name: Require the deployed backend baseline on main
+        shell: bash
+        run: |
+          if git merge-base --is-ancestor 2ad5148634e8747855657eaf0b7c077b662f0a84 HEAD; then
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo '### Deployment waiting for updated backend' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Merge develop (including 2ad5148) into main to enable releases. The existing cloud revision is preserved.' >> "$GITHUB_STEP_SUMMARY"
+            echo '::notice::The current main predates the live API. Deployment is blocked until the deployed baseline is merged.'
+          fi
+      - if: steps.baseline.outputs.ready == 'true'
+        run: npm ci
+      - if: steps.baseline.outputs.ready == 'true'
+        run: npm run lint
+      - if: steps.baseline.outputs.ready == 'true'
+        run: npm test -- --runInBand
+      - if: steps.baseline.outputs.ready == 'true'
+        run: node --test deploy/gcp/api/deployment.test.mjs
+      - if: steps.baseline.outputs.ready == 'true'
+        run: npm run build
+
+  connection:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: traccar-510507
+          workload_identity_provider: projects/597059510567/locations/global/workloadIdentityPools/github-api/providers/github-main
+          service_account: github-api-deployer@traccar-510507.iam.gserviceaccount.com
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+      - name: Verify keyless connection to the existing service
+        run: |
+          gcloud run services describe superkalan-crm-api --project="$GCP_PROJECT_ID" --region="$GCP_REGION" --format='value(status.url,status.latestReadyRevisionName)'
+
+  deploy:
+    needs: [verify, connection]
+    if: needs.verify.outputs.ready == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - name: Check funded deployment window
+        run: node deploy/gcp/api/continuous-deploy.mjs --check-window
+      - name: Build API and NGINX images
+        run: |
+          docker build --platform linux/amd64 --tag "$REGISTRY/api:$GITHUB_SHA" --file Dockerfile .
+          docker build --platform linux/amd64 --tag "$REGISTRY/api-nginx:$GITHUB_SHA" --file deploy/gcp/api/nginx.Dockerfile .
+      # Authenticate after the builds so short-lived credentials cover publishing and release.
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: traccar-510507
+          workload_identity_provider: projects/597059510567/locations/global/workloadIdentityPools/github-api/providers/github-main
+          service_account: github-api-deployer@traccar-510507.iam.gserviceaccount.com
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+      - name: Push both images
+        run: |
+          gcloud auth configure-docker asia-southeast1-docker.pkg.dev --quiet
+          docker push "$REGISTRY/api:$GITHUB_SHA"
+          docker push "$REGISTRY/api-nginx:$GITHUB_SHA"
+      - name: Verify candidate and promote it
+        run: node deploy/gcp/api/continuous-deploy.mjs

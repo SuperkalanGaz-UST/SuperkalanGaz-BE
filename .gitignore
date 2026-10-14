@@ -26,3 +26,6 @@ coverage/
 
 # misc
 *.tsbuildinfo
+
+# Short-lived Google GitHub Actions credentials
+gha-creds-*.json

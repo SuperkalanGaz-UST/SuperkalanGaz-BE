@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.env.*
+**/.env
+**/.env.*
+.npmrc
+node_modules
+dist
+coverage
+*.log
+**/certs
+**/backups
+deploy/gcp/.local
+
+# Short-lived Google GitHub Actions credentials
+gha-creds-*.json
