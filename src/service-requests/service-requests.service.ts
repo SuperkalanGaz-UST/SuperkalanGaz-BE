@@ -463,7 +463,7 @@ export class ServiceRequestsService {
       customerId = customer.id;
     }
 
-    const product = await this.prices.findByCylinderSize(dto.cylinderSize);
+    const product = await this.prices.findByCylinderSize(dto.cylinderSize, branchId);
 
     const now = new Date();
     const serviceRequest = this.serviceRequests.create({
@@ -537,7 +537,7 @@ export class ServiceRequestsService {
       accountType: principal.accountType,
     });
 
-    const product = await this.prices.findByCylinderSize(dto.cylinderSize);
+    const product = await this.prices.findByCylinderSize(dto.cylinderSize, branch.id);
     const now = new Date();
     const serviceRequest = this.serviceRequests.create({
       branchId: branch.id,
@@ -1552,7 +1552,7 @@ export class ServiceRequestsService {
         nextCylinderSize !== serviceRequest.cylinderSize ||
         nextQuantity !== serviceRequest.quantity
       ) {
-        const product = await this.prices.findByCylinderSize(nextCylinderSize);
+        const product = await this.prices.findByCylinderSize(nextCylinderSize, serviceRequest.branchId);
         const nextTotal = Number((product.unitPrice * nextQuantity).toFixed(2));
 
         if (product.cylinderSize !== serviceRequest.cylinderSize) {
@@ -1970,4 +1970,3 @@ export interface FranchiseOrderAnalyticsSeries {
   deliveredCount: number;
   cancelledCount: number;
 }
-

@@ -22,7 +22,8 @@ function fixture(status = 200) {
   };
   const request = async (url, options) => {
     requests.push([url, options]);
-    return new Response('', { status: url.includes('/health/') ? status : 401 });
+    const publicRead = url.includes('/health/') || url.endsWith('/api/prices/regions') || url.includes('/api/prices?');
+    return new Response('', { status: publicRead ? status : 401 });
   };
   return { env, run, request, now: () => Date.parse('2026-10-14T00:00:00Z'), calls, requests };
 }
@@ -31,7 +32,7 @@ test('verifies the no-traffic candidate before promoting digest-pinned images', 
   const f = fixture();
   const result = await release(f);
   assert.equal(result.previous, 'previous');
-  assert.equal(f.requests.length, 4);
+  assert.equal(f.requests.length, 7);
   const update = f.calls.find((args) => args.includes('update'));
   assert.ok(update.includes('--no-traffic'));
   assert.equal(update.filter((arg) => arg.startsWith('--image=')).length, 2);
@@ -70,5 +71,15 @@ test('a cutoff reached during verification prevents promotion', async () => {
   let checks = 0;
   f.now = () => ++checks < 3 ? Date.parse(cutoff) - 1 : Date.parse(cutoff);
   await assert.rejects(release(f), /ended/);
+  assert.ok(!f.calls.some((args) => args.includes('update-traffic')));
+});
+
+test('a candidate missing the regional pricing endpoint cannot receive traffic', async () => {
+  const f = fixture();
+  const request = f.request;
+  f.request = async (url, options) => url.endsWith('/api/prices/regions')
+    ? new Response(JSON.stringify({ message: 'Cannot GET /api/prices/regions' }), { status: 404 })
+    : request(url, options);
+  await assert.rejects(release(f), /prices\/regions: expected 200, received 404/);
   assert.ok(!f.calls.some((args) => args.includes('update-traffic')));
 });

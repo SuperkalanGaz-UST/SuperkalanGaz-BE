@@ -120,6 +120,17 @@ export class NotificationsService {
     );
   }
 
+  /** Regional price publications are visible only within the affected branch scopes. */
+  async publishRegionalPriceUpdate(message: string, branchIds: string[], manager: EntityManager): Promise<void> {
+    if (branchIds.length === 0) return;
+    const repository = manager.getRepository(StaffNotification);
+    const now = new Date();
+    await repository.save(branchIds.map((branchId) => repository.create({
+      type: 'price-update', audienceRole: null, branchId, title: 'Regional price update published',
+      message, createdAt: now, deletedAt: null,
+    })));
+  }
+
   /**
    * Domain services use this method for non-price events (complaints, branch
    * approvals, service requests, etc.). The explicit role and optional branch

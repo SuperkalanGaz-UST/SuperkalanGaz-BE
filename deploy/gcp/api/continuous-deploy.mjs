@@ -56,6 +56,8 @@ export async function release({ env = process.env, run = execute, request = fetc
   }
   for (const [path, expected, headers] of [
     ['/api/health/live', 200, {}], ['/api/health/ready', 200, {}],
+    ['/api/prices/regions', 200, {}], ['/api/prices?regionCode=IV-A', 200, {}],
+    ['/api/prices/assigned', 401, {}],
     ['/api/branches', 401, {}], ['/api/users', 401, { Authorization: 'Bearer invalid' }],
   ]) {
     const response = await request(`${candidate.url}${path}`, {

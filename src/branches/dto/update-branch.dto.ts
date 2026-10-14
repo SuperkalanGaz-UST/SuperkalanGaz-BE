@@ -1,5 +1,6 @@
-import { IsNotEmpty, IsObject, IsOptional, IsString } from 'class-validator';
+import { IsIn, IsNotEmpty, IsObject, IsOptional, IsString } from 'class-validator';
 import { BranchGeofence } from '../branch.entity';
+import { REGION_CODES, RegionCode } from '../../prices/philippine-regions';
 
 /**
  * Editable fields for an existing branch (Franchise Registry "Edit" modal).
@@ -8,6 +9,10 @@ import { BranchGeofence } from '../branch.entity';
  * may be changed but not blanked; city/province/contact may be cleared.
  */
 export class UpdateBranchDto {
+  @IsOptional()
+  @IsIn(REGION_CODES)
+  region?: RegionCode | null;
+
   @IsOptional()
   @IsString()
   @IsNotEmpty()

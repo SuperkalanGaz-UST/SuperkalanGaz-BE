@@ -158,7 +158,7 @@ export class BranchesService {
       const branch = this.branches.create({
         name,
         code: generateBranchCode(name),
-        region: null,
+        region: dto.region ?? null,
         address: dto.address.trim(),
         contactNumber: dto.contactNumber ?? null,
         province: dto.province?.trim() ? dto.province.trim() : null,
@@ -321,7 +321,7 @@ export class BranchesService {
    * fields (city/province/contact) normalize an empty string to null.
    */
   async update(
-    _principal: Principal,
+    principal: Principal,
     id: string,
     dto: UpdateBranchDto,
   ): Promise<BranchRow> {
@@ -329,6 +329,7 @@ export class BranchesService {
     if (!branch) throw new NotFoundException('Branch not found');
 
     const oldName = branch.name;
+    const oldRegion = branch.region;
 
     if (dto.name !== undefined) branch.name = dto.name.trim();
     if (dto.address !== undefined) branch.address = dto.address.trim();
@@ -338,9 +339,22 @@ export class BranchesService {
     if (dto.province !== undefined)
       branch.province = dto.province.trim() ? dto.province.trim() : null;
     if (dto.geofence !== undefined) branch.geofence = dto.geofence ?? null;
+    if (dto.region !== undefined) branch.region = dto.region;
     branch.updatedAt = new Date();
 
-    const saved = await this.branches.save(branch);
+    const audit = this.governanceAudit;
+    const saved = branch.region !== oldRegion && audit
+      ? await this.branches.manager.transaction(async (manager) => {
+        const updated = await manager.getRepository(Branch).save(branch);
+        await audit.record({
+          category: 'price-change', action: 'branch-pricing-region-assigned', actor: principal,
+          affectedRecordType: 'branch', affectedRecordId: updated.id, branchId: updated.id,
+          beforeState: { region: oldRegion }, afterState: { region: updated.region },
+          reason: 'Pricing region updated in the Franchise Registry',
+        }, manager);
+        return updated;
+      })
+      : await this.branches.save(branch);
 
     // UUID scope survives renames. Refresh display-only branch labels for users
     // assigned to this UUID; legacy-name accounts are included during rollout.
