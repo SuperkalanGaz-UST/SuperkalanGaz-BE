@@ -1,9 +1,9 @@
 -- 0008_create_fleet_riders.sql
 -- Creates fleet.riders — one row per delivery rider (motorcycle courier) that a
 -- branch can dispatch a Service Request to. This is the minimal roster backing
--- the BM dispatch dropdown (story BM-003); riders are seeded manually for now,
--- there is no rider-CRUD UI in this slice, and — per AGENTS.md §8/§11 — riders
--- have NO mobile app or client. Live GPS (SinoTrack ST-901 → Traccar) is
+-- the BM dispatch dropdown (story BM-003). Delivery Riders are seeded manually in this
+-- historical slice; the planned Rider invitation and offer-acceptance flow
+-- is specified separately. Live GPS (SinoTrack ST-901 → Traccar) remains
 -- hardware-dependent and deferred; this table carries no GPS/telematics columns.
 -- Follows project conventions (AGENTS.md §6): UUID PK, no FK constraints
 -- (integrity is enforced in the NestJS service layer), timestamptz audit fields,

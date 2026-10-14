@@ -4,25 +4,175 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, IsNull, Repository } from 'typeorm';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  And,
+  In,
+  IsNull,
+  LessThan,
+  MoreThanOrEqual,
+  Not,
+  Repository,
+  DataSource,
+} from 'typeorm';
 import { Principal } from '../auth/principal';
+import { Branch } from '../branches/branch.entity';
+import { BranchReportQuery } from '../common/dto/branch-report.query';
+import { reportRangeFrom } from '../common/report-range';
 import { CimService } from '../cim/cim.service';
 import { FleetService } from '../fleet/fleet.service';
+import { LoyaltyService } from '../loyalty/loyalty.service';
+import { Redemption } from '../loyalty/redemption.entity';
 import { PricesService } from '../prices/prices.service';
+import { CreateCustomerServiceRequestDto } from './dto/create-customer-service-request.dto';
 import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
 import { EditServiceRequestDto } from './dto/edit-service-request.dto';
 import { CancelServiceRequestDto } from './dto/cancel-service-request.dto';
-import { ServiceRequest } from './service-request.entity';
+import { ReassignServiceRequestDto } from './dto/reassign-service-request.dto';
+import { LogDelayReasonDto } from './dto/log-delay-reason.dto';
+import { OrderSource, ServiceRequest } from './service-request.entity';
 import { ServiceRequestStatusHistory } from './service-request-status-history.entity';
+import { ServiceRequestDeliveryProof } from './service-request-delivery-proof.entity';
+import { SlaConfiguration, SlaSegment } from './sla-configuration.entity';
+import { PayMongoService } from './paymongo.service';
+import {
+  DELIVERY_PROOF_MAX_BYTES,
+  DeliveryProofMimeType,
+  isDeliveryProofMimeType,
+} from './delivery-proof.constants';
+import { PrivateObjectStorageService, StoredObject } from '../storage/private-object-storage.service';
+
+export interface DeliveryProofUpload {
+  buffer: Buffer;
+  originalname: string;
+  mimetype: string;
+  size: number;
+}
+
+interface PreparedDeliveryProof extends StoredObject {
+  id: string;
+  branchId: string;
+  serviceRequestId: string;
+  riderId: string;
+  originalFileName: string;
+  mimeType: DeliveryProofMimeType;
+  byteSize: number;
+  sha256: string;
+  uploadedAt: Date;
+}
+
+export interface DeliveryProofDownload {
+  data: Buffer;
+  contentType: DeliveryProofMimeType;
+  contentLength: number;
+  fileName: string;
+}
+
+/** Human labels for the delay-reason dropdown categories, used to build the
+ * single combined `delay_reason` display string (story BM-011). */
+const DELAY_REASON_LABELS: Record<string, string> = {
+  traffic: 'Traffic',
+  weather: 'Weather',
+  customer_unavailable: 'Customer unavailable',
+  vehicle_issue: 'Vehicle issue',
+  address_issue: 'Address issue',
+  other: 'Other',
+};
+
+/** Resolved SLA thresholds for one branch, keyed by segment. A missing key
+ * means no active 'all'-channel threshold is configured (branch-specific or
+ * global) for that segment — treated as "cannot breach" (fails quiet, never
+ * flags a false breach from missing configuration). */
+type ThresholdMap = Partial<Record<SlaSegment, number>>;
+
+export type ReportSlaSegment =
+  | 'request_to_dispatch'
+  | 'dispatch_to_in_transit'
+  | 'in_transit_to_delivery'
+  | 'dispatch_to_delivery';
+
+export interface SlaReportMetric {
+  evaluated: number;
+  compliant: number;
+  breached: number;
+  complianceRate: number | null;
+  totalMinutes: number;
+  averageMinutes: number | null;
+}
+
+export interface SlaOrderSourceMetric extends SlaReportMetric {
+  total: number;
+  notEvaluated: number;
+}
+
+export interface DailyStockCheckMetric {
+  distinctDaysChecked: number;
+  totalDaysInPeriod: number;
+  complianceRate: number | 'no data';
+}
+
+export interface SlaBranchReport {
+  totalServiceRequests: number;
+  evaluatedRequests: number;
+  withinSla: number;
+  breaches: number;
+  notEvaluated: number;
+  overallComplianceRate: number | null;
+  segments: Record<ReportSlaSegment, SlaReportMetric>;
+  orderSources: Record<OrderSource, SlaOrderSourceMetric>;
+  dailyStockCheck: DailyStockCheckMetric;
+}
+
+export interface BranchDashboardMetrics {
+  ordersToday: number;
+  totalOrders: number;
+  completedDeliveries: number;
+  cancelledFailedDeliveries: number;
+  slaBreaches: number;
+  deliveryCompletionRate: number;
+  loyaltyClaimsThisMonth: number;
+  earningsToday: Array<{ hour: string; earnings: number }>;
+  earningsThisWeek: Array<{ day: string; earnings: number }>;
+  earningsThisMonth: Array<{ week: string; earnings: number }>;
+  topSellingTanks: Array<{ size: string; orders: number }>;
+  orderVolumeTrend: Array<{ month: string; orders: number }>;
+  dailyOrderVolume: Array<{ day: string; orders: number }>;
+  hourlyOrderVolume: Array<{ hour: string; orders: number }>;
+  totalRevenue: number;
+  revenueByTank: Array<{ size: string; revenue: number }>;
+  sales: Array<{
+    id: string;
+    date: Date;
+    receipt: string;
+    customer: string;
+    orders: number;
+    spent: number;
+    paid: string;
+  }>;
+}
+
+export interface BranchSalesRecord {
+  id: string;
+  date: Date;
+  receipt: string;
+  customer: string;
+  orders: number;
+  spent: number;
+  paid: string;
+}
 
 /**
- * Service Request intake & queue (SRD module). This slice covers create
- * (walk-in / phone intake), the branch queue list, and detail lookup. Rider
- * assignment, dispatch, in-transit and delivery are later slices — they will
- * populate the trailing SLA timestamps left null here.
+ * Service Request intake & queue (SRD module). Covers create (walk-in / phone
+ * intake), the branch queue, detail lookup, dispatch/deliver, pre-dispatch
+ * edit/cancel (BM-US-07), and the delayed-delivery journey (BM-US-02):
+ * live SLA-at-risk flagging on the queue (BM-008), rider reassignment
+ * (BM-010), delay-reason logging (BM-011), and the persisted SLA breach
+ * record (BM-012), plus read-only Branch Owner SLA reporting.
  *
  * All scoping derives from the verified Principal, never from request
  * params/body (AGENTS.md §5). Isolation is enforced here in the application
@@ -33,10 +183,18 @@ export class ServiceRequestsService {
   constructor(
     @InjectRepository(ServiceRequest)
     private readonly serviceRequests: Repository<ServiceRequest>,
+    @InjectRepository(Branch)
+    private readonly branches: Repository<Branch>,
     // Append-only audit trail for guarded lifecycle actions (edit / cancel,
-    // BM-US-07). Maps the existing srd.service_request_status_history table.
+    // BM-US-07; reassign / delay-reason, BM-US-02). Maps the existing
+    // srd.service_request_status_history table.
     @InjectRepository(ServiceRequestStatusHistory)
     private readonly statusHistory: Repository<ServiceRequestStatusHistory>,
+    // READ-ONLY: the Franchise Administrator's configured SLA breach
+    // thresholds (BM-008's "configured breach threshold" — explicitly
+    // FA-owned per the story). This module never writes to this table.
+    @InjectRepository(SlaConfiguration)
+    private readonly slaConfigurations: Repository<SlaConfiguration>,
     // Reused to validate a rider at dispatch time and flip them to 'On Delivery'
     // — mirrors how BranchesService reuses GoTrueAdminService across modules.
     private readonly fleet: FleetService,
@@ -46,7 +204,233 @@ export class ServiceRequestsService {
     // Shared catalog lookup. Money is resolved server-side and snapshotted so
     // staff clients cannot submit a forged price.
     private readonly prices: PricesService,
+    private readonly payMongo: PayMongoService,
+    private readonly loyalty: LoyaltyService,
+    private readonly dataSource: DataSource,
+    // Optional keeps isolated legacy unit fixtures that exercise only the
+    // non-upload BM path valid; the NestJS module always supplies both.
+    @Optional()
+    @InjectRepository(ServiceRequestDeliveryProof)
+    private readonly deliveryProofs?: Repository<ServiceRequestDeliveryProof>,
+    @Optional()
+    private readonly objectStorage?: PrivateObjectStorageService,
+    @Optional()
+    @InjectRepository(Redemption)
+    private readonly redemptions?: Repository<Redemption>,
   ) {}
+
+  /** Shared branch dashboard calculation used by role-specific report routes. */
+  async getBranchDashboardMetrics(
+    principal: Principal,
+    query: BranchReportQuery,
+  ): Promise<BranchDashboardMetrics> {
+    const branchIds = this.requireBranches(principal);
+    const branchId = query.branchId ?? branchIds[0];
+    if (!branchIds.includes(branchId)) {
+      throw new ForbiddenException('Dashboard branch is outside the caller scope');
+    }
+
+    const { start, endExclusive } = reportRangeFrom(query);
+    const requests = await this.serviceRequests.find({
+      where: {
+        branchId,
+        requestedAt: And(MoreThanOrEqual(start), LessThan(endExclusive)),
+        deletedAt: IsNull(),
+      },
+      order: { requestedAt: 'ASC' },
+    });
+    const trendStart = new Date(start);
+    trendStart.setUTCMonth(trendStart.getUTCMonth() - 5);
+    const trendRequests = await this.serviceRequests.find({
+      where: {
+        branchId,
+        requestedAt: And(MoreThanOrEqual(trendStart), LessThan(endExclusive)),
+        deletedAt: IsNull(),
+      },
+      order: { requestedAt: 'ASC' },
+    });
+    if (!this.redemptions) throw new ServiceUnavailableException('Dashboard metrics are unavailable');
+    const redemptions = await this.redemptions.find({
+      where: {
+        branchId,
+        requestedAt: And(MoreThanOrEqual(start), LessThan(endExclusive)),
+        status: Not(In(['rejected', 'cancelled'])),
+      },
+    });
+
+    const todayKey = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(new Date());
+    const toManilaDate = (date: Date) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(date);
+    const todayRequests = requests.filter((request) => toManilaDate(request.requestedAt) === todayKey);
+    const hourly = new Map<number, number>(Array.from({ length: 11 }, (_, index) => [index + 8, 0]));
+    const weekly = new Map<number, number>(Array.from({ length: 5 }, (_, index) => [index + 1, 0]));
+    const tankCounts = new Map<string, number>();
+    const tankRevenue = new Map<string, number>();
+    const monthlyVolume = new Map<string, number>();
+    const dailyVolume = new Map<string, number>();
+    const hourlyVolume = new Map<number, number>(Array.from({ length: 24 }, (_, hour) => [hour, 0]));
+    const dailyEarnings = new Map<string, number>();
+    const eligibleOrders = requests.filter((request) => request.status !== 'Cancelled');
+    const completedOrders = eligibleOrders.filter(
+      (request) => request.status === 'Delivered' || request.deliveredAt !== null,
+    );
+    for (let offset = 5; offset >= 0; offset -= 1) {
+      const month = new Date(start);
+      month.setUTCMonth(month.getUTCMonth() - offset);
+      const key = `${month.getUTCFullYear()}-${String(month.getUTCMonth() + 1).padStart(2, '0')}`;
+      monthlyVolume.set(key, 0);
+    }
+    // Anchored to the requested range's actual last day, not server "now" —
+    // otherwise this skeleton silently drifts from the data whenever `to`
+    // isn't today (it happened to line up before only because the frontend
+    // always requests a range ending today).
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const rangeEndDate = new Date(endExclusive.getTime() - DAY_MS);
+    for (let offset = 6; offset >= 0; offset -= 1) {
+      const day = new Date(rangeEndDate);
+      day.setUTCDate(day.getUTCDate() - offset);
+      const key = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Manila',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(day);
+      dailyVolume.set(key, 0);
+      dailyEarnings.set(key, 0);
+    }
+    for (const request of requests) {
+      const date = request.requestedAt;
+      if (request.status === 'Cancelled') continue;
+      const amount = request.totalAmount ?? 0;
+      const hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Manila', hour: '2-digit', hour12: false }).format(date));
+      const day = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Manila', day: 'numeric' }).format(date));
+      hourly.set(hour, (hourly.get(hour) ?? 0) + amount);
+      weekly.set(Math.floor((day - 1) / 7) + 1, (weekly.get(Math.floor((day - 1) / 7) + 1) ?? 0) + amount);
+      tankCounts.set(request.cylinderSize, (tankCounts.get(request.cylinderSize) ?? 0) + request.quantity);
+      tankRevenue.set(request.cylinderSize, (tankRevenue.get(request.cylinderSize) ?? 0) + amount);
+      const dayKey = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Manila',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(date);
+      dailyVolume.set(dayKey, (dailyVolume.get(dayKey) ?? 0) + 1);
+      dailyEarnings.set(dayKey, (dailyEarnings.get(dayKey) ?? 0) + amount);
+      if (toManilaDate(date) === todayKey) {
+        hourlyVolume.set(hour, (hourlyVolume.get(hour) ?? 0) + 1);
+      }
+    }
+    for (const request of trendRequests) {
+      if (request.status === 'Cancelled') continue;
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Manila',
+        year: 'numeric',
+        month: '2-digit',
+      }).formatToParts(request.requestedAt);
+      const year = parts.find((part) => part.type === 'year')?.value;
+      const month = parts.find((part) => part.type === 'month')?.value;
+      if (year && month) {
+        const key = `${year}-${month}`;
+        monthlyVolume.set(key, (monthlyVolume.get(key) ?? 0) + 1);
+      }
+    }
+
+    const supportedCylinderSizes = ['2.7kg', '5kg', '11kg', '22kg'];
+    const rankedTanks = [...new Set([...supportedCylinderSizes, ...tankCounts.keys()])]
+      .map((size) => ({ size, orders: tankCounts.get(size) ?? 0 }))
+      .sort((a, b) => b.orders - a.orders);
+    const sales = requests.map((request) => ({
+      id: request.id,
+      date: request.requestedAt,
+      receipt: request.srCode,
+      customer: request.customerName,
+      orders: request.quantity,
+      spent: request.totalAmount ?? 0,
+      paid: request.paymentStatus === 'Paid' ? 'Paid' : 'Unpaid',
+    }));
+
+    return {
+      ordersToday: todayRequests.filter((request) => request.status !== 'Cancelled').length,
+      totalOrders: requests.length,
+      completedDeliveries: completedOrders.length,
+      cancelledFailedDeliveries: requests.filter(
+        (request) => request.status === 'Cancelled' || request.status === 'Under Review',
+      ).length,
+      slaBreaches: requests.filter((request) => request.slaBreached).length,
+      deliveryCompletionRate: eligibleOrders.length === 0
+        ? 0
+        : Number(((completedOrders.length / eligibleOrders.length) * 100).toFixed(1)),
+      loyaltyClaimsThisMonth: redemptions.length,
+      earningsToday: [...hourly.entries()].sort(([a], [b]) => a - b).map(([hour, earnings]) => ({ hour: `${hour}:00`, earnings })),
+      earningsThisWeek: [...dailyEarnings.entries()].map(([key, earnings]) => {
+        const d = new Date(`${new Date().getFullYear()}-${key}T00:00:00+08:00`);
+        const weekday = new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'Asia/Manila' }).format(d);
+        const dayNum = new Intl.DateTimeFormat('en-US', { day: 'numeric', timeZone: 'Asia/Manila' }).format(d);
+        return { day: `${weekday} ${dayNum}`, earnings };
+      }),
+      earningsThisMonth: [...weekly.entries()].sort(([a], [b]) => a - b).map(([week, earnings]) => ({ week: `Week ${week}`, earnings })),
+      topSellingTanks: rankedTanks,
+      orderVolumeTrend: [...monthlyVolume.entries()].map(([key, orders]) => ({
+        month: new Intl.DateTimeFormat('en-US', { month: 'short', timeZone: 'Asia/Manila' })
+          .format(new Date(`${key}-01T00:00:00+08:00`)),
+        orders,
+      })),
+      dailyOrderVolume: [...dailyVolume.entries()].map(([key, orders]) => {
+        const d = new Date(`${new Date().getFullYear()}-${key}T00:00:00+08:00`);
+        const weekday = new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'Asia/Manila' }).format(d);
+        const dayNum = new Intl.DateTimeFormat('en-US', { day: 'numeric', timeZone: 'Asia/Manila' }).format(d);
+        return { day: `${weekday} ${dayNum}`, orders };
+      }),
+      hourlyOrderVolume: [...hourlyVolume.entries()].sort(([a], [b]) => a - b)
+        .map(([hour, orders]) => ({ hour: `${String(hour).padStart(2, '0')}:00`, orders })),
+      totalRevenue: requests.reduce((sum, request) => sum + (request.totalAmount ?? 0), 0),
+      revenueByTank: [...new Set([...supportedCylinderSizes, ...tankRevenue.keys()])]
+        .map((size) => ({ size, revenue: tankRevenue.get(size) ?? 0 }))
+        .filter((entry) => entry.revenue > 0 || supportedCylinderSizes.includes(entry.size)),
+      sales,
+    };
+  }
+
+  async getBranchSalesRecords(
+    principal: Principal, 
+    branchId: string,
+    page: number = 1,
+    limit: number = 1000000,
+    search?: string,
+    status?: string
+  ): Promise<{ sales: BranchSalesRecord[], totalCount: number }> {
+    if (!this.requireBranches(principal).includes(branchId)) {
+      throw new ForbiddenException('Sales branch is outside the caller scope');
+    }
+    
+    const qb = this.serviceRequests.createQueryBuilder('sr')
+      .where('sr.branch_id = :branchId', { branchId })
+      .andWhere('sr.deleted_at IS NULL');
+      
+    if (search) {
+      qb.andWhere('(sr.sr_code ILIKE :search OR sr.customer_name ILIKE :search)', { search: `%${search}%` });
+    }
+    
+    if (status && status !== 'all') {
+      const paymentStatus = status.toLowerCase() === 'paid' ? 'Paid' : 'Unpaid';
+      qb.andWhere('sr.payment_status = :paymentStatus', { paymentStatus });
+    }
+    
+    qb.orderBy('sr.requested_at', 'DESC')
+      .skip((page - 1) * limit)
+      .take(limit);
+      
+    const [requests, totalCount] = await qb.getManyAndCount();
+    
+    const sales = requests.map((request) => ({
+      id: request.id,
+      date: request.requestedAt,
+      receipt: request.srCode,
+      customer: request.customerName,
+      orders: request.quantity,
+      spent: request.totalAmount ?? 0,
+      paid: request.paymentStatus === 'Paid' ? 'Paid' : 'Unpaid',
+    }));
+    
+    return { sales, totalCount };
+  }
 
   /**
    * Walk-in / phone intake. The server owns branch_id (the caller's own
@@ -94,6 +478,14 @@ export class ServiceRequestsService {
       quantity: dto.quantity,
       unitPrice: product.unitPrice,
       totalAmount: Number((product.unitPrice * dto.quantity).toFixed(2)),
+      paymentMethod: 'Cash on Delivery',
+      paymentStatus: 'Unpaid',
+      paymongoCheckoutSessionId: null,
+      paymongoCheckoutUrl: null,
+      paymongoReference: null,
+      paymongoPaymentId: null,
+      paymongoWebhookEventId: null,
+      paymentPaidAt: null,
       specialInstructions: dto.specialInstructions?.trim() || null,
       // requested_at opens the SLA chain now; the rest fill in on later slices.
       requestedAt: now,
@@ -106,6 +498,86 @@ export class ServiceRequestsService {
     });
 
     return this.serviceRequests.save(serviceRequest);
+  }
+
+  /**
+   * Customer-app order placement. The customer chooses the branch and the API
+   * materializes their authenticated identity into that branch's CIM directory.
+   * The order links to the resulting CIM profile; the profile retains the
+   * auth.users reference needed to read the customer's own history.
+   */
+  async createForCustomer(
+    principal: Principal,
+    dto: CreateCustomerServiceRequestDto,
+  ): Promise<ServiceRequest> {
+    if (!principal.accountType) {
+      throw new ForbiddenException('Customer account type is missing');
+    }
+    // L4 fix: never log PII (customer name was previously included here).
+    console.log('[service-requests-service] createForCustomer input', {
+      userId: principal.userId,
+      role: principal.role,
+      branchId: dto.branchId,
+      quantity: dto.quantity,
+      cylinderSize: dto.cylinderSize,
+    });
+    const branch = await this.branches.findOne({
+      where: { id: dto.branchId, status: 'active' },
+    });
+    if (!branch) {
+      throw new BadRequestException('Branch not found');
+    }
+
+    const customer = await this.cim.upsertSelfRegisteredInBranch({
+      authUserId: principal.userId,
+      branchId: branch.id,
+      name: dto.customerName,
+      contactNumber: dto.customerContact,
+      deliveryAddress: dto.deliveryAddress,
+      accountType: principal.accountType,
+    });
+
+    const product = await this.prices.findByCylinderSize(dto.cylinderSize);
+    const now = new Date();
+    const serviceRequest = this.serviceRequests.create({
+      branchId: branch.id,
+      orderSource: 'Mobile App',
+      status: 'Pending',
+      customerId: customer.id,
+      customerName: dto.customerName.trim(),
+      customerContact: dto.customerContact.trim(),
+      deliveryAddress: dto.deliveryAddress.trim(),
+      cylinderSize: product.cylinderSize,
+      quantity: dto.quantity,
+      unitPrice: product.unitPrice,
+      totalAmount: Number((product.unitPrice * dto.quantity).toFixed(2)),
+      paymentMethod: dto.paymentMethod,
+      paymentStatus: 'Unpaid',
+      paymongoCheckoutSessionId: null,
+      paymongoCheckoutUrl: null,
+      paymongoReference: null,
+      paymongoPaymentId: null,
+      paymongoWebhookEventId: null,
+      paymentPaidAt: null,
+      specialInstructions: dto.specialInstructions?.trim() || null,
+      requestedAt: now,
+      dispatchedAt: null,
+      inTransitAt: null,
+      deliveredAt: null,
+      createdAt: now,
+      updatedAt: now,
+      deletedAt: null,
+    });
+
+    const saved = await this.serviceRequests.save(serviceRequest);
+    console.log('[service-requests-service] createForCustomer saved', {
+      id: saved.id,
+      branchId: saved.branchId,
+      status: saved.status,
+      customerId: saved.customerId,
+      orderSource: saved.orderSource,
+    });
+    return saved;
   }
 
   /**
@@ -123,6 +595,247 @@ export class ServiceRequestsService {
   }
 
   /**
+   * A CIM customer's order history for the Branch Manager's Customer Directory
+   * (click-through detail view) — newest first, branch-scoped via the customer's
+   * own resolved branch rather than the caller's first branch, so a multi-branch
+   * BM gets the right one. 404s (not an empty list) when the id is unknown or
+   * belongs to a branch outside the caller's scope, so the UI can distinguish
+   * "no orders yet" from "wrong id".
+   */
+  async listForCimCustomer(
+    principal: Principal,
+    customerId: string,
+  ): Promise<ServiceRequest[]> {
+    const branchIds = this.requireBranches(principal);
+    const customer = await this.cim.findInBranches(customerId, branchIds);
+    if (!customer) throw new NotFoundException('Customer not found');
+
+    return this.serviceRequests.find({
+      where: { customerId: customer.id, branchId: customer.branchId, deletedAt: IsNull() },
+      order: { requestedAt: 'DESC' },
+    });
+  }
+
+  /** Customer order history, newest first. */
+  async listForCustomer(principal: Principal): Promise<ServiceRequest[]> {
+    const profileIds = await this.cim.profileIdsForAuthUser(principal.userId);
+    // Include the auth subject for legacy mobile orders written before mobile
+    // customers were materialized into CIM. Migration 0025 rewrites those rows,
+    // but this fallback keeps history readable during a rolling deployment.
+    const ownedCustomerIds = [...new Set([principal.userId, ...profileIds])];
+    return this.serviceRequests.find({
+      where: { customerId: In(ownedCustomerIds), deletedAt: IsNull() },
+      order: { requestedAt: 'DESC' },
+    });
+  }
+
+  /**
+   * The queue, enriched with a LIVE (non-persisted) "at risk" flag for
+   * still-in-flight requests (story BM-008: "has been Pending or En Route
+   * longer than the configured SLA threshold"). Dispatched is treated the same
+   * as En Route — the GPS/Traccar pipeline that would transition a request to
+   * 'En Route' is hardware-deferred (AGENTS.md §8), so in practice a request
+   * never leaves 'Dispatched' before delivery; excluding it would make this
+   * flag never fire (interpretation call, stated in the PR).
+   *
+   * This flag is computed fresh on every call — it is NOT the persisted
+   * sla_breached column (that is written once, at delivery, by deliver()
+   * below; see BM-012). Delivered/Cancelled/Under Review rows always read
+   * slaAtRisk=false here; their permanent record is on the row itself.
+   */
+  async listWithSlaRisk(principal: Principal): Promise<
+    {
+      serviceRequest: ServiceRequest;
+      slaAtRisk: boolean;
+      slaAtRiskSegment: SlaSegment | null;
+      customerCode: string | null;
+    }[]
+  > {
+    const branchIds = this.requireBranches(principal);
+    const requests = await this.list(principal);
+    if (requests.length === 0) return [];
+
+    const thresholdsByBranch = await this.resolveThresholdsForBranches(branchIds);
+    const now = new Date();
+    const customerIds = [...new Set(requests.map((sr) => sr.customerId).filter((id): id is string => id != null))];
+    const codes = await this.cim.codesByIds(customerIds);
+
+    return requests.map((sr) => {
+      const { atRisk, segment } = this.computeAtRisk(
+        sr,
+        thresholdsByBranch.get(sr.branchId) ?? {},
+        now,
+      );
+      return {
+        serviceRequest: sr,
+        slaAtRisk: atRisk,
+        slaAtRiskSegment: segment,
+        customerCode: sr.customerId ? (codes.get(sr.customerId) ?? null) : null,
+      };
+    });
+  }
+
+  /** Completed delivery records for staff review. A Branch Owner must provide
+   * the selected branch UUID when multiple assigned branches exist. */
+  async listDeliveryRecords(
+    principal: Principal,
+    requestedBranchId?: string,
+  ): Promise<ServiceRequest[]> {
+    const branchIds = this.proofBranchIds(principal, requestedBranchId);
+    return this.serviceRequests.find({
+      where: {
+        branchId: In(branchIds),
+        deliveredAt: Not(IsNull()),
+        deletedAt: IsNull(),
+      },
+      order: { deliveredAt: 'DESC' },
+    });
+  }
+
+  /**
+   * Read-only SLA analytics for a Branch Owner. Each real timestamp segment is
+   * evaluated independently. GPS-dependent legs remain explicitly unevaluated
+   * when `in_transit_at` or a configured threshold is absent; the overall result
+   * may still use the existing end-to-end fallback, but never invents segment
+   * attribution.
+   */
+  async getSlaReport(
+    principal: Principal,
+    query: BranchReportQuery,
+  ): Promise<SlaBranchReport> {
+    const branchIds = this.reportBranchIds(principal, query.branchId);
+    const { start, endExclusive } = reportRangeFrom(query);
+    const requests = await this.serviceRequests.find({
+      where: {
+        branchId: In(branchIds),
+        deliveredAt: And(MoreThanOrEqual(start), LessThan(endExclusive)),
+        deletedAt: IsNull(),
+      },
+      order: { deliveredAt: 'DESC' },
+    });
+    const thresholdsByBranch = await this.resolveThresholdsForBranches(branchIds);
+
+    const segments: SlaBranchReport['segments'] = {
+      request_to_dispatch: this.emptySlaMetric(),
+      dispatch_to_in_transit: this.emptySlaMetric(),
+      in_transit_to_delivery: this.emptySlaMetric(),
+      dispatch_to_delivery: this.emptySlaMetric(),
+    };
+    const orderSources: SlaBranchReport['orderSources'] = {
+      'Mobile App': { ...this.emptySlaMetric(), total: 0, notEvaluated: 0 },
+      'Walk-in/Phone': { ...this.emptySlaMetric(), total: 0, notEvaluated: 0 },
+    };
+
+    let evaluatedRequests = 0;
+    let withinSla = 0;
+    let breaches = 0;
+
+    for (const request of requests) {
+      const thresholds = thresholdsByBranch.get(request.branchId) ?? {};
+      const overallResults: boolean[] = [];
+      const segmentInputs: Array<{
+        key: ReportSlaSegment;
+        from: Date | null;
+        to: Date | null;
+      }> = [
+        {
+          key: 'request_to_dispatch',
+          from: request.requestedAt,
+          to: request.dispatchedAt,
+        },
+        {
+          key: 'dispatch_to_in_transit',
+          from: request.dispatchedAt,
+          to: request.inTransitAt,
+        },
+        {
+          key: 'in_transit_to_delivery',
+          from: request.inTransitAt,
+          to: request.deliveredAt,
+        },
+      ];
+
+      for (const input of segmentInputs) {
+        const threshold = thresholds[input.key as SlaSegment];
+        if (threshold == null || !input.from || !input.to) continue;
+        const mins = this.minutesBetween(input.from, input.to);
+        const compliant = mins <= threshold;
+        this.recordSlaOutcome(segments[input.key], compliant, mins);
+        overallResults.push(compliant);
+      }
+
+      // Without the GPS-dependent timestamp, use the same honest end-to-end
+      // fallback as delivery-time breach persistence. It contributes only to
+      // the overall/source result, never to either missing fine-grained segment.
+      if (!request.inTransitAt && request.dispatchedAt && request.deliveredAt) {
+        const endToEnd = thresholds.end_to_end;
+        if (endToEnd != null) {
+          const mins = this.minutesBetween(request.dispatchedAt, request.deliveredAt);
+          const compliant = mins <= endToEnd;
+          overallResults.push(compliant);
+          this.recordSlaOutcome(segments.dispatch_to_delivery, compliant, mins);
+        }
+      }
+
+      const sourceMetric = orderSources[request.orderSource];
+      sourceMetric.total += 1;
+      if (overallResults.length === 0) {
+        sourceMetric.notEvaluated += 1;
+        continue;
+      }
+
+      const compliant = overallResults.every(Boolean);
+      evaluatedRequests += 1;
+      
+      // Calculate total end-to-end minutes if possible, or 0
+      const totalMins = request.requestedAt && request.deliveredAt ? this.minutesBetween(request.requestedAt, request.deliveredAt) : 0;
+      this.recordSlaOutcome(sourceMetric, compliant, totalMins);
+      if (compliant) withinSla += 1;
+      else breaches += 1;
+    }
+
+    for (const metric of Object.values(segments)) this.finishSlaMetric(metric);
+    for (const metric of Object.values(orderSources)) this.finishSlaMetric(metric);
+
+    return {
+      totalServiceRequests: requests.length,
+      evaluatedRequests,
+      withinSla,
+      breaches,
+      notEvaluated: requests.length - evaluatedRequests,
+      overallComplianceRate: this.complianceRate(withinSla, evaluatedRequests),
+      segments,
+      orderSources,
+      dailyStockCheck: await this.calculateDailyStockCheck(branchIds, start, endExclusive),
+    };
+  }
+
+  private async calculateDailyStockCheck(branchIds: string[], start: Date, endExclusive: Date): Promise<DailyStockCheckMetric> {
+    const totalDays = Math.round((endExclusive.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
+    if (totalDays === 0) return { distinctDaysChecked: 0, totalDaysInPeriod: 0, complianceRate: 'no data' };
+    
+    // Query distinct days in Manila time where the branch checked stock
+    const stockCheckResult = await this.dataSource.query(
+      `
+      SELECT COUNT(DISTINCT (checked_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Manila')::date) as "daysChecked"
+      FROM inventory.stock_check_logs
+      WHERE branch_id = ANY($1)
+        AND checked_at >= $2
+        AND checked_at < $3
+      `,
+      [branchIds, start, endExclusive]
+    );
+    const distinctDaysChecked = parseInt(stockCheckResult[0].daysChecked, 10);
+    const complianceRate = distinctDaysChecked === 0 ? 'no data' : Number(((distinctDaysChecked / totalDays) * 100).toFixed(1));
+
+    return {
+      distinctDaysChecked,
+      totalDaysInPeriod: totalDays,
+      complianceRate,
+    };
+  }
+
+  /**
    * A single request, scoped to the caller's branch(es). Out-of-scope,
    * soft-deleted, or unknown ids all return 404 — never leak whether a row
    * exists in another branch (AGENTS.md §5).
@@ -134,6 +847,7 @@ export class ServiceRequestsService {
       where: { id, branchId: In(branchIds), deletedAt: IsNull() },
     });
     if (!serviceRequest) throw new NotFoundException('Service request not found');
+
     return serviceRequest;
   }
 
@@ -179,6 +893,12 @@ export class ServiceRequestsService {
     if (serviceRequest.dispatchedAt !== null || serviceRequest.status !== 'Pending') {
       throw new ConflictException('Service request already dispatched');
     }
+    if (
+      serviceRequest.paymentMethod === 'PayMongo' &&
+      serviceRequest.paymentStatus !== 'Paid'
+    ) {
+      throw new ConflictException('PayMongo payment is required before dispatch');
+    }
 
     // 3. Rider must be live, Available, and in the SAME branch as the request.
     const rider = await this.fleet.findAssignableRider(
@@ -201,10 +921,20 @@ export class ServiceRequestsService {
         status: 'Dispatched',
         updatedAt: now,
       })
-      .where('id = :id AND dispatched_at IS NULL AND status = :status', {
-        id,
-        status: 'Pending',
-      })
+      .where(
+        `id = :id
+          AND branch_id = :branchId
+          AND dispatched_at IS NULL
+          AND status = :status
+          AND (payment_method <> :paymongo OR payment_status = :paid)`,
+        {
+          id,
+          branchId: serviceRequest.branchId,
+          status: 'Pending',
+          paymongo: 'PayMongo',
+          paid: 'Paid',
+        },
+      )
       .execute();
     if (!result.affected) {
       throw new ConflictException('Service request already dispatched');
@@ -233,18 +963,29 @@ export class ServiceRequestsService {
    *     'Dispatched' or 'En Route'). Enforced authoritatively by the conditional
    *     UPDATE below, so a still-Pending / already-Delivered / Cancelled request
    *     (0 rows affected) is a 409 and two concurrent deliveries can't both win.
-   *  3. Commit: stamp delivered_at + status='Delivered', bump updated_at.
+   *  3. When a Delivery Rider completes the request, the validated proof is
+   *     uploaded first and its metadata is committed with the delivery state.
    *  4. Return the rider to 'Available' so the branch can dispatch them again.
    *
-   * En Route / in_transit_at is GPS/hardware-dependent and deferred (AGENTS.md
-   * §8) — a request may be delivered with in_transit_at still NULL; that is
-   * expected and NOT backfilled here.
+   * Delivery Riders must have started the delivery (En Route). Branch Managers
+   * retain manual completion for Walk-in/Phone requests with no assigned rider.
    *
    * PANEL-CHECK: BM-007's CSAT rating prompt to the customer is a customer MOBILE
    * concern (customers are mobile-only, AGENTS.md §7) — it is deliberately NOT
    * triggered from this backend endpoint. Out of scope for this slice.
+   *
+   * Also PERSISTS the SLA breach record here (story BM-012 — "the delivery is
+   * eventually completed"): computed once, from the four real timestamps, and
+   * written only if not already breached. Because reassign() (below) never
+   * touches these timestamps, this computation — and the record it writes —
+   * is unaffected by any reassignment that happened along the way ("the
+   * original SLA breach is not erased").
    */
-  async deliver(principal: Principal, id: string): Promise<ServiceRequest> {
+  async deliver(
+    principal: Principal,
+    id: string,
+    proof?: DeliveryProofUpload,
+  ): Promise<ServiceRequest> {
     const branchIds = this.requireBranches(principal);
 
     // 1. Load, scoped to the caller's branch(es). Out-of-scope / soft-deleted /
@@ -254,39 +995,491 @@ export class ServiceRequestsService {
     });
     if (!serviceRequest) throw new NotFoundException('Service request not found');
 
+    if (principal.role !== 'driver' && principal.role !== 'branch-manager') {
+      throw new ForbiddenException('Only the assigned Delivery Rider or Branch Manager can complete delivery');
+    }
+    if (principal.role === 'branch-manager' &&
+        (serviceRequest.orderSource !== 'Walk-in/Phone' || serviceRequest.riderId !== null)) {
+      throw new ForbiddenException('Rider deliveries must be completed by the assigned rider with a proof photo');
+    }
+
+    // The client never supplies or selects the completing rider's identity.
+    let authenticatedRiderId: string | null = serviceRequest.riderId;
+    if (principal.role === 'driver') {
+      this.requireProofDependencies();
+      const rider = await this.fleet.findByAuthUserInBranch(
+        principal.userId,
+        serviceRequest.branchId,
+      );
+      if (!rider || serviceRequest.riderId !== rider.id) {
+        throw new ForbiddenException('This Service Request is not assigned to you');
+      }
+      authenticatedRiderId = rider.id;
+      if (serviceRequest.deliveredAt || serviceRequest.status !== 'En Route') {
+        throw new ConflictException('Only an On the way order can be completed with delivery proof');
+      }
+      if (!proof) {
+        throw new BadRequestException('A delivery proof photo is required');
+      }
+    }
+
+    // Retain the existing idempotent loyalty repair for manual deliveries.
+    // Rider proof submissions reject duplicates before reaching this path.
+    if (serviceRequest.deliveredAt && serviceRequest.status === 'Delivered') {
+      await this.recordDeliveredPurchase(serviceRequest);
+      return serviceRequest;
+    }
+
+    if (!serviceRequest.dispatchedAt || serviceRequest.deliveredAt ||
+        !['Dispatched', 'En Route'].includes(serviceRequest.status)) {
+      throw new ConflictException('Service request is not out for delivery');
+    }
+
     // 2 + 3. Commit atomically: only a request that is out for delivery
     //    (dispatched, not yet delivered) is updated. 0 rows affected means the
     //    request is not out for delivery (still Pending, already Delivered, or
     //    Cancelled) — or a concurrent deliver already won — so treat it as the
     //    conflict, mirroring the dispatch race guard (AGENTS.md §8.2).
+    const preparedProof = proof && authenticatedRiderId
+      ? await this.prepareProof(serviceRequest, authenticatedRiderId, proof)
+      : null;
     const now = new Date();
-    const result = await this.serviceRequests
-      .createQueryBuilder()
-      .update(ServiceRequest)
-      .set({
-        deliveredAt: now,
-        status: 'Delivered',
-        updatedAt: now,
-      })
-      .where(
-        'id = :id AND dispatched_at IS NOT NULL AND delivered_at IS NULL',
-        { id },
-      )
-      .execute();
-    if (!result.affected) {
+    const deliverySet: Partial<ServiceRequest> = {
+      deliveredAt: now,
+      status: 'Delivered',
+      updatedAt: now,
+    };
+    if (serviceRequest.paymentMethod === 'Cash on Delivery') {
+      // Same-row UPDATE makes delivery confirmation and Cash receipt one
+      // atomic database transition (CU-017 AC6).
+      deliverySet.paymentStatus = 'Paid';
+      deliverySet.paymentPaidAt = now;
+    }
+    let affected = 0;
+    try {
+      // The database transition and proof metadata commit together. The
+      // object upload happened first, so a delivery is never marked complete
+      // before the photo is available to persist.
+      affected = await this.serviceRequests.manager.transaction(async (manager) => {
+        const result = await manager
+          .createQueryBuilder()
+          .update(ServiceRequest)
+          .set(deliverySet)
+          .where(
+            `id = :id
+              AND branch_id = :branchId
+              AND dispatched_at IS NOT NULL
+              AND delivered_at IS NULL
+              AND status = :expectedStatus
+              AND ${principal.role === 'driver'
+                ? 'rider_id = :riderId'
+                : 'rider_id IS NULL AND order_source = :orderSource'}`,
+            {
+              id, branchId: serviceRequest.branchId,
+              expectedStatus: serviceRequest.status,
+              riderId: authenticatedRiderId,
+              orderSource: 'Walk-in/Phone',
+            },
+          )
+          .execute();
+        if (!result.affected) return 0;
+
+        if (preparedProof) {
+          const proofs = manager.getRepository(ServiceRequestDeliveryProof);
+          await proofs.save(proofs.create({
+            id: preparedProof.id,
+            serviceRequestId: preparedProof.serviceRequestId,
+            branchId: preparedProof.branchId,
+            riderId: preparedProof.riderId,
+            storagePath: preparedProof.path,
+            originalFileName: preparedProof.originalFileName,
+            mimeType: preparedProof.mimeType,
+            byteSize: preparedProof.byteSize,
+            sha256: preparedProof.sha256,
+            uploadedAt: preparedProof.uploadedAt,
+            deletedAt: null,
+          }));
+        }
+        const history = manager.getRepository(ServiceRequestStatusHistory);
+        await history.save(history.create({
+          serviceRequestId: id,
+          branchId: serviceRequest.branchId,
+          fromStatus: serviceRequest.status,
+          toStatus: 'Delivered',
+          changedBy: principal.userId,
+          changedAt: now,
+          note: principal.role === 'driver'
+            ? 'Delivery Rider submitted proof of delivery'
+            : 'Branch Manager marked Walk-in/Phone order delivered',
+        }));
+        return result.affected;
+      });
+    } catch (error) {
+      if (preparedProof) await this.cleanupPreparedProof(preparedProof);
+      throw error;
+    }
+
+    if (!affected) {
+      if (preparedProof) await this.cleanupPreparedProof(preparedProof);
+      const concurrentlyDelivered = await this.serviceRequests.findOne({
+        where: { id, branchId: In(branchIds), deletedAt: IsNull() },
+      });
+      if (principal.role === 'branch-manager' &&
+          concurrentlyDelivered?.deliveredAt && concurrentlyDelivered.status === 'Delivered' &&
+          concurrentlyDelivered.orderSource === 'Walk-in/Phone' && concurrentlyDelivered.riderId === null) {
+        await this.recordDeliveredPurchase(concurrentlyDelivered);
+        return concurrentlyDelivered;
+      }
       throw new ConflictException('Service request is not out for delivery');
     }
 
     // 4. Return the assigned rider to the Available roster (inverse of dispatch's
     //    markOnDelivery). rider_id is always set on an out-for-delivery request,
-    //    but guard defensively in case of legacy data.
+    //    but guard defensively in case of legacy data. Best-effort: a vehicle
+    //    lookup failure must never block the delivery itself — the rider can be
+    //    reset manually or on the next deliver attempt.
     if (serviceRequest.riderId) {
-      await this.fleet.markAvailable(serviceRequest.riderId);
+      try {
+        await this.fleet.markAvailable(serviceRequest.riderId);
+      } catch {
+        // Non-fatal — the delivery committed; the rider may need a manual reset.
+      }
     }
 
     // Reflect the committed state back to the caller without a re-read.
     serviceRequest.deliveredAt = now;
     serviceRequest.status = 'Delivered';
+    serviceRequest.updatedAt = now;
+    if (serviceRequest.paymentMethod === 'Cash on Delivery') {
+      serviceRequest.paymentStatus = 'Paid';
+      serviceRequest.paymentPaidAt = now;
+    }
+
+    // 5. Persist the SLA breach record (BM-012), using the now-complete four
+    //    timestamps. Best-effort: a threshold lookup failure must never block
+    //    the delivery itself, so this runs after the commit and swallows its
+    //    own errors.
+    try {
+      const breach = await this.computeBreach(serviceRequest);
+      if (breach) {
+        await this.serviceRequests.update(
+          { id },
+          {
+            slaBreached: true,
+            slaBreachSegment: breach.segment,
+            slaBreachedAt: now,
+          },
+        );
+        serviceRequest.slaBreached = true;
+        serviceRequest.slaBreachSegment = breach.segment;
+        serviceRequest.slaBreachedAt = now;
+      }
+    } catch {
+      // Non-fatal — the delivery itself already committed successfully.
+    }
+
+    // 6. Credit exactly one server-owned loyalty track for a linked customer.
+    await this.recordDeliveredPurchase(serviceRequest);
+
+    return serviceRequest;
+  }
+
+  /**
+   * Streams a proof only after resolving the Service Request and proof through
+   * the caller's JWT-derived branch scope. The object key never leaves this
+   * service, so clients cannot turn storage paths into cross-branch handles.
+   */
+  async downloadDeliveryProof(
+    principal: Principal,
+    id: string,
+    requestedBranchId?: string,
+  ): Promise<DeliveryProofDownload> {
+    const branchIds = this.proofBranchIds(principal, requestedBranchId);
+    const serviceRequest = await this.serviceRequests.findOne({
+      where: { id, branchId: In(branchIds), deletedAt: IsNull() },
+    });
+    if (!serviceRequest) throw new NotFoundException('Service request not found');
+
+    const proof = await this.findLiveProof(id, serviceRequest.branchId);
+    if (!proof) throw new NotFoundException('Proof of Delivery is not available');
+
+    const { objectStorage } = this.requireProofDependencies();
+    const object = await objectStorage.getObject(proof.storagePath);
+    return {
+      data: object.data,
+      contentType: proof.mimeType as DeliveryProofMimeType,
+      contentLength: object.contentLength,
+      fileName: this.safeOriginalFileName(proof.originalFileName, proof.mimeType),
+    };
+  }
+
+  private requireProofDependencies(): {
+    deliveryProofs: Repository<ServiceRequestDeliveryProof>;
+    objectStorage: PrivateObjectStorageService;
+  } {
+    if (!this.deliveryProofs || !this.objectStorage) {
+      throw new ServiceUnavailableException('Proof of Delivery storage is unavailable');
+    }
+    return {
+      deliveryProofs: this.deliveryProofs,
+      objectStorage: this.objectStorage,
+    };
+  }
+
+  private async findLiveProof(
+    serviceRequestId: string,
+    branchId: string,
+  ): Promise<ServiceRequestDeliveryProof | null> {
+    const { deliveryProofs } = this.requireProofDependencies();
+    return deliveryProofs.findOne({
+      where: { serviceRequestId, branchId, deletedAt: IsNull() },
+    });
+  }
+
+  private async prepareProof(
+    serviceRequest: ServiceRequest,
+    riderId: string,
+    proof: DeliveryProofUpload,
+  ): Promise<PreparedDeliveryProof> {
+    const { objectStorage } = this.requireProofDependencies();
+    const byteSize = proof.buffer.byteLength;
+    if (!byteSize || byteSize > DELIVERY_PROOF_MAX_BYTES || proof.size !== byteSize) {
+      throw new BadRequestException('Proof photo must be 3 MB or smaller');
+    }
+    if (!isDeliveryProofMimeType(proof.mimetype)) {
+      throw new BadRequestException('Proof photo must be a JPEG or PNG image');
+    }
+    if (!this.hasImageSignature(proof.buffer, proof.mimetype)) {
+      throw new BadRequestException('Proof photo is not a valid JPEG or PNG image');
+    }
+
+    const id = randomUUID();
+    const extension = proof.mimetype === 'image/png' ? 'png' : 'jpg';
+    const path = `${serviceRequest.branchId}/${serviceRequest.id}/${id}.${extension}`;
+    const uploadedAt = new Date();
+    await objectStorage.putObject(path, proof.buffer, proof.mimetype);
+
+    return {
+      id,
+      path,
+      branchId: serviceRequest.branchId,
+      serviceRequestId: serviceRequest.id,
+      riderId,
+      originalFileName: this.safeOriginalFileName(proof.originalname, proof.mimetype),
+      mimeType: proof.mimetype,
+      byteSize,
+      sha256: createHash('sha256').update(proof.buffer).digest('hex'),
+      uploadedAt,
+    };
+  }
+
+  private async cleanupPreparedProof(proof: PreparedDeliveryProof): Promise<void> {
+    try {
+      await this.objectStorage?.removeObject(proof.path);
+    } catch {
+      // The database transaction remains authoritative. An orphaned object is
+      // safer than exposing it; an operator can clean it up from the bucket.
+    }
+  }
+
+  private hasImageSignature(buffer: Buffer, mimeType: string): boolean {
+    if (mimeType === 'image/jpeg') {
+      return buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+    }
+    return (
+      mimeType === 'image/png' &&
+      buffer.length >= 8 &&
+      buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    );
+  }
+
+  private safeOriginalFileName(original: string, mimeType: string): string {
+    const fallback = mimeType === 'image/png' ? 'delivery-proof.png' : 'delivery-proof.jpg';
+    const cleaned = original
+      .replace(/[\\/]/g, '_')
+      .replace(/[^a-zA-Z0-9._ -]/g, '_')
+      .trim()
+      .slice(0, 120);
+    return cleaned || fallback;
+  }
+
+  private proofBranchIds(principal: Principal, requestedBranchId?: string): string[] {
+    if (principal.role === 'branch-owner' && principal.branchIds.length > 1 && !requestedBranchId) {
+      throw new BadRequestException('Selected branch is required');
+    }
+    return this.reportBranchIds(principal, requestedBranchId);
+  }
+
+  private async recordDeliveredPurchase(serviceRequest: ServiceRequest): Promise<void> {
+    if (!serviceRequest.customerId) return;
+    await this.loyalty.recordDeliveredPurchase(
+      serviceRequest.customerId,
+      serviceRequest.branchId,
+      serviceRequest.id,
+      serviceRequest.cylinderSize,
+      serviceRequest.quantity,
+    );
+  }
+
+  /**
+   * Replace the assigned rider on a delayed, still-in-flight request (story
+   * BM-010). Interpretation call (stated in the PR): this does NOT touch
+   * dispatched_at / in_transit_at — it only swaps the rider and writes an
+   * audit entry. The story's bold AC title says "new dispatched_at segment
+   * logged", but its actual Given/When/Then only requires "the system logs
+   * the reassignment event with a timestamp" (which the audit row satisfies).
+   * Taking the literal, testable clause over the loose title also means the
+   * original SLA timing — and therefore the eventual persisted breach record
+   * (BM-012) — is never disturbed by a reassignment, satisfying "the original
+   * SLA breach is not erased" by construction rather than by extra logic.
+   *
+   * Order of checks (all in the service layer, AGENTS.md §5/§6):
+   *  1. Load the SR scoped to the caller's branches — 404 if missing.
+   *  2. Must be Dispatched/En Route with a currently assigned rider — else 400
+   *     (nothing to reassign: still Pending, already Delivered, or Cancelled).
+   *  3. The CURRENT rider is looked up status-agnostically (they are 'On
+   *     Delivery', not 'Available') to name them in the audit note.
+   *  4. The NEW rider must be Available, in the same branch, and different
+   *     from the current rider — else 400.
+   *  5. Commit atomically: conditional UPDATE (WHERE rider_id = the OLD rider
+   *     AND status still Dispatched/En Route). 0 rows => a concurrent
+   *     reassign/deliver already won => 409.
+   *  6. Free the old rider ('Available'), claim the new one ('On Delivery').
+   *  7. Append an audit entry naming both riders.
+   */
+  async reassign(
+    principal: Principal,
+    id: string,
+    dto: ReassignServiceRequestDto,
+  ): Promise<ServiceRequest> {
+    const branchIds = this.requireBranches(principal);
+
+    // 1. Load, scoped to the caller's branch(es).
+    const serviceRequest = await this.serviceRequests.findOne({
+      where: { id, branchId: In(branchIds), deletedAt: IsNull() },
+    });
+    if (!serviceRequest) throw new NotFoundException('Service request not found');
+
+    // 2. Must be out for delivery with a rider already assigned.
+    if (
+      !['Dispatched', 'En Route'].includes(serviceRequest.status) ||
+      !serviceRequest.riderId
+    ) {
+      throw new BadRequestException(
+        'Cannot reassign: request is not out for delivery',
+      );
+    }
+    const oldRiderId = serviceRequest.riderId;
+
+    // 3. Name the current rider for the audit note (status-agnostic lookup —
+    //    they are 'On Delivery', so findAssignableRider would not find them).
+    const oldRider = await this.fleet.findInBranch(oldRiderId, serviceRequest.branchId);
+
+    // 4. The new rider must be Available, in-branch, and a genuine change.
+    if (dto.riderId === oldRiderId) {
+      throw new BadRequestException('Request is already assigned to this rider');
+    }
+    const newRider = await this.fleet.findAssignableRider(
+      dto.riderId,
+      serviceRequest.branchId,
+    );
+    if (!newRider) throw new BadRequestException('Rider is not assignable');
+
+    // 5. Commit atomically: only a still-out-for-delivery request currently
+    //    assigned to the OLD rider is updated. 0 rows => a concurrent
+    //    reassign or deliver already won => 409.
+    const now = new Date();
+    const result = await this.serviceRequests
+      .createQueryBuilder()
+      .update(ServiceRequest)
+      .set({ riderId: newRider.id, updatedAt: now })
+      .where(
+        'id = :id AND rider_id = :oldRiderId AND status IN (:...statuses)',
+        { id, oldRiderId, statuses: ['Dispatched', 'En Route'] },
+      )
+      .execute();
+    if (!result.affected) {
+      throw new ConflictException('Request is no longer assigned to that rider');
+    }
+
+    // 6. Swap fleet availability: free the old rider, claim the new one.
+    //    markAvailable is best-effort — a vehicle-lookup failure must not prevent
+    //    the new rider from being claimed (the old rider can be reset manually).
+    try {
+      await this.fleet.markAvailable(oldRiderId);
+    } catch {
+      // Non-fatal — the old rider may remain On Delivery; manual reset possible.
+    }
+    await this.fleet.markOnDelivery(newRider.id);
+
+    // 7. Audit the reassignment. Status is unchanged (see the interpretation
+    //    note above), so from/to are both the request's current status.
+    await this.statusHistory.save(
+      this.statusHistory.create({
+        serviceRequestId: id,
+        branchId: serviceRequest.branchId,
+        fromStatus: serviceRequest.status,
+        toStatus: serviceRequest.status,
+        changedBy: principal.userId,
+        changedAt: now,
+        note: `Reassigned from ${oldRider?.name ?? oldRiderId} to ${newRider.name}`,
+      }),
+    );
+
+    // Reflect the committed state back to the caller without a re-read.
+    serviceRequest.riderId = newRider.id;
+    serviceRequest.updatedAt = now;
+    return serviceRequest;
+  }
+
+  /**
+   * Log a delay reason (story BM-011). The dropdown category + optional
+   * free-text note are combined into the single `delay_reason` display
+   * string. No status change — this is purely documentation, available on any
+   * still-in-flight request (Pending/Dispatched/En Route); once Delivered or
+   * Cancelled the delivery outcome already speaks for itself, and once Under
+   * Review a lost-cylinder complaint (BM-US-04) already documents the issue.
+   */
+  async logDelayReason(
+    principal: Principal,
+    id: string,
+    dto: LogDelayReasonDto,
+  ): Promise<ServiceRequest> {
+    const branchIds = this.requireBranches(principal);
+
+    const serviceRequest = await this.serviceRequests.findOne({
+      where: { id, branchId: In(branchIds), deletedAt: IsNull() },
+    });
+    if (!serviceRequest) throw new NotFoundException('Service request not found');
+
+    if (!['Pending', 'Dispatched', 'En Route'].includes(serviceRequest.status)) {
+      throw new BadRequestException(
+        `Cannot log a delay reason on a request that is ${serviceRequest.status}`,
+      );
+    }
+
+    const label = DELAY_REASON_LABELS[dto.reasonCategory] ?? dto.reasonCategory;
+    const note = dto.note?.trim();
+    const delayReason = note ? `${label}: ${note}` : label;
+
+    const now = new Date();
+    await this.serviceRequests.update(
+      { id },
+      { delayReason, updatedAt: now },
+    );
+    await this.statusHistory.save(
+      this.statusHistory.create({
+        serviceRequestId: id,
+        branchId: serviceRequest.branchId,
+        fromStatus: serviceRequest.status,
+        toStatus: serviceRequest.status,
+        changedBy: principal.userId,
+        changedAt: now,
+        note: `Delay reason logged: ${delayReason}`,
+      }),
+    );
+
+    serviceRequest.delayReason = delayReason;
     serviceRequest.updatedAt = now;
     return serviceRequest;
   }
@@ -326,6 +1519,13 @@ export class ServiceRequestsService {
     });
     if (!serviceRequest) throw new NotFoundException('Service request not found');
 
+    if (
+      serviceRequest.paymentMethod === 'PayMongo' &&
+      serviceRequest.paymongoCheckoutSessionId
+    ) {
+      throw new ConflictException('Cannot edit after PayMongo checkout has started');
+    }
+
     // 2. Diff against the OLD values. Only changed fields land in `set` (the
     //    UPDATE) and `changes` (the human-readable audit note). specialInstructions
     //    is normalised to null when blank so "" genuinely clears it.
@@ -341,16 +1541,34 @@ export class ServiceRequestsService {
         set.deliveryAddress = next;
       }
     }
-    if (dto.cylinderSize !== undefined) {
-      const next = dto.cylinderSize.trim();
-      if (next !== serviceRequest.cylinderSize) {
-        changes.push(`cylinder_size "${serviceRequest.cylinderSize}" → "${next}"`);
-        set.cylinderSize = next;
+    // cylinderSize/quantity are priced fields — never patch either without
+    // re-deriving unitPrice/totalAmount from the live catalog (H2 fix: an
+    // edit must never leave a stale price snapshot on the order).
+    if (dto.cylinderSize !== undefined || dto.quantity !== undefined) {
+      const nextCylinderSize = dto.cylinderSize ?? serviceRequest.cylinderSize;
+      const nextQuantity = dto.quantity ?? serviceRequest.quantity;
+
+      if (
+        nextCylinderSize !== serviceRequest.cylinderSize ||
+        nextQuantity !== serviceRequest.quantity
+      ) {
+        const product = await this.prices.findByCylinderSize(nextCylinderSize);
+        const nextTotal = Number((product.unitPrice * nextQuantity).toFixed(2));
+
+        if (product.cylinderSize !== serviceRequest.cylinderSize) {
+          changes.push(
+            `cylinder_size "${serviceRequest.cylinderSize}" → "${product.cylinderSize}"`,
+          );
+          set.cylinderSize = product.cylinderSize;
+        }
+        if (nextQuantity !== serviceRequest.quantity) {
+          changes.push(`quantity ${serviceRequest.quantity} → ${nextQuantity}`);
+          set.quantity = nextQuantity;
+        }
+        changes.push(`total_amount ${serviceRequest.totalAmount} → ${nextTotal}`);
+        set.unitPrice = product.unitPrice;
+        set.totalAmount = nextTotal;
       }
-    }
-    if (dto.quantity !== undefined && dto.quantity !== serviceRequest.quantity) {
-      changes.push(`quantity ${serviceRequest.quantity} → ${dto.quantity}`);
-      set.quantity = dto.quantity;
     }
     if (dto.specialInstructions !== undefined) {
       const next = dto.specialInstructions.trim() || null;
@@ -436,6 +1654,19 @@ export class ServiceRequestsService {
     });
     if (!serviceRequest) throw new NotFoundException('Service request not found');
 
+    if (
+      serviceRequest.paymentMethod === 'PayMongo' &&
+      serviceRequest.paymentStatus === 'Paid'
+    ) {
+      throw new ConflictException('Paid PayMongo Service Requests cannot be cancelled');
+    }
+    if (
+      serviceRequest.paymentMethod === 'PayMongo' &&
+      serviceRequest.paymongoCheckoutSessionId
+    ) {
+      await this.payMongo.expireCheckout(serviceRequest.paymongoCheckoutSessionId);
+    }
+
     // 2. Commit atomically under the pre-dispatch guard. 0 rows affected means
     //    the request was dispatched (or already cancelled/deleted) between load
     //    and write — treat as the conflict, mirroring dispatch/deliver.
@@ -445,8 +1676,18 @@ export class ServiceRequestsService {
       .update(ServiceRequest)
       .set({ status: 'Cancelled', updatedAt: now })
       .where(
-        'id = :id AND dispatched_at IS NULL AND status = :status AND deleted_at IS NULL',
-        { id, status: 'Pending' },
+        `id = :id
+          AND branch_id = :branchId
+          AND dispatched_at IS NULL
+          AND status = :status
+          AND deleted_at IS NULL
+          AND payment_status <> :paid`,
+        {
+          id,
+          branchId: serviceRequest.branchId,
+          status: 'Pending',
+          paid: 'Paid',
+        },
       )
       .execute();
     if (!result.affected) {
@@ -472,6 +1713,157 @@ export class ServiceRequestsService {
     return serviceRequest;
   }
 
+  /**
+   * Batch-resolve active 'all'-channel SLA thresholds for a set of branches,
+   * one query for branch-specific rows + one for the global (branch_id NULL)
+   * fallback — avoids an N+1 lookup per row in listWithSlaRisk. A branch with
+   * no specific override falls back to the global row per segment.
+   */
+  private async resolveThresholdsForBranches(
+    branchIds: string[],
+  ): Promise<Map<string, ThresholdMap>> {
+    const [branchRows, globalRows] = await Promise.all([
+      this.slaConfigurations.find({
+        where: { branchId: In(branchIds), orderSource: 'all', isActive: true },
+      }),
+      this.slaConfigurations.find({
+        where: { branchId: IsNull(), orderSource: 'all', isActive: true },
+      }),
+    ]);
+
+    const globalMap: ThresholdMap = {};
+    for (const row of globalRows) globalMap[row.segment] = row.thresholdMinutes;
+
+    const result = new Map<string, ThresholdMap>();
+    for (const branchId of branchIds) {
+      result.set(branchId, { ...globalMap });
+    }
+    for (const row of branchRows) {
+      const map = result.get(row.branchId as string);
+      if (map) map[row.segment] = row.thresholdMinutes;
+    }
+    return result;
+  }
+
+  private emptySlaMetric(): SlaReportMetric {
+    return { evaluated: 0, compliant: 0, breached: 0, complianceRate: null, totalMinutes: 0, averageMinutes: null };
+  }
+
+  private recordSlaOutcome(metric: SlaReportMetric, compliant: boolean, minutes: number): void {
+    metric.evaluated += 1;
+    metric.totalMinutes += minutes;
+    if (compliant) metric.compliant += 1;
+    else metric.breached += 1;
+  }
+
+  private finishSlaMetric(metric: SlaReportMetric): void {
+    metric.complianceRate = this.complianceRate(metric.compliant, metric.evaluated);
+    metric.averageMinutes = metric.evaluated === 0 ? null : Number((metric.totalMinutes / metric.evaluated).toFixed(1));
+  }
+
+  private complianceRate(compliant: number, evaluated: number): number | null {
+    return evaluated === 0 ? null : Number(((compliant / evaluated) * 100).toFixed(1));
+  }
+
+  private minutesBetween(from: Date, to: Date): number {
+    return (to.getTime() - from.getTime()) / 60_000;
+  }
+
+  /**
+   * LIVE at-risk check for one still-in-flight request (BM-008). See
+   * listWithSlaRisk's doc for the Dispatched≈En Route interpretation.
+   * Delivered/Cancelled/Under Review rows are never "at risk" — their outcome
+   * is already final; the permanent breach record (if any) lives on the row.
+   */
+  private computeAtRisk(
+    sr: ServiceRequest,
+    thresholds: ThresholdMap,
+    now: Date,
+  ): { atRisk: boolean; segment: SlaSegment | null } {
+    const minutesSince = (from: Date) => (now.getTime() - from.getTime()) / 60000;
+
+    if (sr.status === 'Pending') {
+      const threshold = thresholds.request_to_dispatch;
+      if (threshold == null) return { atRisk: false, segment: null };
+      return {
+        atRisk: minutesSince(sr.requestedAt) > threshold,
+        segment: 'request_to_dispatch',
+      };
+    }
+
+    if (sr.status === 'Dispatched' || sr.status === 'En Route') {
+      // in_transit_at is GPS-dependent and typically null in this MVP
+      // (AGENTS.md §8) — when present, check the finer in-transit segment;
+      // otherwise fall back to the coarser dispatch segment using
+      // dispatched_at, which is always set once out for delivery.
+      if (sr.inTransitAt) {
+        const threshold = thresholds.in_transit_to_delivery;
+        if (threshold == null) return { atRisk: false, segment: null };
+        return {
+          atRisk: minutesSince(sr.inTransitAt) > threshold,
+          segment: 'in_transit_to_delivery',
+        };
+      }
+      const threshold = thresholds.dispatch_to_in_transit;
+      if (threshold == null || !sr.dispatchedAt) return { atRisk: false, segment: null };
+      return {
+        atRisk: minutesSince(sr.dispatchedAt) > threshold,
+        segment: 'dispatch_to_in_transit',
+      };
+    }
+
+    return { atRisk: false, segment: null };
+  }
+
+  /**
+   * PERSISTED breach computation at delivery (BM-012), using the four real
+   * timestamps. Segment 1 (request_to_dispatch) is always measurable. When
+   * in_transit_at was never populated (typical for this MVP — GPS deferred,
+   * AGENTS.md §8), segments 2/3 cannot be individually attributed without it,
+   * so this checks the 'end_to_end' threshold (dispatched_at → delivered_at)
+   * as the honest fallback instead of guessing at segment attribution —
+   * interpretation call, stated in the PR. Returns the FIRST segment found in
+   * breach (chronological order), or null if none breached / no threshold is
+   * configured for the relevant segment(s).
+   */
+  private async computeBreach(
+    sr: ServiceRequest,
+  ): Promise<{ segment: SlaSegment } | null> {
+    const thresholds = (await this.resolveThresholdsForBranches([sr.branchId])).get(
+      sr.branchId,
+    ) ?? {};
+    const minutesBetween = (from: Date, to: Date) => (to.getTime() - from.getTime()) / 60000;
+
+    if (!sr.dispatchedAt || !sr.deliveredAt) return null;
+
+    // Segment 1: request → dispatch. Always measurable.
+    const seg1 = thresholds.request_to_dispatch;
+    if (seg1 != null && minutesBetween(sr.requestedAt, sr.dispatchedAt) > seg1) {
+      return { segment: 'request_to_dispatch' };
+    }
+
+    if (sr.inTransitAt) {
+      // GPS data present: check segments 2 and 3 individually.
+      const seg2 = thresholds.dispatch_to_in_transit;
+      if (seg2 != null && minutesBetween(sr.dispatchedAt, sr.inTransitAt) > seg2) {
+        return { segment: 'dispatch_to_in_transit' };
+      }
+      const seg3 = thresholds.in_transit_to_delivery;
+      if (seg3 != null && minutesBetween(sr.inTransitAt, sr.deliveredAt) > seg3) {
+        return { segment: 'in_transit_to_delivery' };
+      }
+      return null;
+    }
+
+    // No GPS data: fall back to the combined dispatch→delivery span against
+    // the end_to_end threshold.
+    const endToEnd = thresholds.end_to_end;
+    if (endToEnd != null && minutesBetween(sr.dispatchedAt, sr.deliveredAt) > endToEnd) {
+      return { segment: 'end_to_end' };
+    }
+    return null;
+  }
+
   /** Render a nullable string for an audit note: quoted value, or (none). */
   private quoteNullable(value: string | null): string {
     return value === null ? '(none)' : `"${value}"`;
@@ -485,8 +1877,97 @@ export class ServiceRequestsService {
     return principal.branchIds;
   }
 
+  /** A client value can narrow verified JWT scope, never widen it. */
+  private reportBranchIds(principal: Principal, requestedBranchId?: string): string[] {
+    const branchIds = this.requireBranches(principal);
+    if (!requestedBranchId) return branchIds;
+    if (!branchIds.includes(requestedBranchId)) {
+      throw new ForbiddenException('Requested branch is outside the caller scope');
+    }
+    return [requestedBranchId];
+  }
+
   /** The single branch a new request is filed under — the caller's own branch. */
   private requireBranch(principal: Principal): string {
     return this.requireBranches(principal)[0];
   }
+
+  /**
+   * Cross-branch order-volume analytics for the Franchise Administrator dashboard.
+   * Returns monthly order counts (total, delivered, cancelled) per branch for the
+   * requested date window, joined with branch name and region.  Optional
+   * `branchId` or `region` narrow the result to a single branch or region.
+   */
+  async franchiseAnalytics(
+    from: Date,
+    to: Date,
+    branchId?: string,
+    region?: string,
+  ): Promise<FranchiseOrderAnalyticsSeries[]> {
+    const qb = this.serviceRequests
+      .createQueryBuilder('sr')
+      .select([
+        `to_char(date_trunc('month', sr.requested_at AT TIME ZONE 'Asia/Manila'), 'YYYY-MM') AS month`,
+        'sr.branch_id AS branch_id',
+        'b.name AS branch_name',
+        'b.region AS region',
+        'COUNT(*)::int AS order_count',
+        `SUM(CASE WHEN sr.status = 'Delivered' THEN 1 ELSE 0 END)::int AS delivered_count`,
+        `SUM(CASE WHEN sr.status = 'Cancelled' THEN 1 ELSE 0 END)::int AS cancelled_count`,
+      ])
+      .innerJoin(
+        Branch,
+        'b',
+        'b.id = sr.branch_id',
+      )
+      .where('sr.requested_at >= :from', { from })
+      .andWhere('sr.requested_at < :to', { to })
+      .andWhere('sr.deleted_at IS NULL')
+      .andWhere("b.status = 'active'")
+      .groupBy(`date_trunc('month', sr.requested_at AT TIME ZONE 'Asia/Manila')`)
+      .addGroupBy('sr.branch_id')
+      .addGroupBy('b.name')
+      .addGroupBy('b.region')
+      .orderBy(`date_trunc('month', sr.requested_at AT TIME ZONE 'Asia/Manila')`, 'ASC');
+
+    if (branchId) {
+      qb.andWhere('sr.branch_id = :branchId', { branchId });
+    } else if (region === 'Unassigned') {
+      qb.andWhere('b.region IS NULL');
+    } else if (region) {
+      qb.andWhere('b.region = :region', { region });
+    }
+
+    const rows = await qb.getRawMany<{
+      month: string;
+      branch_id: string;
+      branch_name: string;
+      region: string | null;
+      order_count: number;
+      delivered_count: number;
+      cancelled_count: number;
+    }>();
+
+    return rows.map((r) => ({
+      month: r.month,
+      branchId: r.branch_id,
+      branchName: r.branch_name,
+      region: r.region,
+      orderCount: Number(r.order_count),
+      deliveredCount: Number(r.delivered_count),
+      cancelledCount: Number(r.cancelled_count),
+    }));
+  }
 }
+
+/** One data point in the Franchise Admin order-volume analytics series. */
+export interface FranchiseOrderAnalyticsSeries {
+  month: string;
+  branchId: string;
+  branchName: string;
+  region: string | null;
+  orderCount: number;
+  deliveredCount: number;
+  cancelledCount: number;
+}
+

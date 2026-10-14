@@ -1,0 +1,10 @@
+[Unit]
+Description=Approved 2026-12-20 Asia/Manila export/stop deadline
+
+[Timer]
+OnCalendar=2026-12-19 16:00:00 UTC
+Persistent=true
+Unit=superkalan-traccar-cutoff.service
+
+[Install]
+WantedBy=timers.target

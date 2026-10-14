@@ -25,10 +25,18 @@ constraints must never be violated.
 | Repo                   | Stack                     | Purpose                          |
 | ---------------------- | ------------------------- | -------------------------------- |
 | `superkalan-crm-api`   | NestJS + TypeScript       | Backend, business logic, data    |
-| `superkalan-crm-web`   | Next.js (React)           | Internal staff dashboard (FA/BO/BM) |
-| `SuperkalanGaz-Mobile` | React Native + Expo      | **Customer-only** mobile app     |
+| `superkalan-crm-web`   | Next.js (React)           | Internal staff dashboard (SA/FA/BO/BM) |
+| `SuperkalanGaz-Mobile` | React Native + Expo      | Customer and **Delivery Rider** mobile app |
 
 Sections below are tagged `[api]`, `[web]`, `[mobile]`, or `[all]` where they apply.
+
+At the start of every task, read the workspace [docs index](../docs/index.md) and
+[references index](../docs/references/index.md). Follow them to relevant product,
+architecture, or decision documents; check each document's `sources` and linked primary
+references before relying on a claim. This repository's rules and the workspace
+[AGENTS.md](../AGENTS.md) still govern code; Jira project `SK` remains the source of
+truth for behavior. The shared docs are references, not authorization to implement
+deferred work.
 
 ---
 
@@ -66,12 +74,23 @@ Sections below are tagged `[api]`, `[web]`, `[mobile]`, or `[all]` where they ap
   from `tile.openstreetmap.org`. The browser loads the OpenFreeMap style/tiles; the NestJS
   API only supplies CRM-owned coordinates/geofences. Geocoding is not currently
   implemented and must be treated as a separate future decision.
-- **Mobile:** React Native + Expo (customers only).
-- **GPS:** **SinoTrack ST-901** hardware devices → **Traccar** (self-hosted middleware) →
-  ingested by the API. These are two distinct things; never conflate them (§10).
+- **Mobile:** React Native + Expo (Customer and Delivery Rider role-gated experiences).
+- **GPS has two separate sources.** SinoTrack ST-901 → Traccar → API is authoritative
+  vehicle telemetry for Fleet geofencing and PMS. Delivery Rider phone GPS → Expo app →
+  branch-scoped NestJS API supplies foreground operational location for Service Request
+  and dispatch workflows. Never conflate the sources (§10).
 - **Edge:** NGINX reverse proxy in front of the API.
 - **Architecture style:** **Modular monolith** using NestJS's native module system.
   **No microservices.** RESTful, 3-tier.
+- **Backend-for-Frontend (BFF) boundary:** Deploy/run Next.js and NestJS as separate
+  processes or containers. NestJS is the web-facing BFF and the only application backend;
+  do not add Next.js API routes, backend logic, direct database access, or service-role
+  credentials to the web container, and do not split domains into microservices. BFF
+  endpoints must use timeouts and dependency-aware responses so a failed integration or
+  governance dependency degrades only the affected screen/module while unrelated web and
+  API areas continue running. The web shell must remain usable and show an explicit retry
+  or unavailable state when NestJS cannot be reached; it must never fabricate authoritative
+  data or permit writes while the required dependency is unavailable.
 
 ---
 
@@ -81,22 +100,33 @@ Sections below are tagged `[api]`, `[web]`, `[mobile]`, or `[all]` where they ap
 - Isolation is enforced **at the application layer** via **NestJS guards reading JWT
   claims** — **NOT** Postgres Row-Level Security and **NOT** physical partitioning.
 - **Implication for you:** the database will not stop a cross-branch read. *You* must. Every
-  repository/service query for branch-owned data must apply the `branch_id` derived from the
-  authenticated principal. Do not trust a `branch_id` sent from the client body/params for
-  scoping; derive it from the verified JWT.
+  repository/service query for branch-owned data must apply a `branch_id` contained in the
+  authenticated principal's protected `app_metadata.branch_ids`. A Branch Owner may select
+  one active branch UUID from that authorized set as request context; the guard must validate
+  membership and inject the authorized context before a service uses it. Client input may
+  narrow verified scope but must never widen it or be trusted directly. For a Branch Owner,
+  the guard must also intersect those UUID claims with live `core.branches.owner_id` rows for
+  that Auth user, so a stale token cannot retain a branch after reassignment.
 - **Do not claim or comment that isolation is "DB-enforced."** It is guard-enforced. Accurate
   comments matter — this is a panel-defense point.
 
 Scoping by role (see §7 for full permissions):
+- **SA:** cross-branch governance and audit read visibility (no operational writes).
 - **FA:** cross-branch read visibility (no operational writes).
-- **BO / BM:** strictly their own `branch_id`.
+- **BO:** strictly one of their assigned `branch_ids`; a BO may own one or more branches.
+- **BM:** strictly their single assigned `branch_id`.
 - **Customer:** their own records only.
+
+For every Branch Owner action or branch-specific view, require an explicit selected branch UUID
+when the owner has multiple assignments, validate it against the guard-resolved scope, and use
+that UUID in every repository query. Never default a multi-branch owner to `branchIds[0]`, and
+never use a branch name as an authorization key.
 
 ---
 
 ## 6. Database Conventions `[api]`
 
-- **7 schemas:** `core`, `cim`, `srd`, `fleet`, `loyalty`, `csat`, `inventory` (23 tables).
+- **7 schemas:** `core`, `cim`, `srd`, `fleet`, `loyalty`, `csat`, `inventory` (25 tables).
   All application tables live in exactly one of these. `core.branches` is the branch
   table — never `public.branches`.
 - **The `public` schema MUST stay empty — no application tables, views, or functions.**
@@ -107,15 +137,20 @@ Scoping by role (see §7 for full permissions):
 - **Identity is owned by Supabase Auth, not a `public.profiles` table.** The one row per
   user lives in `auth.users`; CRM claims (role, branch scope, status) are stored in that
   user's **`app_metadata`** (service-role-only — never `user_metadata`, which the user can
-  self-edit and would allow tenancy/privilege escalation). These claims ride in the verified
-  JWT, so the guard reads them from the token (§5) and never queries a mirror table. Manage
-  them through the GoTrue Admin API, never a `public.profiles` row or PostgREST.
+  self-edit and would allow tenancy/privilege escalation). Branch authorization is stored as
+  immutable UUIDs in `app_metadata.branch_ids`; branch names may be retained only as display
+  metadata and must never authorize access. These claims ride in the verified JWT, so the
+  guard reads them from the token (§5) and never queries a mirror table. Manage them through
+  the GoTrue Admin API, never a `public.profiles` row or PostgREST.
 - **UUID primary keys** everywhere.
 - **No foreign-key constraints in the schema.** Referential integrity is enforced in the
   **NestJS service layer**. When writing services, validate referenced records exist and
   belong to the correct branch before persisting.
 - **Explicit indexes are required on all reference columns** (every column used as a logical
   FK / lookup). Add the index in the same migration that introduces the column.
+- **Branch ownership is one-to-many through `core.branches.owner_id`.** Multiple branch rows
+  may reference the same Branch Owner `auth.users` UUID; each branch row has at most one
+  active owner. `owner_id` is indexed and has no database FK.
 - **Soft delete only** (§3.2).
 - Migrations are the only way to change schema; do not rely on TypeORM `synchronize`.
 
@@ -125,15 +160,51 @@ Scoping by role (see §7 for full permissions):
 
 | Role | Interface | Can do | Must NOT do |
 | ---- | --------- | ------ | ----------- |
-| **Franchise Administrator (FA)** | Web | Cross-branch read visibility; **set system-wide SLA thresholds (only FA may)**; manage branch accounts | Any operational write; process orders; dispatch; approve redemptions |
-| **Branch Owner (BO)** | Web | Configure **their branch only**: loyalty merchandise catalog, point rates, threshold values *within FA-set bounds*, Dual-Authorization toggle; view branch analytics | Process daily orders; dispatch; cross-branch access |
-| **Branch Manager (BM)** | Web | **Day-to-day ops for their branch:** create/process service requests, dispatch riders, approve loyalty redemptions | Change SLA thresholds; act outside own branch |
+| **Super Administrator (SA)** | Web | Top-level governance; directly invite, resend, revoke, deactivate, and reactivate Franchise Administrator accounts; approve or reject FA-submitted SLA-threshold, price-configuration, and Branch Owner-reassignment requests; review immutable Franchise Administrator account, price-change, Branch Owner-change, approval, and security activity logs; cross-branch read visibility | Set or know an invited user's password; expose invitation credentials; submit or approve their own governance request; mutate audit history; perform operational writes; process service requests; dispatch; approve redemptions |
+| **Franchise Administrator (FA)** | Web | Cross-branch read visibility; submit system-wide SLA-threshold, price-configuration, and Branch Owner-reassignment requests for SA approval; perform initial branch and Branch Owner onboarding; manage other branch accounts | Create, invite, approve, deactivate, or reactivate Franchise Administrator accounts; approve governance requests; mutate audit history; perform operational writes; process service requests; dispatch; approve redemptions |
+| **Branch Owner (BO)** | Web | Own one or more assigned branches; select one authorized branch context at a time; configure that branch's loyalty merchandise catalog, point rates, threshold values *within FA-set bounds*, and Dual-Authorization toggle; view analytics for assigned branches | Process daily orders; dispatch; access any branch outside `branch_ids` |
+| **Branch Manager (BM)** | Web | **Day-to-day ops for their branch:** create/process service requests, prepare authorized Delivery Riders for dispatch, offer/dispatch service requests, assign branch vehicles, approve loyalty redemptions | Authorize Delivery Rider identity or branch membership; change SLA thresholds; act outside own branch |
+| **Delivery Rider (DR)** | **Web or mobile onboarding; mobile operations** | Accept a Branch Owner invitation through the dedicated registration flow, then use mobile to manage availability after activation, accept or decline assigned service-request offers, and update delivery milestones | Access a web operations dashboard; choose or change authoritative `branch_id`; browse or claim unoffered requests; access another branch or staff governance screens |
 | **Customer (CU)** | **Mobile only** | Place orders, track delivery status *milestones*, submit CSAT | Access web dashboard; see live GPS coordinates |
 
 Hard constraints:
 - **BO and BM are always separate people.** Do not merge these roles or share a session.
-- **FA has no operational write actions.** Its only writes are SLA-threshold config
-  (system-wide) and branch-account management.
+- **Branch Owner ownership is one-to-many.** A Branch Owner may own one or more branches;
+  each branch has exactly one active Branch Owner. A Branch Manager remains assigned to
+  exactly one branch. Store authorization as UUIDs, not editable branch names.
+- **SA and FA are governance roles with no operational write actions.** FA proposes
+  system-wide SLA-threshold and price-configuration changes and Branch Owner reassignments;
+  SA makes the approval decision. Initial branch/Branch Owner onboarding remains an FA
+  action and must still be audited. Approved governance changes execute through a separately
+  authorized service path and remain attributable in the audit trail.
+- **Franchise Administrator provisioning is invitation-only.** There is no public FA signup
+  or applicant-selected FA role. An authenticated Super Administrator enters the intended
+  recipient's verified name and email, and that authorization triggers a single-use,
+  expiring email invitation through the NestJS API. The invitee sets their own password;
+  the SA must never create, view, copy, or transmit it. The backend assigns the
+  `franchise-admin` role only in protected `app_metadata`. Accepting a valid invitation
+  activates the account without a second SA approval.
+- **No self-approval.** SA cannot create and approve the same governance request. Direct FA
+  invitations are provisioning actions, not governance requests, so sending the invitation
+  is the SA's authorization and must not create a duplicate approval step.
+- **Audit history is immutable to users.** Price changes, Branch Owner changes, FA invitation
+  sends/resends/revocations/acceptances and account-status changes, and approval decisions
+  must record actor, action, affected record, before/after values where applicable,
+  timestamp, and reason where the action requires one.
+- **Delivery Rider provisioning is invitation-only.** A Branch Owner supplies the intended
+  person's verified identity; the API binds a single-use, expiring invitation to the
+  server-validated active branch selected from the Owner's JWT-derived `branch_ids`. The
+  invitee sets their own password.
+- **Delivery Rider web access is registration-only.** The token-gated web page reviews the
+  invitation, creates the password, and records final invitation acceptance before handing
+  off to the app. PH mobile verification happens only after app sign-in, and web must never
+  authorize a Delivery Rider operations dashboard.
+  Pending-session endpoints may accept only a verified `driver` JWT on handlers explicitly
+  marked for invitation activation; every normal protected endpoint must still reject it.
+- **Invitation acceptance is the authorization.** Website acceptance consumes the invitation
+  while status remains pending. After app-based PH mobile verification, only the API writes
+  active status and creates the branch-scoped `Offline`, unassigned Fleet roster entry. No
+  Branch Manager approval or applicant-selected branch is allowed.
 - **Customers see delivery status milestones only — never live GPS coordinates.**
 
 ---
@@ -143,7 +214,8 @@ Hard constraints:
 **5 confirmed modules. There is no Supply Chain module.**
 
 1. **Customer Information Management (CIM)** — profiles, addresses, purchase history.
-2. **Service Request & Dispatch (SRD)** — digital order creation + rider assignment.
+2. **Service Request & Dispatch (SRD)** — digital order creation, Delivery Rider offer/assignment,
+   acceptance, and delivery milestone updates.
    - **Four-timestamp SLA chain (mandatory):**
      `requested_at → dispatched_at → in_transit_at → delivered_at`.
    - SLA breach is measured across **three segments**: request→dispatch,
@@ -152,12 +224,17 @@ Hard constraints:
      `Walk-in/Phone`) for channel-level SLA reporting. Never omit it.
    - **Race condition:** re-check `dispatched_at` state at dispatch time to prevent
      double-dispatch (panel-defense requirement).
+   - Offering a request does not stamp `dispatched_at`. Delivery Rider acceptance must
+     atomically revalidate the offer before stamping `dispatched_at` and moving the Rider
+     to `On Delivery`.
 3. **Loyalty Program Monitoring (LPM)** — see §8a. Two **separate** tracks; never merge.
 4. **CSAT Feedback & Analytics** — post-delivery star ratings, complaint (Incident) logging,
    average response-time tracking.
-5. **Fleet Management** — GPS via SinoTrack ST-901 → Traccar → API. **Riders do not use a
-   mobile app**; there is no rider client. Live GPS/Fleet integration is
-   hardware-dependent and may be sprint-deferred — check current sprint before building it.
+5. **Fleet Management** — Delivery Rider roster, vehicle assignment, geofencing, and PMS.
+   SinoTrack ST-901 → Traccar → API is authoritative for vehicle geofencing and PMS.
+   Separately, the Delivery Rider app submits foreground phone location while Available or
+   On Delivery for Service Request and dispatch operations. Store and return those coordinates
+   separately; never use them as vehicle telemetry or expose them to customers.
 
 ### 8a. Loyalty Program Rules `[api] [web]`
 
@@ -175,6 +252,21 @@ Shared workflow:
   acceptance criteria.**
 - **Re-validate eligibility at BM approval time** (not only at flagging time) — panel-defense
   requirement.
+
+### 8b. Delivery Rider invitation and branch activation `[api] [web] [mobile]`
+
+1. The Branch Owner issues a single-use, expiring invitation bound by the API to a verified
+   identity and the server-validated active branch selected from the Owner's JWT-derived
+   `branch_ids`.
+2. The invitee uses the dedicated web page to review the locked invitation and create their
+   password after email verification.
+3. The API rejects mismatched, expired, revoked, used, or replayed invitations without
+   exposing branch data.
+4. Website acceptance consumes the invitation and records immutable attribution to the Owner
+   while the protected Delivery Rider account remains pending.
+5. After app sign-in, the rider verifies the invitation-bound PH mobile number. The API then
+   activates protected claims and creates the `Offline`, unassigned Fleet roster entry. The
+   Branch Manager manages vehicle readiness but cannot authorize identity or membership.
 
 ---
 
@@ -197,7 +289,12 @@ Management as practices this system implements. Vocabulary: "Service Request" (o
 
 - **"Centralized CRM" / "value-based CRM"** — **never "omnichannel."**
 - **"Branch Manager"** — never "Branch Head" / "Branch Administrator."
-- **"Franchise Administrator"** — the correct top-level role name.
+- **"Super Administrator"** — the correct top-level governance role name.
+- **"Franchise Administrator"** — the cross-branch administrative role below Super
+  Administrator; never shorten it to a generic "Admin" in role labels.
+- **"Delivery Rider" / `DR`** — the user-facing delivery-person persona and Story prefix. Existing
+  `fleet.riders`, `rider_id`, and `Rider` identifiers are legacy implementation names and
+  may remain until a dedicated compatibility migration is approved.
 - **SinoTrack ST-901 = hardware device.** **Traccar = self-hosted middleware** that consumes
   SinoTrack data. Never call Traccar the tracker, or vice versa.
 
@@ -208,7 +305,6 @@ Management as practices this system implements. Vocabulary: "Service Request" (o
 Do not write code for, scaffold, or suggest:
 - Live corporate **ERP** integration for supply-chain replenishment.
 - **HR / payroll**, employee records, **BIR / tax** reporting, or **accounting**.
-- Any **rider mobile app** (riders are GPS-tracked via hardware only).
 - Additional ITIL practices beyond the four in §9.
 - Any feature outside the 5 modules in §8.
 
@@ -247,8 +343,12 @@ propose an in-scope alternative.
   `superkalan-crm-api` instead.
 
 ### `[mobile]`
-- Expo, customer-only flows. No staff/admin screens.
-- Surface **delivery status milestones only** — no map with live coordinates.
+- Expo with separate, role-gated Customer and Delivery Rider navigation. No SA/FA/BO/BM screens.
+- The phone-location endpoint derives Delivery Rider identity and the single `branch_id` from
+  the verified JWT, accepts updates only while Available or On Delivery, prevents older
+  samples from replacing newer ones, and clears operational location on Offline/maintenance.
+- Customers see **delivery status milestones only** and never receive phone or vehicle
+  coordinates. SinoTrack ST-901/Traccar remains authoritative for vehicle geofencing and PMS.
 
 ---
 

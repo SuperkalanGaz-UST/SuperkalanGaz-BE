@@ -1,11 +1,10 @@
 # Main-branch deployment
 
-Pushing or merging into `main` runs `.github/workflows/deploy-api.yml`. The initial
-setup verifies the GitHub → Google Cloud connection but preserves the live revision:
-`main` is older than the deployed backend. Merge `develop`, including commit
-`2ad5148634e8747855657eaf0b7c077b662f0a84`, into `main` to satisfy the baseline gate.
-Keep merge ancestry; squash-merging that baseline will require reviewing this gate.
-Uncommitted work is never included in a release.
+Pushing or merging into `main` runs `.github/workflows/deploy-api.yml`. The setup merges the
+committed `develop` baseline into `main` at the owner’s request. Releases require
+commit `2ad5148634e8747855657eaf0b7c077b662f0a84` in their ancestry, preventing
+accidental deployment of the older pre-cloud backend. Uncommitted local work is
+never included in a release.
 
 After that gate passes, lint, unit tests, deployment tests and build must pass before
 publishing the API and NGINX images. A no-traffic candidate uses immutable digests;

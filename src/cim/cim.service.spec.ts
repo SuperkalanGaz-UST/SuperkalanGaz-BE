@@ -15,12 +15,15 @@ import { SearchCustomersQuery } from './dto/search-customers.query';
  * aggregate) is faked; no database is touched.
  */
 describe('CimService', () => {
-  // Fake repo. `find` returns the seeded matches; `manager.createQueryBuilder`
-  // yields a chainable builder whose `getRawMany` reports the per-customer
-  // last-order aggregate. `create` echoes input; `save` resolves it with an id.
-  const makeRepo = (opts?: { found?: Customer[]; rawOrders?: unknown[] }) => {
+  // Fake repo. The customer query builder returns the seeded matches; the
+  // manager query builder reports the per-customer last-order aggregate.
+  const makeRepo = (opts?: {
+    found?: Customer[];
+    rawOrders?: unknown[];
+    selfRegistered?: Customer;
+  }) => {
     const getRawMany = jest.fn(() => Promise.resolve(opts?.rawOrders ?? []));
-    const qb = {
+    const orderQb = {
       select: jest.fn().mockReturnThis(),
       addSelect: jest.fn().mockReturnThis(),
       from: jest.fn().mockReturnThis(),
@@ -29,14 +32,38 @@ describe('CimService', () => {
       groupBy: jest.fn().mockReturnThis(),
       getRawMany,
     };
+    const customerQb = {
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      take: jest.fn().mockReturnThis(),
+      getMany: jest.fn(() => Promise.resolve(opts?.found ?? [])),
+    };
+    // create() re-fetches after save() to pick up the DB-trigger-assigned
+    // customer_code (migration 0029); track the saved row so the default
+    // findOneByOrFail stub can echo it back with a code attached.
+    let lastSaved: Customer | undefined;
     const repo = {
       create: jest.fn((v: Partial<Customer>) => v as Customer),
-      save: jest.fn((v: Customer) => Promise.resolve({ ...v, id: 'cust-1' })),
+      save: jest.fn((v: Customer) => {
+        lastSaved = { ...v, id: 'cust-1' } as Customer;
+        return Promise.resolve(lastSaved);
+      }),
+      upsert: jest.fn(() => Promise.resolve({ identifiers: [], generatedMaps: [], raw: [] })),
       find: jest.fn(() => Promise.resolve(opts?.found ?? [])),
       findOne: jest.fn(() => Promise.resolve(null)),
-      manager: { createQueryBuilder: jest.fn(() => qb) },
+      findOneByOrFail: jest.fn(() =>
+        Promise.resolve(
+          opts?.selfRegistered ??
+            (lastSaved
+              ? ({ ...lastSaved, customerCode: 'H-00001' } as Customer)
+              : ({ id: 'mobile-cust-1', branchId: 'branch-uuid-1' } as Customer)),
+        ),
+      ),
+      createQueryBuilder: jest.fn(() => customerQb),
+      manager: { createQueryBuilder: jest.fn(() => orderQb) },
     } as unknown as jest.Mocked<Repository<Customer>>;
-    return { repo, qb };
+    return { repo, customerQb, orderQb };
   };
 
   const principal = (branchIds: string[]): Principal => ({
@@ -50,33 +77,32 @@ describe('CimService', () => {
     ({ id, branchId: 'branch-uuid-1', name: id }) as Customer;
 
   describe('search', () => {
-    it('scopes to the caller branches, excludes soft-deleted, and ILIKEs name OR contact', async () => {
-      const { repo } = makeRepo();
+    it('requires a same-branch order and applies branch-scoped name/contact search', async () => {
+      const { repo, customerQb } = makeRepo();
       const service = new CimService(repo);
 
       await service.search(principal(['branch-uuid-1', 'branch-uuid-2']), {
         search: 'jua',
       });
 
-      const where = repo.find.mock.calls[0][0]?.where as Record<string, unknown>[];
-      // OR of two branches: one matches on name, the other on contact_number.
-      expect(Array.isArray(where)).toBe(true);
-      expect(where).toHaveLength(2);
-      // Both branches carry the full scope (branch + soft-delete).
-      for (const clause of where) {
-        expect(clause).toHaveProperty('branchId');
-        expect(clause).toHaveProperty('deletedAt');
-      }
-      expect(where[0]).toHaveProperty('name');
-      expect(where[1]).toHaveProperty('contactNumber');
-      // Ordered by name, capped so the search is never unbounded.
-      expect(repo.find.mock.calls[0][0]?.order).toEqual({ name: 'ASC' });
-      expect(repo.find.mock.calls[0][0]?.take).toBe(20);
+      expect(customerQb.where).toHaveBeenCalledWith(
+        'customer.branch_id IN (:...branchIds)',
+        { branchIds: ['branch-uuid-1', 'branch-uuid-2'] },
+      );
+      expect(customerQb.andWhere).toHaveBeenCalledWith(
+        expect.stringContaining('service_request.branch_id = customer.branch_id'),
+      );
+      expect(customerQb.andWhere).toHaveBeenCalledWith(
+        '(customer.name ILIKE :term OR customer.contact_number ILIKE :term)',
+        { term: '%jua%' },
+      );
+      expect(customerQb.orderBy).toHaveBeenCalledWith('customer.name', 'ASC');
+      expect(customerQb.take).toHaveBeenCalledWith(20);
     });
 
     it('maps last_order_date per customer (null when they have no linked orders)', async () => {
       const lastOrder = new Date('2026-01-15T00:00:00Z');
-      const { repo } = makeRepo({
+      const { repo, orderQb } = makeRepo({
         found: [customer('cust-1'), customer('cust-2')],
         // Only cust-1 has a linked order; cust-2 is absent → null.
         rawOrders: [{ customer_id: 'cust-1', last_order_date: lastOrder }],
@@ -90,10 +116,14 @@ describe('CimService', () => {
       expect(items).toHaveLength(2);
       expect(items[0].lastOrderDate).toEqual(lastOrder);
       expect(items[1].lastOrderDate).toBeNull();
+      expect(orderQb.andWhere).toHaveBeenCalledWith(
+        'sr.branch_id IN (:...branchIds)',
+        { branchIds: ['branch-uuid-1'] },
+      );
     });
 
     it('skips the last-order aggregate when nothing matched', async () => {
-      const { repo, qb } = makeRepo({ found: [] });
+      const { repo, orderQb } = makeRepo({ found: [] });
       const service = new CimService(repo);
 
       const items = await service.search(principal(['branch-uuid-1']), {
@@ -101,7 +131,7 @@ describe('CimService', () => {
       });
 
       expect(items).toEqual([]);
-      expect(qb.getRawMany).not.toHaveBeenCalled();
+      expect(orderQb.getRawMany).not.toHaveBeenCalled();
     });
 
     it('fails closed when the caller has no active branch', async () => {
@@ -111,7 +141,7 @@ describe('CimService', () => {
       await expect(
         service.search(principal([]), { search: 'jua' }),
       ).rejects.toBeInstanceOf(ForbiddenException);
-      expect(repo.find).not.toHaveBeenCalled();
+      expect(repo.createQueryBuilder).not.toHaveBeenCalled();
     });
   });
 
@@ -124,6 +154,7 @@ describe('CimService', () => {
         name: '  Juan Dela Cruz ',
         contactNumber: ' 09171234567 ',
         deliveryAddress: '  123 Rizal St ',
+        accountType: 'household',
       });
 
       expect(result.branchId).toBe('branch-uuid-1');
@@ -133,6 +164,7 @@ describe('CimService', () => {
       expect(result.name).toBe('Juan Dela Cruz');
       expect(result.contactNumber).toBe('09171234567');
       expect(result.deliveryAddress).toBe('123 Rizal St');
+      expect(result.accountType).toBe('household');
       expect(repo.save).toHaveBeenCalledTimes(1);
     });
 
@@ -145,6 +177,7 @@ describe('CimService', () => {
           name: 'Juan',
           contactNumber: '09171234567',
           deliveryAddress: '123 Rizal St',
+          accountType: 'household',
         }),
       ).rejects.toBeInstanceOf(ForbiddenException);
       expect(repo.save).not.toHaveBeenCalled();
@@ -165,6 +198,68 @@ describe('CimService', () => {
     });
   });
 
+  describe('mobile customer projection', () => {
+    it('upserts a self-registered profile using auth identity plus branch', async () => {
+      const selfRegistered = {
+        id: 'mobile-cust-1',
+        branchId: 'branch-uuid-1',
+        authUserId: 'auth-user-1',
+      } as Customer;
+      const { repo } = makeRepo({ selfRegistered });
+      const service = new CimService(repo);
+
+      const result = await service.upsertSelfRegisteredInBranch({
+        authUserId: 'auth-user-1',
+        branchId: 'branch-uuid-1',
+        name: '  Shoti Go ',
+        contactNumber: ' +639399168168 ',
+        deliveryAddress: '  Las Pinas ',
+        accountType: 'commercial',
+      });
+
+      expect(repo.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branchId: 'branch-uuid-1',
+          authUserId: 'auth-user-1',
+          name: 'Shoti Go',
+          contactNumber: '+639399168168',
+          deliveryAddress: 'Las Pinas',
+          registrationSource: 'self-registered',
+          accountType: 'commercial',
+          deletedAt: null,
+        }),
+        expect.objectContaining({
+          conflictPaths: ['branchId', 'authUserId'],
+        }),
+      );
+      expect(repo.findOneByOrFail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branchId: 'branch-uuid-1',
+          authUserId: 'auth-user-1',
+        }),
+      );
+      expect(result).toBe(selfRegistered);
+    });
+
+    it('resolves profile ids by authenticated owner for customer history', async () => {
+      const { repo } = makeRepo({
+        found: [customer('cust-1'), customer('cust-2')],
+      });
+      const service = new CimService(repo);
+
+      await expect(service.profileIdsForAuthUser('auth-user-1')).resolves.toEqual([
+        'cust-1',
+        'cust-2',
+      ]);
+      expect(repo.find).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ authUserId: 'auth-user-1' }),
+          select: { id: true },
+        }),
+      );
+    });
+  });
+
   // The min-2-char / required rule is enforced by the query DTO (ValidationPipe
   // → 400), not the service, so it is covered here at the DTO level.
   describe('SearchCustomersQuery validation', () => {
@@ -181,8 +276,8 @@ describe('CimService', () => {
       expect((await validateSearch(' a ')).length).toBeGreaterThan(0);
     });
 
-    it('rejects a missing term', async () => {
-      expect((await validateSearch(undefined)).length).toBeGreaterThan(0);
+    it('accepts a missing term for the bounded customer directory listing', async () => {
+      expect(await validateSearch(undefined)).toHaveLength(0);
     });
   });
 });

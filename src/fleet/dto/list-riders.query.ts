@@ -1,4 +1,4 @@
-import { IsIn, IsOptional } from 'class-validator';
+import { IsIn, IsOptional, IsUUID } from 'class-validator';
 import { RIDER_STATUSES, RiderStatus } from '../rider.entity';
 
 /**
@@ -8,6 +8,14 @@ import { RIDER_STATUSES, RiderStatus } from '../rider.entity';
  * caller's own-branch results, never widen them (AGENTS.md §5).
  */
 export class ListRidersQuery {
+  /**
+   * Branch Owner views must carry the selected branch UUID. The Fleet service
+   * verifies it against the Principal's live authorized scope before querying.
+   */
+  @IsOptional()
+  @IsUUID()
+  branchId?: string;
+
   @IsOptional()
   @IsIn(RIDER_STATUSES as unknown as RiderStatus[])
   status?: RiderStatus;

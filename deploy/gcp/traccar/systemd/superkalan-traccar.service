@@ -1,0 +1,18 @@
+[Unit]
+Description=Superkalan Traccar Compose stack
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/superkalan-traccar
+UMask=0077
+ExecStart=/usr/bin/docker compose --env-file .env -p superkalan-traccar --profile private-api up -d --wait --wait-timeout 600
+ExecStop=/usr/bin/docker compose --env-file .env -p superkalan-traccar --profile private-api stop --timeout 30
+TimeoutStartSec=900
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

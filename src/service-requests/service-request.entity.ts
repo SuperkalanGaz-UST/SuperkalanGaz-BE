@@ -10,14 +10,23 @@ const decimalTransformer = {
  * customer-initiated (later slice). */
 export type OrderSource = 'Mobile App' | 'Walk-in/Phone';
 
+export type PaymentMethod = 'Cash on Delivery' | 'PayMongo';
+export type PaymentStatus = 'Unpaid' | 'Pending' | 'Paid';
+
 /** Lifecycle state of a Service Request. Advances along the SLA chain: later
- * slices move a row Pending → Dispatched → En Route → Delivered. */
+ * slices move a row Pending → Dispatched → En Route → Delivered. 'Under Review'
+ * is a side-branch set when a Branch Manager logs a lost/undelivered cylinder
+ * complaint against a Dispatched/En Route/Delivered order (story BM-021,
+ * journey BM-US-04) — it does NOT erase or overwrite delivered_at or any of the
+ * other SLA timestamps, which stay intact for reporting. There is no DB CHECK
+ * constraint on this column (plain text), so this union is the only guard. */
 export type ServiceRequestStatus =
   | 'Pending'
   | 'Dispatched'
   | 'En Route'
   | 'Delivered'
-  | 'Cancelled';
+  | 'Cancelled'
+  | 'Under Review';
 
 /**
  * Maps srd.service_requests — one row per LPG delivery order (a "Service
@@ -30,6 +39,11 @@ export type ServiceRequestStatus =
 export class ServiceRequest {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
+
+  /** Human-readable Service Request code, assigned by the database sequence
+   * (for example, SR-00001). The UUID above remains the internal identifier. */
+  @Column({ name: 'sr_code', type: 'text' })
+  srCode!: string;
 
   /** Tenancy handle — server-derived from the verified principal, never the
    * client. No FK by design (AGENTS.md §6); integrity is checked in the service. */
@@ -90,6 +104,32 @@ export class ServiceRequest {
   })
   totalAmount!: number | null;
 
+  /** CU-017 payment state. Provider secrets never enter this entity; only the
+   * identifiers needed to reconcile a signed PayMongo callback are retained. */
+  @Column({ name: 'payment_method', type: 'text', default: 'Cash on Delivery' })
+  paymentMethod!: PaymentMethod;
+
+  @Column({ name: 'payment_status', type: 'text', default: 'Unpaid' })
+  paymentStatus!: PaymentStatus;
+
+  @Column({ name: 'paymongo_checkout_session_id', type: 'text', nullable: true })
+  paymongoCheckoutSessionId!: string | null;
+
+  @Column({ name: 'paymongo_checkout_url', type: 'text', nullable: true })
+  paymongoCheckoutUrl!: string | null;
+
+  @Column({ name: 'paymongo_reference', type: 'text', nullable: true })
+  paymongoReference!: string | null;
+
+  @Column({ name: 'paymongo_payment_id', type: 'text', nullable: true })
+  paymongoPaymentId!: string | null;
+
+  @Column({ name: 'paymongo_webhook_event_id', type: 'text', nullable: true })
+  paymongoWebhookEventId!: string | null;
+
+  @Column({ name: 'payment_paid_at', type: 'timestamptz', nullable: true })
+  paymentPaidAt!: Date | null;
+
   @Column({ name: 'special_instructions', type: 'text', nullable: true })
   specialInstructions!: string | null;
 
@@ -122,4 +162,27 @@ export class ServiceRequest {
 
   @Column({ name: 'deleted_at', type: 'timestamptz', nullable: true })
   deletedAt!: Date | null;
+
+  /** The Branch Manager's logged delay reason (story BM-011), a combined
+   * "category: note" display string. Null until a delay reason is logged. */
+  @Column({ name: 'delay_reason', type: 'text', nullable: true })
+  delayReason!: string | null;
+
+  /**
+   * PERSISTED SLA breach record (story BM-012). Computed once, at delivery,
+   * from the four real SLA timestamps against core.sla_configurations — see
+   * ServiceRequestsService.deliver(). Because reassignment never touches
+   * dispatched_at/in_transit_at/delivered_at, this record survives any later
+   * reassignment untouched ("the original SLA breach is not erased").
+   * sla_breach_segment is the FIRST segment found in breach, chronologically:
+   * 'request_to_dispatch' | 'dispatch_to_in_transit' | 'in_transit_to_delivery'.
+   */
+  @Column({ name: 'sla_breached', type: 'boolean', default: false })
+  slaBreached!: boolean;
+
+  @Column({ name: 'sla_breach_segment', type: 'text', nullable: true })
+  slaBreachSegment!: string | null;
+
+  @Column({ name: 'sla_breached_at', type: 'timestamptz', nullable: true })
+  slaBreachedAt!: Date | null;
 }

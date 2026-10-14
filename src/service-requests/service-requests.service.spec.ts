@@ -5,16 +5,23 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { describe, expect, it, jest } from '@jest/globals';
-import { Repository } from 'typeorm';
+import { DataSource, EntityManager, FindOperator, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
+import { Branch } from '../branches/branch.entity';
 import { CimService } from '../cim/cim.service';
 import { Customer } from '../cim/customer.entity';
 import { FleetService } from '../fleet/fleet.service';
 import { Rider } from '../fleet/rider.entity';
+import { LoyaltyService } from '../loyalty/loyalty.service';
+import { Redemption } from '../loyalty/redemption.entity';
 import { PricesService } from '../prices/prices.service';
+import { PayMongoService } from './paymongo.service';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
+import { PrivateObjectStorageService } from '../storage/private-object-storage.service';
 import { ServiceRequest } from './service-request.entity';
+import { ServiceRequestDeliveryProof } from './service-request-delivery-proof.entity';
 import { ServiceRequestStatusHistory } from './service-request-status-history.entity';
+import { SlaConfiguration } from './sla-configuration.entity';
 import { ServiceRequestsService } from './service-requests.service';
 
 /**
@@ -48,21 +55,51 @@ describe('ServiceRequestsService', () => {
     };
   };
 
-  // Fake Fleet service: `findAssignableRider` returns a rider (or null when not
-  // assignable); `markOnDelivery` / `markAvailable` are spies.
-  const makeFleet = (rider: Rider | null) =>
+  // Fake Fleet service: `findAssignableRider` returns the NEW rider being
+  // assigned (or null when not assignable); `findInBranch` is the
+  // status-agnostic lookup reassign() uses to name the CURRENT rider (who is
+  // 'On Delivery', not 'Available') — defaults to the same rider so existing
+  // dispatch/deliver tests (which only care about one rider) are unaffected;
+  // `markOnDelivery` / `markAvailable` are spies.
+  const makeFleet = (assignableRider: Rider | null, currentRider: Rider | null = assignableRider) =>
     ({
-      findAssignableRider: jest.fn(() => Promise.resolve(rider)),
+      findAssignableRider: jest.fn(() => Promise.resolve(assignableRider)),
+      findInBranch: jest.fn(() => Promise.resolve(currentRider)),
+      findByAuthUserInBranch: jest.fn(() => Promise.resolve(currentRider)),
       markOnDelivery: jest.fn(() => Promise.resolve()),
       markAvailable: jest.fn(() => Promise.resolve()),
     }) as unknown as jest.Mocked<FleetService>;
+
+  // Fake SLA-configuration repo: `find` returns no rows by default (no
+  // thresholds configured), so pre-existing dispatch/deliver/edit/cancel tests
+  // are unaffected — computeBreach/computeAtRisk both fail quiet with nothing
+  // configured. Tests targeting BM-US-02 pass real rows.
+  const makeSlaConfig = (rows: Partial<SlaConfiguration>[] = []) =>
+    ({
+      find: jest.fn(() => Promise.resolve(rows as SlaConfiguration[])),
+    }) as unknown as jest.Mocked<Repository<SlaConfiguration>>;
 
   // Fake CIM service: `findInBranch` returns a customer (in-branch link valid) or
   // null (unknown / soft-deleted / other branch → the create rejects with 400).
   const makeCim = (customer: Customer | null) =>
     ({
       findInBranch: jest.fn(() => Promise.resolve(customer)),
+      findInBranches: jest.fn(() => Promise.resolve(customer)),
+      upsertSelfRegisteredInBranch: jest.fn(() =>
+        Promise.resolve(
+          customer ??
+            ({ id: 'mobile-cust-1', branchId: 'branch-uuid-1' } as Customer),
+        ),
+      ),
+      profileIdsForAuthUser: jest.fn(() =>
+        Promise.resolve(customer ? [customer.id] : []),
+      ),
     }) as unknown as jest.Mocked<CimService>;
+
+  const makeBranches = (branch: Branch | null = null) =>
+    ({
+      findOne: jest.fn(() => Promise.resolve(branch)),
+    }) as unknown as jest.Mocked<Repository<Branch>>;
 
   // Fake status-history repo: `create` echoes its input (as the real one does),
   // `save` is a spy. Edit/cancel tests inspect these to assert an audit row was
@@ -80,12 +117,79 @@ describe('ServiceRequestsService', () => {
       ),
     }) as unknown as jest.Mocked<PricesService>;
 
+  const makePayMongo = () =>
+    ({
+      expireCheckout: jest.fn(() => Promise.resolve()),
+    }) as unknown as jest.Mocked<PayMongoService>;
+
+  const makeLoyalty = () =>
+    ({
+      recordDeliveredPurchase: jest.fn(() => Promise.resolve()),
+    }) as unknown as jest.Mocked<LoyaltyService>;
+
+  const makeDataSource = () => ({ query: jest.fn(async () => [{ daysChecked: '0' }]) }) as unknown as DataSource;
+
+  const makeProofRepo = (existing: ServiceRequestDeliveryProof | null = null) =>
+    ({
+      create: jest.fn((v: Partial<ServiceRequestDeliveryProof>) => v),
+      findOne: jest.fn(() => Promise.resolve(existing)),
+      save: jest.fn((v: ServiceRequestDeliveryProof) => Promise.resolve(v)),
+    }) as unknown as jest.Mocked<Repository<ServiceRequestDeliveryProof>>;
+
+  const makeProofStorage = () =>
+    ({
+      putObject: jest.fn(() => Promise.resolve({ path: 'branch-uuid-1/sr-1/proof.jpg' })),
+      getObject: jest.fn(() => Promise.resolve({
+        data: Buffer.from([0xff, 0xd8, 0xff]),
+        contentType: 'image/jpeg',
+        contentLength: 3,
+      })),
+      removeObject: jest.fn(() => Promise.resolve()),
+    }) as unknown as jest.Mocked<PrivateObjectStorageService>;
+
+  const makeRedemptions = (rows: Partial<Redemption>[] = []) =>
+    ({
+      find: jest.fn(() => Promise.resolve(rows as Redemption[])),
+    }) as unknown as jest.Mocked<Repository<Redemption>>;
+
+  // sla defaults to "no thresholds configured" so every pre-existing call site
+  // (which only ever passed the first four args) is unaffected — appended at
+  // the END of this helper's own params, even though the real constructor
+  // takes it 3rd, precisely so no existing call site needs to change.
   const makeService = (
     repo: jest.Mocked<Repository<ServiceRequest>>,
     history: jest.Mocked<Repository<ServiceRequestStatusHistory>>,
     fleet: jest.Mocked<FleetService>,
     cim: jest.Mocked<CimService>,
-  ) => new ServiceRequestsService(repo, history, fleet, cim, makePrices());
+    sla: jest.Mocked<Repository<SlaConfiguration>> = makeSlaConfig(),
+    branches: jest.Mocked<Repository<Branch>> = makeBranches(),
+    loyalty: jest.Mocked<LoyaltyService> = makeLoyalty(),
+    proofs?: jest.Mocked<Repository<ServiceRequestDeliveryProof>>,
+    storage?: jest.Mocked<PrivateObjectStorageService>,
+  ) => {
+    if (!repo.manager) {
+      Object.defineProperty(repo, 'manager', { value: {
+        transaction: jest.fn(async (callback: (manager: EntityManager) => Promise<number>) => callback({
+          createQueryBuilder: repo.createQueryBuilder,
+          getRepository: (entity: unknown) => entity === ServiceRequestStatusHistory ? history : proofs,
+        } as unknown as EntityManager)),
+      } });
+    }
+    return new ServiceRequestsService(
+      repo,
+      branches,
+      history,
+      sla,
+      fleet,
+      cim,
+      makePrices(),
+      makePayMongo(),
+      loyalty,
+      makeDataSource(),
+      proofs,
+      storage,
+    );
+  };
 
   const inBranchCustomer = (): Customer =>
     ({ id: 'cust-1', branchId: 'branch-uuid-1' }) as Customer;
@@ -97,11 +201,21 @@ describe('ServiceRequestsService', () => {
     branchIds,
   });
 
+  const driverPrincipal = (branchIds: string[]): Principal => ({
+    userId: 'driver-user-1',
+    role: 'driver',
+    branches: ['Alpha'],
+    branchIds,
+  });
+
   const pendingSr = (): ServiceRequest =>
     ({
       id: 'sr-1',
       branchId: 'branch-uuid-1',
       status: 'Pending',
+      paymentMethod: 'Cash on Delivery',
+      paymentStatus: 'Unpaid',
+      paymentPaidAt: null,
       dispatchedAt: null,
       riderId: null,
     }) as ServiceRequest;
@@ -113,6 +227,9 @@ describe('ServiceRequestsService', () => {
       id: 'sr-1',
       branchId: 'branch-uuid-1',
       status: 'Dispatched',
+      paymentMethod: 'Cash on Delivery',
+      paymentStatus: 'Unpaid',
+      paymentPaidAt: null,
       dispatchedAt: new Date(),
       inTransitAt: null,
       deliveredAt: null,
@@ -121,6 +238,13 @@ describe('ServiceRequestsService', () => {
 
   const availableRider = (): Rider =>
     ({ id: 'rider-1', branchId: 'branch-uuid-1', status: 'Available' }) as Rider;
+
+  // For reassign() tests: the rider CURRENTLY assigned (On Delivery, matches
+  // outForDeliverySr's riderId) and a DIFFERENT rider being reassigned to.
+  const currentAssignedRider = (): Rider =>
+    ({ id: 'rider-1', branchId: 'branch-uuid-1', status: 'On Delivery', name: 'Current Rider' }) as Rider;
+  const newAssignableRider = (): Rider =>
+    ({ id: 'rider-2', branchId: 'branch-uuid-1', status: 'Available', name: 'New Rider' }) as Rider;
 
   const dto: CreateServiceRequestDto = {
     customerName: '  Juan Dela Cruz ',
@@ -186,6 +310,109 @@ describe('ServiceRequestsService', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
     // Rejected before persisting the order.
     expect(repo.save).not.toHaveBeenCalled();
+  });
+
+  describe('listForCimCustomer (Customer Directory detail view)', () => {
+    it('returns the customer order history scoped to their resolved branch', async () => {
+      const { repo } = makeRepo();
+      repo.find.mockResolvedValue([pendingSr()]);
+      const cim = makeCim(inBranchCustomer());
+      const service = makeService(repo, makeHistory(), makeFleet(null), cim);
+
+      const result = await service.listForCimCustomer(
+        principal(['branch-uuid-1']),
+        'cust-1',
+      );
+
+      expect(cim.findInBranches).toHaveBeenCalledWith('cust-1', ['branch-uuid-1']);
+      expect(repo.find.mock.calls[0][0]?.where).toMatchObject({
+        customerId: 'cust-1',
+        branchId: 'branch-uuid-1',
+      });
+      expect(result).toEqual([pendingSr()]);
+    });
+
+    it('404s when the customer id is unknown or outside the caller branch scope', async () => {
+      const { repo } = makeRepo();
+      const cim = makeCim(null);
+      const service = makeService(repo, makeHistory(), makeFleet(null), cim);
+
+      await expect(
+        service.listForCimCustomer(principal(['branch-uuid-1']), 'unknown'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(repo.find).not.toHaveBeenCalled();
+    });
+  });
+
+  it('upserts a mobile customer into branch CIM and links the order to that profile', async () => {
+    const { repo } = makeRepo();
+    const customer = {
+      id: 'mobile-cust-1',
+      branchId: 'branch-uuid-1',
+      authUserId: 'auth-user-1',
+    } as Customer;
+    const cim = makeCim(customer);
+    const branches = makeBranches({
+      id: 'branch-uuid-1',
+      status: 'active',
+    } as Branch);
+    const service = makeService(
+      repo,
+      makeHistory(),
+      makeFleet(null),
+      cim,
+      makeSlaConfig(),
+      branches,
+    );
+    const mobilePrincipal: Principal = {
+      userId: 'auth-user-1',
+      role: 'customer',
+      accountType: 'household',
+      branches: [],
+      branchIds: [],
+    };
+
+    const result = await service.createForCustomer(mobilePrincipal, {
+      branchId: 'branch-uuid-1',
+      customerName: 'Shoti Go',
+      customerContact: '+639399168168',
+      deliveryAddress: 'Las Pinas',
+      cylinderSize: '2.7kg',
+      quantity: 1,
+      paymentMethod: 'Cash on Delivery',
+    });
+
+    expect(cim.upsertSelfRegisteredInBranch).toHaveBeenCalledWith({
+      authUserId: 'auth-user-1',
+      branchId: 'branch-uuid-1',
+      name: 'Shoti Go',
+      contactNumber: '+639399168168',
+      deliveryAddress: 'Las Pinas',
+      accountType: 'household',
+    });
+    expect(result.customerId).toBe('mobile-cust-1');
+    expect(result.orderSource).toBe('Mobile App');
+    expect(repo.save).toHaveBeenCalledTimes(1);
+  });
+
+  it('loads customer history through owned CIM profile ids with a legacy fallback', async () => {
+    const { repo } = makeRepo();
+    const cim = makeCim(inBranchCustomer());
+    const service = makeService(repo, makeHistory(), makeFleet(null), cim);
+    const mobilePrincipal: Principal = {
+      userId: 'auth-user-1',
+      role: 'customer',
+      branches: [],
+      branchIds: [],
+    };
+
+    await service.listForCustomer(mobilePrincipal);
+
+    expect(cim.profileIdsForAuthUser).toHaveBeenCalledWith('auth-user-1');
+    const where = repo.find.mock.calls[0][0]?.where as {
+      customerId: FindOperator<string>;
+    };
+    expect(where.customerId.value).toEqual(['auth-user-1', 'cust-1']);
   });
 
   it('fails closed when the caller has no active branch', async () => {
@@ -277,6 +504,23 @@ describe('ServiceRequestsService', () => {
       expect(qb.execute).not.toHaveBeenCalled();
     });
 
+    it('409s an unpaid PayMongo request before assigning a rider', async () => {
+      const { repo, qb } = makeRepo();
+      repo.findOne = jest.fn(() => Promise.resolve({
+        ...pendingSr(),
+        paymentMethod: 'PayMongo',
+        paymentStatus: 'Pending',
+      } as ServiceRequest)) as never;
+      const fleet = makeFleet(availableRider());
+      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
+
+      await expect(
+        service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-1' }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(fleet.findAssignableRider).not.toHaveBeenCalled();
+      expect(qb.execute).not.toHaveBeenCalled();
+    });
+
     it('409s when a concurrent dispatch won the race (0 rows affected)', async () => {
       // Row still looks Pending on load, but the conditional UPDATE touches 0
       // rows because another dispatch committed first (AGENTS.md §8.2).
@@ -323,11 +567,202 @@ describe('ServiceRequestsService', () => {
   });
 
   describe('deliver', () => {
-    it('stamps delivery, closes the chain, and returns the rider to Available', async () => {
+    const manualDeliverySr = (): ServiceRequest => ({
+      ...outForDeliverySr(), riderId: null, orderSource: 'Walk-in/Phone',
+    });
+    const riderDeliverySr = (): ServiceRequest => ({
+      ...outForDeliverySr(), status: 'En Route', inTransitAt: new Date(), orderSource: 'Mobile App',
+    });
+    const photo = {
+      buffer: Buffer.from([0xff, 0xd8, 0xff, 0x01]),
+      originalname: 'handoff.jpg', mimetype: 'image/jpeg', size: 4,
+    };
+
+    it('requires, uploads, and commits one rider proof with delivery state', async () => {
       const { repo, qb } = makeRepo(1);
-      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
+      repo.findOne = jest.fn(() => Promise.resolve(riderDeliverySr())) as never;
+      const proofRepo = makeProofRepo();
+      const storage = makeProofStorage();
+      const history = makeHistory();
+      const transaction = jest.fn(async (callback: (manager: unknown) => Promise<number>) =>
+        callback({
+          createQueryBuilder: jest.fn(() => qb),
+          getRepository: jest.fn((entity: unknown) => entity === ServiceRequestStatusHistory ? history : proofRepo),
+        }),
+      );
+      (repo as unknown as { manager: { transaction: typeof transaction } }).manager = { transaction };
+      const fleet = makeFleet(availableRider());
+      const service = makeService(
+        repo,
+        history,
+        fleet,
+        makeCim(null),
+        makeSlaConfig(),
+        makeBranches(),
+        makeLoyalty(),
+        proofRepo,
+        storage,
+      );
+      const proof = {
+        buffer: Buffer.from([0xff, 0xd8, 0xff, 0x01]),
+        originalname: 'handoff.jpg',
+        mimetype: 'image/jpeg',
+        size: 4,
+      };
+
+      const result = await service.deliver(driverPrincipal(['branch-uuid-1']), 'sr-1', proof);
+
+      expect(result.status).toBe('Delivered');
+      expect(storage.putObject).toHaveBeenCalledWith(
+        expect.stringMatching(/^branch-uuid-1\/sr-1\/.*\.jpg$/),
+        proof.buffer,
+        'image/jpeg',
+      );
+      expect(transaction).toHaveBeenCalledTimes(1);
+      expect(storage.putObject.mock.invocationCallOrder[0]).toBeLessThan(transaction.mock.invocationCallOrder[0]);
+      expect(history.save).toHaveBeenCalledWith(expect.objectContaining({
+        fromStatus: 'En Route', toStatus: 'Delivered', changedBy: 'driver-user-1',
+        changedAt: result.deliveredAt, note: 'Delivery Rider submitted proof of delivery',
+      }));
+      expect(qb.where).toHaveBeenCalledWith(expect.stringContaining('rider_id = :riderId'), expect.objectContaining({ riderId: 'rider-1', expectedStatus: 'En Route' }));
+      expect(fleet.markAvailable).toHaveBeenCalledWith('rider-1');
+      expect(proofRepo.save).toHaveBeenCalledWith(expect.objectContaining({
+        serviceRequestId: 'sr-1',
+        branchId: 'branch-uuid-1',
+        riderId: 'rider-1',
+        storagePath: expect.stringMatching(/^branch-uuid-1\/sr-1\/.*\.jpg$/),
+        sha256: expect.any(String),
+      }));
+    });
+
+    it('does not complete a rider delivery without a proof photo', async () => {
+      const { repo, qb } = makeRepo(1);
+      repo.findOne = jest.fn(() => Promise.resolve(riderDeliverySr())) as never;
+      const proofRepo = makeProofRepo();
+      const storage = makeProofStorage();
+      const fleet = makeFleet(availableRider());
+      const service = makeService(
+        repo,
+        makeHistory(),
+        fleet,
+        makeCim(null),
+        makeSlaConfig(),
+        makeBranches(),
+        makeLoyalty(),
+        proofRepo,
+        storage,
+      );
+
+      await expect(
+        service.deliver(driverPrincipal(['branch-uuid-1']), 'sr-1'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(qb.execute).not.toHaveBeenCalled();
+      expect(storage.putObject).not.toHaveBeenCalled();
+    });
+
+    it.each(['Mobile App', 'Walk-in/Phone'] as const)('blocks manager completion of an assigned %s order', async (orderSource) => {
+      const { repo, qb } = makeRepo();
+      repo.findOne = jest.fn(async () => ({ ...riderDeliverySr(), orderSource })) as never;
+      const service = makeService(repo, makeHistory(), makeFleet(null), makeCim(null));
+      await expect(service.deliver(principal(['branch-uuid-1']), 'sr-1')).rejects.toBeInstanceOf(ForbiddenException);
+      expect(qb.execute).not.toHaveBeenCalled();
+    });
+
+    it('blocks manager completion of an unassigned Mobile App order', async () => {
+      const { repo, qb } = makeRepo();
+      repo.findOne = jest.fn(async () => ({ ...manualDeliverySr(), orderSource: 'Mobile App' })) as never;
+      const service = makeService(repo, makeHistory(), makeFleet(null), makeCim(null));
+      await expect(service.deliver(principal(['branch-uuid-1']), 'sr-1')).rejects.toBeInstanceOf(ForbiddenException);
+      expect(qb.execute).not.toHaveBeenCalled();
+    });
+
+    it.each(['Pending', 'Dispatched', 'Cancelled', 'Under Review', 'Delivered'] as const)('blocks rider proof submission when status is %s', async (status) => {
+      const { repo, qb } = makeRepo();
+      repo.findOne = jest.fn(async () => ({ ...riderDeliverySr(), status })) as never;
+      const storage = makeProofStorage();
+      const service = makeService(repo, makeHistory(), makeFleet(availableRider()), makeCim(null), makeSlaConfig(), makeBranches(), makeLoyalty(), makeProofRepo(), storage);
+      await expect(service.deliver(driverPrincipal(['branch-uuid-1']), 'sr-1', photo)).rejects.toBeInstanceOf(ConflictException);
+      expect(qb.execute).not.toHaveBeenCalled();
+      expect(storage.putObject).not.toHaveBeenCalled();
+    });
+
+    it('rejects another rider before uploading', async () => {
+      const { repo, qb } = makeRepo();
+      repo.findOne = jest.fn(async () => riderDeliverySr()) as never;
+      const storage = makeProofStorage();
+      const service = makeService(repo, makeHistory(), makeFleet({ ...availableRider(), id: 'other-rider' }), makeCim(null), makeSlaConfig(), makeBranches(), makeLoyalty(), makeProofRepo(), storage);
+      await expect(service.deliver(driverPrincipal(['branch-uuid-1']), 'sr-1', photo)).rejects.toBeInstanceOf(ForbiddenException);
+      expect(qb.execute).not.toHaveBeenCalled();
+      expect(storage.putObject).not.toHaveBeenCalled();
+    });
+
+    it('leaves the order and history unchanged if storage upload fails', async () => {
+      const { repo, qb } = makeRepo();
+      const order = riderDeliverySr();
+      repo.findOne = jest.fn(async () => order) as never;
+      const storage = makeProofStorage();
+      storage.putObject.mockRejectedValueOnce(new Error('offline'));
+      const proofs = makeProofRepo();
+      const history = makeHistory();
+      const loyalty = makeLoyalty();
+      const service = makeService(repo, history, makeFleet(availableRider()), makeCim(null), makeSlaConfig(), makeBranches(), loyalty, proofs, storage);
+      await expect(service.deliver(driverPrincipal(['branch-uuid-1']), 'sr-1', photo)).rejects.toThrow('offline');
+      expect(qb.execute).not.toHaveBeenCalled();
+      expect(proofs.save).not.toHaveBeenCalled();
+      expect(history.save).not.toHaveBeenCalled();
+      expect(loyalty.recordDeliveredPurchase).not.toHaveBeenCalled();
+      expect(order.status).toBe('En Route');
+      expect(order.deliveredAt).toBeNull();
+    });
+
+    it('rejects a concurrent completion or reassignment and cleans up the losing photo', async () => {
+      const { repo, qb } = makeRepo(0);
+      repo.findOne = jest.fn(async () => riderDeliverySr()) as never;
+      const storage = makeProofStorage();
+      const proofs = makeProofRepo();
+      const history = makeHistory();
+      const service = makeService(repo, history, makeFleet(availableRider()), makeCim(null), makeSlaConfig(), makeBranches(), makeLoyalty(), proofs, storage);
+      await expect(service.deliver(driverPrincipal(['branch-uuid-1']), 'sr-1', photo)).rejects.toBeInstanceOf(ConflictException);
+      expect(qb.execute).toHaveBeenCalledTimes(1);
+      expect(proofs.save).not.toHaveBeenCalled();
+      expect(history.save).not.toHaveBeenCalled();
+      expect(storage.removeObject).toHaveBeenCalledWith(storage.putObject.mock.calls[0][0]);
+    });
+
+    it.each(['proof', 'history'] as const)('propagates %s transaction failure and cleans up the uncommitted photo', async (failure) => {
+      const { repo } = makeRepo();
+      const order = riderDeliverySr();
+      repo.findOne = jest.fn(async () => order) as never;
+      const storage = makeProofStorage();
+      const proofs = makeProofRepo();
+      const history = makeHistory();
+      if (failure === 'proof') proofs.save.mockRejectedValueOnce(new Error('transaction failed'));
+      else history.save.mockRejectedValueOnce(new Error('transaction failed'));
+      const service = makeService(repo, history, makeFleet(availableRider()), makeCim(null), makeSlaConfig(), makeBranches(), makeLoyalty(), proofs, storage);
+      await expect(service.deliver(driverPrincipal(['branch-uuid-1']), 'sr-1', photo)).rejects.toThrow('transaction failed');
+      expect(storage.removeObject).toHaveBeenCalledWith(storage.putObject.mock.calls[0][0]);
+      expect(order.status).toBe('En Route');
+    });
+
+    it.each(['oversized', 'invalid-image'] as const)('rejects an %s proof before upload', async (invalid) => {
+      const { repo, qb } = makeRepo();
+      repo.findOne = jest.fn(async () => riderDeliverySr()) as never;
+      const storage = makeProofStorage();
+      const invalidPhoto = invalid === 'oversized'
+        ? { ...photo, buffer: Buffer.alloc(3 * 1024 * 1024 + 1), size: 3 * 1024 * 1024 + 1 }
+        : { ...photo, buffer: Buffer.from('nope') };
+      const service = makeService(repo, makeHistory(), makeFleet(availableRider()), makeCim(null), makeSlaConfig(), makeBranches(), makeLoyalty(), makeProofRepo(), storage);
+      await expect(service.deliver(driverPrincipal(['branch-uuid-1']), 'sr-1', invalidPhoto)).rejects.toBeInstanceOf(BadRequestException);
+      expect(storage.putObject).not.toHaveBeenCalled();
+      expect(qb.execute).not.toHaveBeenCalled();
+    });
+
+    it('preserves manual completion for a Walk-in/Phone order without a rider', async () => {
+      const { repo, qb } = makeRepo(1);
+      repo.findOne = jest.fn(() => Promise.resolve(manualDeliverySr())) as never;
       const fleet = makeFleet(null);
-      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
+      const history = makeHistory();
+      const service = makeService(repo, history, fleet, makeCim(null));
 
       const result = await service.deliver(principal(['branch-uuid-1']), 'sr-1');
 
@@ -335,12 +770,21 @@ describe('ServiceRequestsService', () => {
       expect(result.deliveredAt).toBeInstanceOf(Date);
       expect(result.status).toBe('Delivered');
       expect(result.updatedAt).toBeInstanceOf(Date);
+      expect(result.paymentStatus).toBe('Paid');
+      expect(result.paymentPaidAt).toBeInstanceOf(Date);
       // in_transit_at is not backfilled — the En Route leg is deferred (§8).
       expect(result.inTransitAt).toBeNull();
       // Committed via the conditional UPDATE (the race guard), not a plain save.
       expect(qb.execute).toHaveBeenCalledTimes(1);
-      // The assigned rider goes back on the roster.
-      expect(fleet.markAvailable).toHaveBeenCalledWith('rider-1');
+      expect(qb.set).toHaveBeenCalledWith(
+        expect.objectContaining({ paymentStatus: 'Paid' }),
+      );
+      expect(fleet.markAvailable).not.toHaveBeenCalled();
+      expect(history.save).toHaveBeenCalledWith(expect.objectContaining({
+        changedBy: 'user-1', toStatus: 'Delivered',
+        note: 'Branch Manager marked Walk-in/Phone order delivered',
+      }));
+      expect(qb.where).toHaveBeenCalledWith(expect.stringContaining('rider_id IS NULL AND order_source = :orderSource'), expect.objectContaining({ orderSource: 'Walk-in/Phone' }));
     });
 
     it('409s when the request is not out for delivery (0 rows affected)', async () => {
@@ -348,7 +792,7 @@ describe('ServiceRequestsService', () => {
       // UPDATE (dispatched_at IS NOT NULL AND delivered_at IS NULL) touches 0
       // rows, and a concurrent deliver that already won hits the same guard.
       const { repo, qb } = makeRepo(0);
-      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
+      repo.findOne = jest.fn(() => Promise.resolve(manualDeliverySr())) as never;
       const fleet = makeFleet(null);
       const service = makeService(repo, makeHistory(), fleet, makeCim(null));
 
@@ -358,6 +802,41 @@ describe('ServiceRequestsService', () => {
       expect(qb.execute).toHaveBeenCalledTimes(1);
       // The loser must NOT touch the rider — nothing was committed.
       expect(fleet.markAvailable).not.toHaveBeenCalled();
+    });
+
+    it('repairs a missing loyalty entry when a committed delivery is retried', async () => {
+      const { repo, qb } = makeRepo();
+      const delivered = {
+        ...manualDeliverySr(),
+        status: 'Delivered',
+        deliveredAt: new Date('2026-08-21T00:00:00.000Z'),
+        customerId: 'customer-1',
+        cylinderSize: '11kg',
+        quantity: 2,
+      } as ServiceRequest;
+      repo.findOne = jest.fn(() => Promise.resolve(delivered)) as never;
+      const loyalty = makeLoyalty();
+      const service = makeService(
+        repo,
+        makeHistory(),
+        makeFleet(null),
+        makeCim(null),
+        makeSlaConfig(),
+        makeBranches(),
+        loyalty,
+      );
+
+      await expect(
+        service.deliver(principal(['branch-uuid-1']), 'sr-1'),
+      ).resolves.toBe(delivered);
+      expect(loyalty.recordDeliveredPurchase).toHaveBeenCalledWith(
+        'customer-1',
+        'branch-uuid-1',
+        'sr-1',
+        '11kg',
+        2,
+      );
+      expect(qb.execute).not.toHaveBeenCalled();
     });
 
     it('404s for a request outside the caller scope or not found', async () => {
@@ -387,6 +866,8 @@ describe('ServiceRequestsService', () => {
       deliveryAddress: '123 Rizal St',
       cylinderSize: '11kg',
       quantity: 2,
+      unitPrice: 500,
+      totalAmount: 1000,
       specialInstructions: null,
     }) as ServiceRequest;
 
@@ -397,10 +878,15 @@ describe('ServiceRequestsService', () => {
       const history = makeHistory();
       const service = new ServiceRequestsService(
         repo,
+        makeBranches(),
         history,
+        makeSlaConfig(),
         makeFleet(null),
         makeCim(null),
         makePrices(),
+        makePayMongo(),
+        makeLoyalty(),
+        makeDataSource(),
       );
 
       const result = await service.edit(principal(['branch-uuid-1']), 'sr-1', {
@@ -431,6 +917,41 @@ describe('ServiceRequestsService', () => {
       expect(saved.note).not.toContain('cylinder_size');
     });
 
+    it('H2: recomputes unitPrice/totalAmount from the live catalog when cylinderSize or quantity changes, ignoring any client-supplied price', async () => {
+      const { repo, qb } = makeRepo(1);
+      repo.findOne = jest.fn(() => Promise.resolve(editablePendingSr())) as never;
+      const history = makeHistory();
+      const prices = makePrices(); // findByCylinderSize always returns unitPrice 650
+      const service = new ServiceRequestsService(
+        repo,
+        makeBranches(),
+        history,
+        makeSlaConfig(),
+        makeFleet(null),
+        makeCim(null),
+        prices,
+        makePayMongo(),
+        makeLoyalty(),
+        makeDataSource(),
+      );
+
+      const result = await service.edit(principal(['branch-uuid-1']), 'sr-1', {
+        cylinderSize: '22kg',
+        quantity: 5,
+      });
+
+      // Price is re-derived from the catalog (650/unit), never trusted from the
+      // client and never left at the stale 500/unit snapshot.
+      expect(prices.findByCylinderSize).toHaveBeenCalledWith('22kg');
+      expect(result.unitPrice).toBe(650);
+      expect(result.totalAmount).toBe(3250); // 650 * 5, not the stale 500 * 5
+      expect(qb.execute).toHaveBeenCalledTimes(1);
+      const saved = history.create.mock.calls[0][0] as ServiceRequestStatusHistory;
+      expect(saved.note).toContain('cylinder_size "11kg" → "22kg"');
+      expect(saved.note).toContain('quantity 2 → 5');
+      expect(saved.note).toContain('total_amount 1000 → 3250');
+    });
+
     it('409s when already dispatched (0 rows affected) and writes no history', async () => {
       // Row looks Pending on load, but the guarded UPDATE touches 0 rows because
       // a concurrent dispatch committed first — the write-time check (BM-034/037).
@@ -439,10 +960,15 @@ describe('ServiceRequestsService', () => {
       const history = makeHistory();
       const service = new ServiceRequestsService(
         repo,
+        makeBranches(),
         history,
+        makeSlaConfig(),
         makeFleet(null),
         makeCim(null),
         makePrices(),
+        makePayMongo(),
+        makeLoyalty(),
+        makeDataSource(),
       );
 
       await expect(
@@ -461,10 +987,15 @@ describe('ServiceRequestsService', () => {
       const history = makeHistory();
       const service = new ServiceRequestsService(
         repo,
+        makeBranches(),
         history,
+        makeSlaConfig(),
         makeFleet(null),
         makeCim(null),
         makePrices(),
+        makePayMongo(),
+        makeLoyalty(),
+        makeDataSource(),
       );
 
       await expect(
@@ -485,10 +1016,15 @@ describe('ServiceRequestsService', () => {
       const history = makeHistory();
       const service = new ServiceRequestsService(
         repo,
+        makeBranches(),
         history,
+        makeSlaConfig(),
         makeFleet(null),
         makeCim(null),
         makePrices(),
+        makePayMongo(),
+        makeLoyalty(),
+        makeDataSource(),
       );
 
       const result = await service.cancel(principal(['branch-uuid-1']), 'sr-1', {
@@ -510,16 +1046,64 @@ describe('ServiceRequestsService', () => {
       expect(saved.note).toBe('Customer changed their mind');
     });
 
+    it('blocks cancellation after PayMongo payment is confirmed', async () => {
+      const { repo, qb } = makeRepo();
+      repo.findOne = jest.fn(() => Promise.resolve({
+        ...editablePendingSr(),
+        paymentMethod: 'PayMongo',
+        paymentStatus: 'Paid',
+      } as ServiceRequest)) as never;
+      const history = makeHistory();
+      const service = makeService(repo, history, makeFleet(null), makeCim(null));
+
+      await expect(
+        service.cancel(principal(['branch-uuid-1']), 'sr-1', { reason: 'cancel' }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(qb.execute).not.toHaveBeenCalled();
+      expect(history.save).not.toHaveBeenCalled();
+    });
+
+    it('expires an active unpaid PayMongo checkout before cancellation', async () => {
+      const { repo } = makeRepo(1);
+      repo.findOne = jest.fn(() => Promise.resolve({
+        ...editablePendingSr(),
+        paymentMethod: 'PayMongo',
+        paymentStatus: 'Pending',
+        paymongoCheckoutSessionId: 'cs_test_1',
+      } as ServiceRequest)) as never;
+      const payMongo = makePayMongo();
+      const service = new ServiceRequestsService(
+        repo,
+        makeBranches(),
+        makeHistory(),
+        makeSlaConfig(),
+        makeFleet(null),
+        makeCim(null),
+        makePrices(),
+        payMongo,
+        makeLoyalty(),
+        makeDataSource(),
+      );
+
+      await service.cancel(principal(['branch-uuid-1']), 'sr-1', { reason: 'cancel' });
+      expect(payMongo.expireCheckout).toHaveBeenCalledWith('cs_test_1');
+    });
+
     it('409s when already dispatched (0 rows affected) and writes no history', async () => {
       const { repo, qb } = makeRepo(0);
       repo.findOne = jest.fn(() => Promise.resolve(editablePendingSr())) as never;
       const history = makeHistory();
       const service = new ServiceRequestsService(
         repo,
+        makeBranches(),
         history,
+        makeSlaConfig(),
         makeFleet(null),
         makeCim(null),
         makePrices(),
+        makePayMongo(),
+        makeLoyalty(),
+        makeDataSource(),
       );
 
       await expect(
@@ -536,10 +1120,15 @@ describe('ServiceRequestsService', () => {
       const history = makeHistory();
       const service = new ServiceRequestsService(
         repo,
+        makeBranches(),
         history,
+        makeSlaConfig(),
         makeFleet(null),
         makeCim(null),
         makePrices(),
+        makePayMongo(),
+        makeLoyalty(),
+        makeDataSource(),
       );
 
       await expect(
@@ -549,6 +1138,342 @@ describe('ServiceRequestsService', () => {
       ).rejects.toBeInstanceOf(NotFoundException);
       expect(qb.execute).not.toHaveBeenCalled();
       expect(history.save).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('reassign', () => {
+    it('swaps the rider, updates fleet availability, and writes an audit note (BM-010)', async () => {
+      const { repo, qb } = makeRepo(1);
+      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
+      const history = makeHistory();
+      const fleet = makeFleet(newAssignableRider(), currentAssignedRider());
+      const service = new ServiceRequestsService(
+        repo,
+        makeBranches(),
+        history,
+        makeSlaConfig(),
+        fleet,
+        makeCim(null),
+        makePrices(),
+        makePayMongo(),
+        makeLoyalty(),
+        makeDataSource(),
+      );
+
+      const result = await service.reassign(principal(['branch-uuid-1']), 'sr-1', {
+        riderId: 'rider-2',
+      });
+
+      expect(result.riderId).toBe('rider-2');
+      // dispatched_at / in_transit_at are never part of the SET clause —
+      // the interpretation call: reassignment never touches SLA timestamps.
+      expect(qb.set).toHaveBeenCalledWith(
+        expect.objectContaining({ riderId: 'rider-2' }),
+      );
+      const setArg = qb.set.mock.calls[0][0];
+      expect(setArg).not.toHaveProperty('dispatchedAt');
+      expect(setArg).not.toHaveProperty('inTransitAt');
+      expect(setArg).not.toHaveProperty('status');
+      expect(fleet.markAvailable).toHaveBeenCalledWith('rider-1');
+      expect(fleet.markOnDelivery).toHaveBeenCalledWith('rider-2');
+      expect(history.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          fromStatus: 'Dispatched',
+          toStatus: 'Dispatched',
+          note: expect.stringContaining('Current Rider'),
+        }),
+      );
+    });
+
+    it('400s when the request is not out for delivery', async () => {
+      const { repo, qb } = makeRepo();
+      repo.findOne = jest.fn(() => Promise.resolve(pendingSr())) as never;
+      const service = makeService(repo, makeHistory(), makeFleet(newAssignableRider()), makeCim(null));
+
+      await expect(
+        service.reassign(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-2' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(qb.execute).not.toHaveBeenCalled();
+    });
+
+    it('400s when reassigning to the same rider already assigned', async () => {
+      const { repo } = makeRepo();
+      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
+      const service = makeService(
+        repo,
+        makeHistory(),
+        makeFleet(currentAssignedRider(), currentAssignedRider()),
+        makeCim(null),
+      );
+
+      await expect(
+        service.reassign(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-1' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it('400s when the new rider is not assignable', async () => {
+      const { repo } = makeRepo();
+      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
+      const service = makeService(
+        repo,
+        makeHistory(),
+        makeFleet(null, currentAssignedRider()),
+        makeCim(null),
+      );
+
+      await expect(
+        service.reassign(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-2' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it('409s when a concurrent reassign/deliver already won the race (0 rows affected)', async () => {
+      const { repo, qb } = makeRepo(0);
+      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
+      const history = makeHistory();
+      const fleet = makeFleet(newAssignableRider(), currentAssignedRider());
+      const service = new ServiceRequestsService(
+        repo,
+        makeBranches(),
+        history,
+        makeSlaConfig(),
+        fleet,
+        makeCim(null),
+        makePrices(),
+        makePayMongo(),
+        makeLoyalty(),
+        makeDataSource(),
+      );
+
+      await expect(
+        service.reassign(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-2' }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(qb.execute).toHaveBeenCalled();
+      expect(fleet.markAvailable).not.toHaveBeenCalled();
+      expect(history.save).not.toHaveBeenCalled();
+    });
+
+    it('404s for a request outside the caller scope or not found', async () => {
+      const { repo } = makeRepo();
+      const service = makeService(repo, makeHistory(), makeFleet(newAssignableRider()), makeCim(null));
+
+      await expect(
+        service.reassign(principal(['branch-uuid-1']), 'missing', { riderId: 'rider-2' }),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+  });
+
+  describe('logDelayReason', () => {
+    it('combines the category + note into delay_reason and writes a history row (BM-011)', async () => {
+      const repo = makeRepo().repo;
+      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
+      repo.update = jest.fn(() => Promise.resolve({ affected: 1 })) as never;
+      const history = makeHistory();
+      const service = makeService(repo, history, makeFleet(null), makeCim(null));
+
+      const result = await service.logDelayReason(principal(['branch-uuid-1']), 'sr-1', {
+        reasonCategory: 'traffic',
+        note: 'Heavy rain flooding the main road',
+      });
+
+      expect(result.delayReason).toBe('Traffic: Heavy rain flooding the main road');
+      expect(repo.update).toHaveBeenCalledWith(
+        { id: 'sr-1' },
+        expect.objectContaining({ delayReason: 'Traffic: Heavy rain flooding the main road' }),
+      );
+      expect(history.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          note: expect.stringContaining('Traffic: Heavy rain flooding the main road'),
+        }),
+      );
+    });
+
+    it('omits the note when none is given', async () => {
+      const repo = makeRepo().repo;
+      repo.findOne = jest.fn(() => Promise.resolve(pendingSr())) as never;
+      repo.update = jest.fn(() => Promise.resolve({ affected: 1 })) as never;
+      const service = makeService(repo, makeHistory(), makeFleet(null), makeCim(null));
+
+      const result = await service.logDelayReason(principal(['branch-uuid-1']), 'sr-1', {
+        reasonCategory: 'weather',
+      });
+
+      expect(result.delayReason).toBe('Weather');
+    });
+
+    it('400s on a Delivered/Cancelled request', async () => {
+      const repo = makeRepo().repo;
+      repo.findOne = jest.fn(() =>
+        Promise.resolve({ id: 'sr-1', branchId: 'branch-uuid-1', status: 'Delivered' } as ServiceRequest),
+      ) as never;
+      const service = makeService(repo, makeHistory(), makeFleet(null), makeCim(null));
+
+      await expect(
+        service.logDelayReason(principal(['branch-uuid-1']), 'sr-1', { reasonCategory: 'traffic' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it('404s for a request outside the caller scope or not found', async () => {
+      const repo = makeRepo().repo;
+      const service = makeService(repo, makeHistory(), makeFleet(null), makeCim(null));
+
+      await expect(
+        service.logDelayReason(principal(['branch-uuid-1']), 'missing', { reasonCategory: 'traffic' }),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+  });
+
+  describe('getSlaReport', () => {
+    it('keeps all three SLA segments separate and groups outcomes by order source', async () => {
+      const repo = makeRepo().repo;
+      repo.find = jest.fn(() =>
+        Promise.resolve([
+          {
+            id: 'sr-mobile',
+            branchId: 'branch-uuid-1',
+            orderSource: 'Mobile App',
+            requestedAt: new Date('2026-05-10T00:00:00Z'),
+            dispatchedAt: new Date('2026-05-10T00:05:00Z'),
+            inTransitAt: new Date('2026-05-10T00:10:00Z'),
+            deliveredAt: new Date('2026-05-10T00:20:00Z'),
+          },
+          {
+            id: 'sr-walk-in',
+            branchId: 'branch-uuid-1',
+            orderSource: 'Walk-in/Phone',
+            requestedAt: new Date('2026-05-11T00:00:00Z'),
+            dispatchedAt: new Date('2026-05-11T00:15:00Z'),
+            inTransitAt: new Date('2026-05-11T00:20:00Z'),
+            deliveredAt: new Date('2026-05-11T00:50:00Z'),
+          },
+        ] as ServiceRequest[]),
+      ) as never;
+      const thresholds = [
+        { branchId: 'branch-uuid-1', segment: 'request_to_dispatch', thresholdMinutes: 10 },
+        { branchId: 'branch-uuid-1', segment: 'dispatch_to_in_transit', thresholdMinutes: 10 },
+        { branchId: 'branch-uuid-1', segment: 'in_transit_to_delivery', thresholdMinutes: 20 },
+      ] as SlaConfiguration[];
+      const sla = makeSlaConfig(thresholds);
+      const service = makeService(
+        repo,
+        makeHistory(),
+        makeFleet(null),
+        makeCim(null),
+        sla,
+      );
+
+      const report = await service.getSlaReport(principal(['branch-uuid-1']), {
+        from: '2026-05-01',
+        to: '2026-05-31',
+        branchId: 'branch-uuid-1',
+      });
+
+      expect(report.overallComplianceRate).toBe(50);
+      expect(report.segments.request_to_dispatch.complianceRate).toBe(50);
+      expect(report.segments.dispatch_to_in_transit.complianceRate).toBe(100);
+      expect(report.segments.in_transit_to_delivery.complianceRate).toBe(50);
+      expect(report.orderSources['Mobile App'].complianceRate).toBe(100);
+      expect(report.orderSources['Walk-in/Phone'].complianceRate).toBe(0);
+    });
+
+    it('rejects a requested branch outside the JWT-derived scope', async () => {
+      const repo = makeRepo().repo;
+      const service = makeService(repo, makeHistory(), makeFleet(null), makeCim(null));
+
+      await expect(
+        service.getSlaReport(principal(['branch-uuid-1']), {
+          from: '2026-05-01',
+          to: '2026-05-31',
+          branchId: 'branch-uuid-2',
+        }),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(repo.find).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getBranchDashboardMetrics', () => {
+    const manilaDateKey = (date: Date) =>
+      new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(date);
+
+    const makeDashboardService = (requests: Partial<ServiceRequest>[]) => {
+      const repo = makeRepo().repo;
+      repo.find = jest.fn(() => Promise.resolve(requests as ServiceRequest[])) as never;
+      return new ServiceRequestsService(
+        repo,
+        makeBranches(),
+        makeHistory(),
+        makeSlaConfig(),
+        makeFleet(null),
+        makeCim(null),
+        makePrices(),
+        makePayMongo(),
+        makeLoyalty(),
+        makeDataSource(),
+        undefined,
+        undefined,
+        makeRedemptions(),
+      );
+    };
+
+    it("anchors the dailyOrderVolume skeleton to the requested range's end date, not server \"now\"", async () => {
+      // A range entirely in the past, far from whenever this test actually
+      // runs — the pre-fix skeleton was built from `new Date()`, so it would
+      // never overlap a request placed inside a fixed 2020 range.
+      const service = makeDashboardService([
+        { id: 'sr-1', branchId: 'branch-uuid-1', status: 'Pending', requestedAt: new Date('2020-01-07T04:00:00Z'), cylinderSize: '11kg', quantity: 1 },
+      ]);
+
+      const result = await service.getBranchDashboardMetrics(
+        { userId: 'user-1', role: 'branch-manager', branches: ['Alpha'], branchIds: ['branch-uuid-1'] },
+        { from: '2020-01-01', to: '2020-01-07', branchId: 'branch-uuid-1' },
+      );
+
+      // Exactly the 7-day skeleton anchored on the requested range — no stray
+      // extra bucket for a day the (buggy) "now"-anchored skeleton wouldn't
+      // have included.
+      expect(result.dailyOrderVolume).toHaveLength(7);
+      const totalDailyOrders = result.dailyOrderVolume.reduce((sum, entry) => sum + entry.orders, 0);
+      expect(totalDailyOrders).toBe(1);
+    });
+
+    it('returns 24 sorted hourly buckets, counting only today\'s requests', async () => {
+      const now = new Date();
+      const todayKey = manilaDateKey(now);
+      const todayAt9am = new Date(`${todayKey}T09:00:00+08:00`);
+      const tenDaysAgo = new Date(now.getTime() - 10 * 24 * 60 * 60 * 1000);
+
+      const service = makeDashboardService([
+        { id: 'sr-today', branchId: 'branch-uuid-1', status: 'Pending', requestedAt: todayAt9am, cylinderSize: '11kg', quantity: 1 },
+        { id: 'sr-old', branchId: 'branch-uuid-1', status: 'Pending', requestedAt: tenDaysAgo, cylinderSize: '11kg', quantity: 1 },
+      ]);
+
+      const result = await service.getBranchDashboardMetrics(
+        { userId: 'user-1', role: 'branch-manager', branches: ['Alpha'], branchIds: ['branch-uuid-1'] },
+        { from: manilaDateKey(tenDaysAgo), to: todayKey, branchId: 'branch-uuid-1' },
+      );
+
+      expect(result.hourlyOrderVolume).toHaveLength(24);
+      expect(result.hourlyOrderVolume[0].hour).toBe('00:00');
+      expect(result.hourlyOrderVolume[23].hour).toBe('23:00');
+      expect(result.hourlyOrderVolume.find((entry) => entry.hour === '09:00')?.orders).toBe(1);
+      // The 10-day-old request must not leak into any hourly bucket.
+      const totalHourlyOrders = result.hourlyOrderVolume.reduce((sum, entry) => sum + entry.orders, 0);
+      expect(totalHourlyOrders).toBe(1);
+    });
+
+    it('returns 7 daily earnings buckets summing totalAmount, excluding cancelled requests', async () => {
+      const service = makeDashboardService([
+        { id: 'sr-1', branchId: 'branch-uuid-1', status: 'Pending', requestedAt: new Date('2020-01-07T04:00:00Z'), cylinderSize: '11kg', quantity: 1, totalAmount: 500 },
+        { id: 'sr-cancelled', branchId: 'branch-uuid-1', status: 'Cancelled', requestedAt: new Date('2020-01-05T04:00:00Z'), cylinderSize: '11kg', quantity: 1, totalAmount: 999 },
+      ]);
+
+      const result = await service.getBranchDashboardMetrics(
+        { userId: 'user-1', role: 'branch-manager', branches: ['Alpha'], branchIds: ['branch-uuid-1'] },
+        { from: '2020-01-01', to: '2020-01-07', branchId: 'branch-uuid-1' },
+      );
+
+      expect(result.earningsThisWeek).toHaveLength(7);
+      const totalWeeklyEarnings = result.earningsThisWeek.reduce((sum, entry) => sum + entry.earnings, 0);
+      expect(totalWeeklyEarnings).toBe(500);
     });
   });
 });

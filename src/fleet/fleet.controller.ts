@@ -1,4 +1,12 @@
-import { Controller, Get, Query, UseGuards } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  NotFoundException,
+  Param,
+  ParseUUIDPipe,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
@@ -9,12 +17,14 @@ import { Rider } from './rider.entity';
 
 /**
  * Fleet roster (Fleet module). Dispatching riders is Branch Manager day-to-day
- * ops (AGENTS.md §7), and this list backs the dispatch dropdown, so only BM
- * reaches this handler. Scope comes from the verified Principal, never the client.
+ * ops (AGENTS.md §7). Branch Owners have read-only access to the same
+ * branch-scoped roster for their selected branch; operational phone location
+ * remains available only to Branch Managers. Scope comes from the verified
+ * Principal, never the client.
  */
 @Controller('riders')
 @UseGuards(AuthGuard, RolesGuard)
-@Roles('branch-manager')
+@Roles('branch-manager', 'branch-owner')
 export class FleetController {
   constructor(private readonly fleet: FleetService) {}
 
@@ -24,10 +34,38 @@ export class FleetController {
     @Query() query: ListRidersQuery,
   ): Promise<{ riders: ReturnType<FleetController['toRow']>[] }> {
     const rows = await this.fleet.listForBranch(principal, query);
-    return { riders: rows.map((r) => this.toRow(r)) };
+    const currentOrders = await this.fleet.currentOrdersForRiders(rows);
+    return {
+      riders: rows.map((r) => ({
+        ...this.toRow(r),
+        current_order: currentOrders.get(r.id) ?? null,
+        ...(principal.role === 'branch-manager'
+          ? { operational_location: this.fleet.operationalLocationFor(r) }
+          : {}),
+      })),
+    };
   }
 
-  /** Snake_case response row, matching the precedent in UsersController.toRow. */
+  /**
+   * Branch-managers see any rider in their own branch; customers see only a
+   * rider they actually have an order with (M4 fix — this had no ownership
+   * check at all).
+   */
+  @Get(':id')
+  @Roles('branch-manager', 'customer')
+  async detail(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<{ rider: ReturnType<FleetController['toRow']> }> {
+    const rider = await this.fleet.findByIdForCaller(principal, id);
+    if (!rider) throw new NotFoundException('Rider not found');
+    return { rider: this.toRow(rider) };
+  }
+
+  /**
+   * Customer-safe row. Operational phone coordinates are added only by the
+   * Branch Manager list handler above and never by this shared detail mapper.
+   */
   private toRow(rider: Rider) {
     return {
       id: rider.id,
@@ -36,6 +74,7 @@ export class FleetController {
       plate: rider.plate,
       status: rider.status,
       created_at: rider.createdAt,
+      updated_at: rider.updatedAt,
     };
   }
 }

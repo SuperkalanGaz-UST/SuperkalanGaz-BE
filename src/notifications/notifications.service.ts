@@ -20,7 +20,7 @@ export interface RoleNotificationInput {
 
 /**
  * Server-side notification RBAC. The browser never supplies its role or branch
- * scope: both come from the verified Principal. FA can read role-addressed
+ * scope: both come from the verified Principal. SA/FA can read role-addressed
  * notifications across branches; BO/BM can only read their own branch rows.
  * Global price updates are visible to every staff role.
  */
@@ -100,7 +100,7 @@ export class NotificationsService {
     return unread.length;
   }
 
-  /** FA price publication is always global, regardless of branch membership. */
+  /** An approved price publication is always global, regardless of branch membership. */
   async publishPriceUpdate(
     message: string,
     manager?: EntityManager,
@@ -161,9 +161,11 @@ export class NotificationsService {
       { audienceRole: principal.role, deletedAt: IsNull() },
     ];
 
-    // FA has cross-branch read visibility. BO/BM fail closed to their own live
+    // SA/FA have cross-branch read visibility. BO/BM fail closed to their own live
     // branch UUIDs plus genuinely global rows for their role.
-    if (principal.role === 'franchise-admin') return audiences;
+    if (principal.role === 'franchise-admin' || principal.role === 'super-admin') {
+      return audiences;
+    }
 
     const scoped: FindOptionsWhere<StaffNotification>[] = [];
     for (const audience of audiences) {

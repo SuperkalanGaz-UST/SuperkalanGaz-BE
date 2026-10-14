@@ -5,6 +5,8 @@ import {
   IsIn,
   IsOptional,
   IsString,
+  IsUUID,
+  MaxLength,
   MinLength,
 } from 'class-validator';
 
@@ -12,8 +14,10 @@ export class CreateUserDto {
   @IsEmail()
   email!: string;
 
+  // L5 fix: was MinLength(6), weaker than the rest of the app's password rules.
   @IsString()
-  @MinLength(6)
+  @MinLength(8)
+  @MaxLength(72)
   password!: string;
 
   @IsOptional()
@@ -30,8 +34,8 @@ export class CreateUserDto {
 
   /**
    * Franchise Administrator accounts cannot be provisioned through this
-   * endpoint; they are seeded out-of-band. BO callers are further restricted
-   * to 'branch-manager' in the service.
+   * endpoint; they require the dedicated Super Administrator invitation path.
+   * BO callers are further restricted to 'branch-manager' in the service.
    */
   @IsOptional()
   @IsIn(['branch-owner', 'branch-manager'])
@@ -39,8 +43,8 @@ export class CreateUserDto {
 
   @IsArray()
   @ArrayNotEmpty()
-  @IsString({ each: true })
-  branches!: string[];
+  @IsUUID(undefined, { each: true })
+  branchIds!: string[];
 
   @IsOptional()
   @IsIn(['Active', 'Inactive'])

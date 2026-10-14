@@ -1,19 +1,50 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from '../auth/auth.module';
+import { Branch } from '../branches/branch.entity';
+import { CimModule } from '../cim/cim.module';
+import { GovernanceModule } from '../governance/governance.module';
+import { ServiceRequest } from '../service-requests/service-request.entity';
+import { UsersModule } from '../users/users.module';
+import { DeliveryRiderInvitationsController } from './delivery-rider-invitations.controller';
+import { DeliveryRiderInvitationsService } from './delivery-rider-invitations.service';
+import { DeliveryRiderController } from './delivery-rider.controller';
 import { FleetController } from './fleet.controller';
 import { FleetService } from './fleet.service';
 import { Rider } from './rider.entity';
+import { Vehicle } from './vehicle.entity';
+import { VehicleMaintenanceLog } from './vehicle-maintenance-log.entity';
+import { VehiclesController } from './vehicles.controller';
+import { TraccarClient } from './traccar/traccar.client';
 
 /**
- * Fleet module (rider roster + dispatch validation). FleetService is exported so
- * the SRD module can reuse it to validate a rider at dispatch time — mirroring
- * how BranchesModule reuses GoTrueAdminService from the Users module.
+ * Fleet module (rider roster + dispatch validation, and vehicle mileage/PMS
+ * tracking — story BM-US-09). FleetService is exported so the SRD module can
+ * reuse it to validate a rider at dispatch time — mirroring how BranchesModule
+ * reuses GoTrueAdminService from the Users module.
  */
 @Module({
-  imports: [TypeOrmModule.forFeature([Rider]), AuthModule],
-  controllers: [FleetController],
-  providers: [FleetService],
+  imports: [
+    TypeOrmModule.forFeature([
+      Rider,
+      Vehicle,
+      VehicleMaintenanceLog,
+      Branch,
+      // Read-only dashboard lookup for the rider's assigned Service Request.
+      ServiceRequest,
+    ]),
+    AuthModule,
+    GovernanceModule,
+    UsersModule,
+    CimModule,
+  ],
+  controllers: [
+    FleetController,
+    VehiclesController,
+    DeliveryRiderInvitationsController,
+    DeliveryRiderController,
+  ],
+  providers: [FleetService, TraccarClient, DeliveryRiderInvitationsService],
   exports: [FleetService],
 })
 export class FleetModule {}

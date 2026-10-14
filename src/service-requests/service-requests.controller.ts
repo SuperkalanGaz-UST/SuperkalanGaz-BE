@@ -2,41 +2,231 @@ import {
   Body,
   Controller,
   Get,
+  Header,
   Param,
   ParseUUIDPipe,
   Patch,
   Post,
+  Query,
+  StreamableFile,
   UseGuards,
 } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
+import { BranchReportQuery } from '../common/dto/branch-report.query';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
+import { CreateCustomerServiceRequestDto } from './dto/create-customer-service-request.dto';
+import { DeliveryProofQuery } from './dto/delivery-proof.query';
 import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
 import { EditServiceRequestDto } from './dto/edit-service-request.dto';
 import { CancelServiceRequestDto } from './dto/cancel-service-request.dto';
+import { ReassignServiceRequestDto } from './dto/reassign-service-request.dto';
+import { LogDelayReasonDto } from './dto/log-delay-reason.dto';
 import { ServiceRequest } from './service-request.entity';
-import { ServiceRequestsService } from './service-requests.service';
+import { ServiceRequestsService, FranchiseOrderAnalyticsSeries } from './service-requests.service';
+import {
+  CheckoutView,
+  PaymentView,
+  ServiceRequestPaymentsService,
+} from './service-request-payments.service';
 
 /**
  * Service Request intake & queue (SRD module). Creating and processing daily
  * orders is Branch Manager day-to-day ops (AGENTS.md §7); FA has no operational
- * writes and BO does not process orders, so only BM reaches these handlers.
- * Scope comes from the verified Principal, never the client.
+ * writes and BO does not process orders. The Branch Owner report handler is a
+ * read-only role override; every operational action remains BM-only. Scope
+ * comes from the verified Principal, never the client.
  */
 @Controller('service-requests')
 @UseGuards(AuthGuard, RolesGuard)
 @Roles('branch-manager')
 export class ServiceRequestsController {
-  constructor(private readonly serviceRequests: ServiceRequestsService) {}
+  constructor(
+    private readonly serviceRequests: ServiceRequestsService,
+    private readonly payments: ServiceRequestPaymentsService,
+  ) {}
+
+  @Get('me')
+  @Roles('customer')
+  async myOrders(
+    @CurrentPrincipal() principal: Principal,
+  ): Promise<{ serviceRequests: ReturnType<ServiceRequestsController['toRow']>[] }> {
+    const items = await this.serviceRequests.listForCustomer(principal);
+    return { serviceRequests: items.map((item) => this.toRow(item)) };
+  }
+
+  /**
+   * Cross-branch order-volume analytics for the Franchise Administrator dashboard.
+   * Returns monthly order counts (total, delivered, cancelled) per active branch
+   * for the given date window, optionally filtered by region or branchId.
+   * No Principal branch-scope is applied — this is intentionally a global view.
+   */
+  @Get('franchise-analytics')
+  @Roles('franchise-admin')
+  async franchiseAnalytics(
+    @Query('from') from: string,
+    @Query('to') to: string,
+    @Query('branchId') branchId?: string,
+    @Query('region') region?: string,
+  ): Promise<{ series: FranchiseOrderAnalyticsSeries[] }> {
+    const fromDate = from ? new Date(from) : (() => { const d = new Date(); d.setMonth(d.getMonth() - 6); d.setDate(1); d.setHours(0, 0, 0, 0); return d; })();
+    const toDate = to ? new Date(to) : new Date();
+    const series = await this.serviceRequests.franchiseAnalytics(fromDate, toDate, branchId, region);
+    return { series };
+  }
+
+  @Post('customer')
+  @Roles('customer')
+  async createCustomerOrder(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: CreateCustomerServiceRequestDto,
+  ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
+    // L4 fix: this used to log the full dto (customer name, contact number,
+    // delivery address) — never log PII, even to local stdout.
+    console.log('[service-requests] createCustomerOrder request', {
+      userId: principal.userId,
+      role: principal.role,
+      branchId: dto.branchId,
+    });
+    const row = await this.serviceRequests.createForCustomer(principal, dto);
+    console.log('[service-requests] createCustomerOrder response', {
+      userId: principal.userId,
+      id: row.id,
+      branchId: row.branchId,
+      status: row.status,
+      orderSource: row.orderSource,
+    });
+    return { serviceRequest: this.toRow(row) };
+  }
+
+  @Post(':id/payment/checkout')
+  @Roles('customer')
+  async createPaymentCheckout(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<{ payment: CheckoutView }> {
+    return { payment: await this.payments.createCheckout(principal, id) };
+  }
+
+  @Get(':id/payment')
+  @Roles('customer')
+  async paymentStatus(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<{ payment: PaymentView }> {
+    return { payment: await this.payments.status(principal, id) };
+  }
 
   @Get()
   async list(
     @CurrentPrincipal() principal: Principal,
+  ): Promise<{ serviceRequests: ReturnType<ServiceRequestsController['toListRow']>[] }> {
+    const items = await this.serviceRequests.listWithSlaRisk(principal);
+    return { serviceRequests: items.map((item) => this.toListRow(item)) };
+  }
+
+  /** Branch-scoped completed records used by the staff Proof of Delivery
+   * viewer. This remains read-only for Branch Owners. */
+  @Get('delivery-records')
+  @Roles('branch-manager', 'branch-owner')
+  async deliveryRecords(
+    @CurrentPrincipal() principal: Principal,
+    @Query() query: DeliveryProofQuery,
   ): Promise<{ serviceRequests: ReturnType<ServiceRequestsController['toRow']>[] }> {
-    const rows = await this.serviceRequests.list(principal);
-    return { serviceRequests: rows.map((r) => this.toRow(r)) };
+    const items = await this.serviceRequests.listDeliveryRecords(
+      principal,
+      query.branchId,
+    );
+    return { serviceRequests: items.map((item) => this.toRow(item)) };
+  }
+
+  /** Branch Owner read-only Service Level Management analytics. */
+  @Get('reports/sla')
+  @Roles('branch-manager', 'branch-owner')
+  async slaReport(
+    @CurrentPrincipal() principal: Principal,
+    @Query() query: BranchReportQuery,
+  ) {
+    const report = await this.serviceRequests.getSlaReport(principal, query);
+    return {
+      report: {
+        total_service_requests: report.totalServiceRequests,
+        evaluated_requests: report.evaluatedRequests,
+        within_sla: report.withinSla,
+        breaches: report.breaches,
+        not_evaluated: report.notEvaluated,
+        overall_compliance_rate: report.overallComplianceRate,
+        segments: Object.entries(report.segments).map(([segment, metric]) => ({
+          segment,
+          evaluated_requests: metric.evaluated,
+          compliant_requests: metric.compliant,
+          breached_requests: metric.breached,
+          compliance_rate: metric.complianceRate,
+          average_minutes: metric.averageMinutes,
+        })),
+        order_sources: Object.entries(report.orderSources).map(([source, metric]) => ({
+          source,
+          total_requests: metric.total,
+          evaluated_requests: metric.evaluated,
+          compliant_requests: metric.compliant,
+          breached_requests: metric.breached,
+          not_evaluated: metric.notEvaluated,
+          compliance_rate: metric.complianceRate,
+        })),
+        daily_stock_check: {
+          distinct_days_checked: report.dailyStockCheck.distinctDaysChecked,
+          total_days_in_period: report.dailyStockCheck.totalDaysInPeriod,
+          compliance_rate: report.dailyStockCheck.complianceRate,
+        },
+      },
+    };
+  }
+
+  /** Branch Owner dashboard metrics; the service enforces its single branch. */
+  @Get('reports/branch-owner-dashboard')
+  @Roles('branch-owner')
+  async branchOwnerDashboard(
+    @CurrentPrincipal() principal: Principal,
+    @Query() query: BranchReportQuery,
+  ) {
+    return { metrics: await this.serviceRequests.getBranchDashboardMetrics(principal, query) };
+  }
+
+  @Get('reports/branch-owner-sales')
+  @Roles('branch-owner')
+  async branchOwnerSales(
+    @CurrentPrincipal() principal: Principal,
+    @Query('branchId') branchId: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('search') search?: string,
+    @Query('status') status?: string,
+  ) {
+    const pageNum = page ? parseInt(page, 10) : 1;
+    const limitNum = limit ? parseInt(limit, 10) : 1000000;
+    
+    return await this.serviceRequests.getBranchSalesRecords(
+      principal, 
+      branchId,
+      pageNum,
+      limitNum,
+      search,
+      status
+    );
+  }
+
+  /** A CIM customer's order history — powers the Customer Directory's
+   * click-through detail view (Branch Manager only, branch-scoped). */
+  @Get('customers/:customerId')
+  @Roles('branch-manager', 'branch-owner')
+  async byCustomer(
+    @CurrentPrincipal() principal: Principal,
+    @Param('customerId', ParseUUIDPipe) customerId: string,
+  ): Promise<{ serviceRequests: ReturnType<ServiceRequestsController['toRow']>[] }> {
+    const items = await this.serviceRequests.listForCimCustomer(principal, customerId);
+    return { serviceRequests: items.map((item) => this.toRow(item)) };
   }
 
   @Get(':id')
@@ -46,6 +236,33 @@ export class ServiceRequestsController {
   ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
     const row = await this.serviceRequests.findById(principal, id);
     return { serviceRequest: this.toRow(row) };
+  }
+
+  /**
+   * Staff-only Proof of Delivery read. The image is deliberately absent from
+   * list/detail JSON responses and is streamed only after an explicit user
+   * action. Branch Owner requests must include their selected branch UUID when
+   * they own multiple branches; the service validates it against JWT scope.
+   */
+  @Get(':id/delivery-proof')
+  @Roles('branch-manager', 'branch-owner')
+  @Header('Cache-Control', 'private, no-store')
+  @Header('X-Content-Type-Options', 'nosniff')
+  async deliveryProof(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: DeliveryProofQuery,
+  ): Promise<StreamableFile> {
+    const proof = await this.serviceRequests.downloadDeliveryProof(
+      principal,
+      id,
+      query.branchId,
+    );
+    return new StreamableFile(proof.data, {
+      type: proof.contentType,
+      length: proof.contentLength,
+      disposition: `inline; filename="${proof.fileName}"`,
+    });
   }
 
   @Post()
@@ -125,10 +342,44 @@ export class ServiceRequestsController {
     return { serviceRequest: this.toRow(row) };
   }
 
+  /**
+   * Replace the assigned rider on a delayed, out-for-delivery request (story
+   * BM-010). Body is just the new rider. 400 if the request is not out for
+   * delivery, the new rider isn't assignable, or it's the same rider already
+   * assigned; 409 if the request's rider assignment changed concurrently
+   * (race); 404 if outside the caller's branch. The updated row is returned.
+   */
+  @Post(':id/reassign')
+  async reassign(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ReassignServiceRequestDto,
+  ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
+    const row = await this.serviceRequests.reassign(principal, id, dto);
+    return { serviceRequest: this.toRow(row) };
+  }
+
+  /**
+   * Log a delay reason (story BM-011): a dropdown category plus an optional
+   * free-text note, combined into the row's delay_reason. Available on any
+   * still-in-flight request (Pending/Dispatched/En Route) — 400 otherwise;
+   * 404 if outside the caller's branch. The updated row is returned.
+   */
+  @Post(':id/delay-reason')
+  async logDelayReason(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: LogDelayReasonDto,
+  ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
+    const row = await this.serviceRequests.logDelayReason(principal, id, dto);
+    return { serviceRequest: this.toRow(row) };
+  }
+
   /** Snake_case response row, matching the precedent in UsersController.toRow. */
   private toRow(sr: ServiceRequest) {
     return {
       id: sr.id,
+      sr_code: sr.srCode,
       branch_id: sr.branchId,
       order_source: sr.orderSource,
       status: sr.status,
@@ -140,13 +391,42 @@ export class ServiceRequestsController {
       quantity: sr.quantity,
       unit_price: sr.unitPrice,
       total_amount: sr.totalAmount,
+      payment_method: sr.paymentMethod,
+      payment_status: sr.paymentStatus,
+      payment_paid_at: sr.paymentPaidAt,
       special_instructions: sr.specialInstructions,
       rider_id: sr.riderId,
       requested_at: sr.requestedAt,
       dispatched_at: sr.dispatchedAt,
       in_transit_at: sr.inTransitAt,
       delivered_at: sr.deliveredAt,
+      delay_reason: sr.delayReason,
+      sla_breached: sr.slaBreached,
+      sla_breach_segment: sr.slaBreachSegment,
+      sla_breached_at: sr.slaBreachedAt,
       created_at: sr.createdAt,
+    };
+  }
+
+  /**
+   * The queue row (BM-008): the base row plus the LIVE "at risk" flag (not a
+   * column — see ServiceRequestsService.listWithSlaRisk). sla_breached (a real
+   * column) is the separate PERSISTED record from delivery time (BM-012); a
+   * row can have sla_at_risk=false and sla_breached=true simultaneously (an
+   * already-delivered request that breached, now closed and no longer "at
+   * risk" since there is nothing left to act on).
+   */
+  private toListRow(item: {
+    serviceRequest: ServiceRequest;
+    slaAtRisk: boolean;
+    slaAtRiskSegment: string | null;
+    customerCode: string | null;
+  }) {
+    return {
+      ...this.toRow(item.serviceRequest),
+      customer_code: item.customerCode,
+      sla_at_risk: item.slaAtRisk,
+      sla_at_risk_segment: item.slaAtRiskSegment,
     };
   }
 }

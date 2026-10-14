@@ -5,6 +5,8 @@ import {
   IsIn,
   IsOptional,
   IsString,
+  IsUUID,
+  MaxLength,
   MinLength,
 } from 'class-validator';
 
@@ -13,9 +15,12 @@ export class UpdateUserDto {
   @IsEmail()
   email?: string;
 
+  // L5 fix: was MinLength(6) — an admin resetting someone else's password
+  // could set a weaker one than the user could set themselves.
   @IsOptional()
   @IsString()
-  @MinLength(6)
+  @MinLength(8)
+  @MaxLength(72)
   password?: string;
 
   @IsOptional()
@@ -37,8 +42,8 @@ export class UpdateUserDto {
   @IsOptional()
   @IsArray()
   @ArrayNotEmpty()
-  @IsString({ each: true })
-  branches?: string[];
+  @IsUUID(undefined, { each: true })
+  branchIds?: string[];
 
   @IsOptional()
   @IsIn(['Active', 'Inactive'])

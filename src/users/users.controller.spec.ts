@@ -11,6 +11,7 @@ function rolesFor(handler: keyof UsersController): Role[] | undefined {
 
 describe('UsersController role access', () => {
   const allStaffRoles: Role[] = [
+    'super-admin',
     'franchise-admin',
     'branch-owner',
     'branch-manager',

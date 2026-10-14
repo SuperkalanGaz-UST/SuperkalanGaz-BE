@@ -1,15 +1,14 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { ListNotificationsQuery } from './dto/list-notifications.query';
-import { PublishPriceUpdateDto } from './dto/publish-price-update.dto';
 import { NotificationView, NotificationsService } from './notifications.service';
 
 @Controller('notifications')
 @UseGuards(AuthGuard, RolesGuard)
-@Roles('franchise-admin', 'branch-owner', 'branch-manager')
+@Roles('super-admin', 'franchise-admin', 'branch-owner', 'branch-manager')
 export class NotificationsController {
   constructor(private readonly notifications: NotificationsService) {}
 
@@ -28,13 +27,6 @@ export class NotificationsController {
   @Post('read-all')
   async markAllRead(@CurrentPrincipal() principal: Principal) {
     return { updated: await this.notifications.markAllRead(principal) };
-  }
-
-  @Post('price-update')
-  @Roles('franchise-admin')
-  async publishPriceUpdate(@Body() dto: PublishPriceUpdateDto) {
-    const notification = await this.notifications.publishPriceUpdate(dto.message);
-    return { notification_id: notification.id };
   }
 
   @Post(':id/read')

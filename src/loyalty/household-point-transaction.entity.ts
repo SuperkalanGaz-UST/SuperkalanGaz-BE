@@ -3,9 +3,8 @@ import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
 /**
  * Maps loyalty.household_point_transactions — the append-only points ledger for
  * the household track (AGENTS.md §8a "digital ledger"). One row per points
- * movement; the account's points_balance is the sum of these deltas. This slice
- * writes exactly one kind of row: a 'redeem' entry (negative points_delta, with
- * redemption_id set) inserted inside the approval transaction.
+ * movement; the account's points_balance is the sum of these deltas. Delivery,
+ * redemption, expiry, and legacy reconciliation append distinct row types.
  *
  * The table ALREADY EXISTS in the shared schema — this entity only maps it, no
  * migration is added. Ledger rows are immutable: never updated or deleted. No FK
@@ -28,8 +27,7 @@ export class HouseholdPointTransaction {
   @Column({ name: 'branch_id', type: 'uuid' })
   branchId!: string;
 
-  /** Movement kind. This slice only writes 'redeem'; 'earn'/'expire' are other
-   * slices (point accrual on delivery, 12-month expiry). */
+  /** 'earn' | 'redeem' | 'expire' | 'adjust'. */
   @Column({ type: 'text' })
   type!: string;
 
@@ -45,6 +43,11 @@ export class HouseholdPointTransaction {
   /** The redemption this movement settles, for a 'redeem' row. Null otherwise. */
   @Column({ name: 'redemption_id', type: 'uuid', nullable: true })
   redemptionId!: string | null;
+
+  /** The earn row consumed by an expiry entry. The partial unique index on this
+   * column makes expiry idempotent even when two reads race. */
+  @Column({ name: 'source_point_transaction_id', type: 'uuid', nullable: true })
+  sourcePointTransactionId!: string | null;
 
   /** When the points were earned (earn rows). Null for a redemption. */
   @Column({ name: 'earned_at', type: 'timestamptz', nullable: true })

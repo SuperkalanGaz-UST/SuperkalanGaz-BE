@@ -4,9 +4,8 @@ import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
  * Maps loyalty.commercial_purchase_records — the audit trail of counted cylinder
  * purchases for the commercial "30+1" track. Each row is one purchase counted
  * toward a cycle (cycle_number = which 30-purchase cycle it belongs to). The
- * earning side (writing these rows as deliveries complete) is a separate slice;
- * this slice READS them only, to render the customer's ledger history on the
- * redemption review screen (BM-014).
+ * Delivery appends these rows idempotently; redemption review reads the same
+ * audit trail (BM-014).
  *
  * The table ALREADY EXISTS in the shared schema — this entity only maps it, no
  * migration. No FK constraints by design (AGENTS.md §6).

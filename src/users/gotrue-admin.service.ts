@@ -1,11 +1,12 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { supabaseApiKeyHeaders } from '../common/utils/supabase-api-key-headers';
 
 /**
  * Thin client for the Supabase Auth (GoTrue) Admin REST API. In this system ALL
  * identity lives in auth.users: credentials/email as first-class fields and the
  * CRM claims (role, branch scope, status, display fields) in `app_metadata`.
- * `app_metadata` is writable ONLY through this service-role client — never by the
+ * `app_metadata` is writable ONLY through this privileged server client — never by the
  * signed-in user (unlike `user_metadata`) — so it is the safe home for the
  * tenancy scope the guards trust (AGENTS.md §5, §6). There is NO public.profiles
  * mirror table. We call GoTrue with plain fetch rather than the Supabase JS SDK:
@@ -15,8 +16,10 @@ import { ConfigService } from '@nestjs/config';
  */
 interface GoTrueUserAttrs {
   email?: string;
+  phone?: string;
   password?: string;
   email_confirm?: boolean;
+  phone_confirm?: boolean;
   user_metadata?: Record<string, unknown>;
   app_metadata?: Record<string, unknown>;
   ban_duration?: string;
@@ -26,27 +29,75 @@ interface GoTrueUserAttrs {
 export interface GoTrueUser {
   id: string;
   email: string | null;
+  phone?: string | null;
   app_metadata: Record<string, unknown>;
   user_metadata: Record<string, unknown>;
   banned_until: string | null;
   created_at: string;
+  last_sign_in_at?: string | null;
+  invited_at?: string | null;
+  confirmation_sent_at?: string | null;
+  confirmed_at?: string | null;
+  email_confirmed_at?: string | null;
+  phone_confirmed_at?: string | null;
 }
 
 @Injectable()
 export class GoTrueAdminService {
+  private readonly authUrl: string;
   private readonly baseUrl: string;
-  private readonly serviceKey: string;
+  private readonly secretKey: string;
+  private readonly publicKey: string;
 
   constructor(config: ConfigService) {
     const supabaseUrl = config.getOrThrow<string>('SUPABASE_URL').replace(/\/$/, '');
+    this.authUrl = `${supabaseUrl}/auth/v1`;
     this.baseUrl = `${supabaseUrl}/auth/v1/admin`;
-    this.serviceKey = config.getOrThrow<string>('SUPABASE_SERVICE_ROLE_KEY');
+    this.secretKey =
+      config.get<string>('SUPABASE_SECRET_KEY')?.trim() ||
+      config.getOrThrow<string>('SUPABASE_SERVICE_ROLE_KEY').trim();
+    this.publicKey =
+      config.get<string>('SUPABASE_PUBLISHABLE_KEY')?.trim() ||
+      config.getOrThrow<string>('SUPABASE_ANON_KEY').trim();
   }
 
   /** Creates an auth user; CRM claims are passed in `app_metadata`. */
   async createUser(attrs: GoTrueUserAttrs): Promise<{ id: string }> {
     const user = await this.request('POST', '/users', attrs);
     return { id: user.id as string };
+  }
+
+  /**
+   * Sends Supabase Auth's single-use invitation email. Only non-sensitive
+   * display data goes in user_metadata; protected CRM claims are written in a
+   * separate Admin API call immediately afterwards.
+   */
+  async inviteUser(
+    email: string,
+    displayName: string,
+    redirectTo: string,
+  ): Promise<GoTrueUser> {
+    const query = new URLSearchParams({ redirect_to: redirectTo });
+    const user = await this.request(
+      'POST',
+      `/invite?${query.toString()}`,
+      { email, data: { display_name: displayName } },
+      this.authUrl,
+    );
+    return user as unknown as GoTrueUser;
+  }
+
+  /**
+   * Sends a single-use link to an existing confirmed identity. Supabase rejects
+   * a second `/invite` call after email confirmation, so a revoked invitation
+   * must continue through the existing Auth row instead of creating a duplicate.
+   */
+  async sendExistingUserLink(email: string, redirectTo: string): Promise<void> {
+    const query = new URLSearchParams({ redirect_to: redirectTo });
+    await this.authRequest('POST', `/otp?${query.toString()}`, {
+      email,
+      create_user: false,
+    });
   }
 
   /** Fetches a single user by id, or null if GoTrue has no such user. */
@@ -96,16 +147,54 @@ export class GoTrueAdminService {
     await this.updateUser(id, { ban_duration: '876000h' });
   }
 
+  /** Re-enables a retained auth identity; no auth row is deleted. */
+  async unbanUser(id: string): Promise<void> {
+    await this.updateUser(id, { ban_duration: 'none' });
+  }
+
+  /** Sends an SMS OTP only for an identity already created by the invitation. */
+  async requestPhoneOtp(phone: string): Promise<void> {
+    await this.authRequest('POST', '/otp', { phone, create_user: false });
+  }
+
+  /** Verifies the phone and returns the Auth identity that consumed the code. */
+  async verifyPhoneOtp(phone: string, token: string): Promise<{ userId: string }> {
+    const result = await this.authRequest('POST', '/verify', {
+      phone,
+      token,
+      type: 'sms',
+    });
+    const user = result.user;
+    if (
+      !user ||
+      typeof user !== 'object' ||
+      typeof (user as Record<string, unknown>).id !== 'string'
+    ) {
+      throw new BadRequestException('The mobile verification response was invalid');
+    }
+    return { userId: (user as Record<string, unknown>).id as string };
+  }
+
+  private async authRequest(
+    method: string,
+    path: string,
+    body?: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    return this.request(method, path, body, this.authUrl, this.publicKey);
+  }
+
   private async request(
     method: string,
     path: string,
-    body?: GoTrueUserAttrs,
+    body?: GoTrueUserAttrs | Record<string, unknown>,
+    baseUrl = this.baseUrl,
+    authKey = this.secretKey,
   ): Promise<Record<string, unknown>> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    const res = await fetch(`${baseUrl}${path}`, {
       method,
+      signal: AbortSignal.timeout(8_000),
       headers: {
-        apikey: this.serviceKey,
-        Authorization: `Bearer ${this.serviceKey}`,
+        ...supabaseApiKeyHeaders(authKey),
         'Content-Type': 'application/json',
       },
       ...(body ? { body: JSON.stringify(body) } : {}),

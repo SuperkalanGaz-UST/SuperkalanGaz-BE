@@ -1,9 +1,17 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import helmet from 'helmet';
 import { AppModule } from './app.module';
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule);
+  // PayMongo signs the exact webhook bytes. Nest keeps that buffer alongside
+  // the parsed JSON body so signature verification never hashes re-serialized
+  // data (CU-017 AC4).
+  const app = await NestFactory.create(AppModule, { rawBody: true });
+
+  // CSP/X-Frame-Options/etc — this API only serves JSON, so the default
+  // policy set is fine as-is.
+  app.use(helmet());
 
   // The web dashboard calls us cross-origin with a Bearer token (no cookies).
   const webOrigins = (process.env.WEB_ORIGIN ?? 'http://localhost:3000')
@@ -14,9 +22,12 @@ async function bootstrap(): Promise<void> {
   // localhost and 127.0.0.1 are the same machine but distinct CORS origins, so a
   // dashboard opened at 127.0.0.1:3000 would otherwise be blocked (the browser
   // fetch throws and login shows "Could not reach the server"). Accept any
-  // loopback origin in addition to the explicitly configured ones.
+  // loopback origin in addition to the explicitly configured ones — but only
+  // outside production (L9 fix): a production deploy has no legitimate reason
+  // to be reached from a caller's own loopback address.
+  const allowLoopbackOrigins = process.env.NODE_ENV !== 'production';
   const isLoopbackOrigin = (origin: string): boolean =>
-    /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+    allowLoopbackOrigins && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
 
   app.enableCors({
     origin: (
@@ -40,7 +51,9 @@ async function bootstrap(): Promise<void> {
   // never trust raw client input for scoping decisions (AGENTS.md §12).
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
 
-  await app.listen(Number(process.env.PORT ?? 3001));
+  // Cloud Run reaches sidecars over the instance network; binding loopback
+  // would make the API unreachable from the NGINX ingress container.
+  await app.listen(Number(process.env.PORT ?? 3001), '0.0.0.0');
 }
 
 void bootstrap();

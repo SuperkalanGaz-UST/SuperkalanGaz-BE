@@ -6,10 +6,18 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { Reflector } from '@nestjs/core';
 import { Request } from 'express';
 import { In, Repository } from 'typeorm';
 import { Branch } from '../branches/branch.entity';
-import { Principal, REQUEST_PRINCIPAL, Role } from './principal';
+import { GoTrueAdminService } from '../users/gotrue-admin.service';
+import {
+  hasMetadataBranchIds,
+  metadataBranchIds,
+  metadataBranchNames,
+} from './branch-scope';
+import { isRole, Principal, REQUEST_PRINCIPAL } from './principal';
+import { ALLOW_PENDING_INVITATION_KEY } from './roles.decorator';
 import { SupabaseJwtService } from './supabase-jwt.service';
 
 /**
@@ -24,8 +32,10 @@ import { SupabaseJwtService } from './supabase-jwt.service';
 export class AuthGuard implements CanActivate {
   constructor(
     private readonly jwt: SupabaseJwtService,
+    private readonly reflector: Reflector,
     @InjectRepository(Branch)
     private readonly branches: Repository<Branch>,
+    private readonly goTrue: GoTrueAdminService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -44,41 +54,114 @@ export class AuthGuard implements CanActivate {
     // Role/branch scope/status come from app_metadata — written only by our
     // service-role GoTrue calls, so the client cannot widen its own access.
     const claims = (payload.app_metadata ?? {}) as Record<string, unknown>;
-    const role = claims.role;
-    if (typeof role !== 'string') {
+    // L11 fix: `request.path` is Express's routed path with the query string
+    // already stripped — matching on `originalUrl` (which includes it) meant
+    // a query string on this one route silently fell through to a 403 instead
+    // of matching. Fails closed either way, but this is the correct match.
+    const requestPath = request.path || request.originalUrl || request.url || '';
+    const isCustomerPublicBranchLookup = request.method === 'GET' && requestPath.endsWith('/api/branches/public');
+    const claimedRole = typeof claims.role === 'string'
+      ? claims.role
+      : isCustomerPublicBranchLookup
+        ? 'customer'
+        : undefined;
+
+    if (!isRole(claimedRole)) {
       throw new ForbiddenException('No CRM role for this account');
     }
-    if (claims.status !== undefined && claims.status !== 'Active') {
+    const allowPendingInvitation =
+      (claims.role === 'franchise-admin' || claims.role === 'driver') &&
+      claims.status === 'Pending' &&
+      this.reflector.getAllAndOverride<boolean>(ALLOW_PENDING_INVITATION_KEY, [
+        context.getHandler(),
+        context.getClass(),
+      ]) === true;
+    if (
+      claims.status !== undefined &&
+      claims.status !== 'Active' &&
+      !allowPendingInvitation
+    ) {
       throw new ForbiddenException('This account is inactive');
     }
 
-    const names = Array.isArray(claims.branches)
-      ? (claims.branches as unknown[]).filter((b): b is string => typeof b === 'string')
-      : [];
+    // A previously issued JWT can still say Active after account deactivation.
+    // Read the live Auth record for riders so a ban takes effect on the next API request.
+    if (claimedRole === 'driver') {
+      const live = await this.goTrue.getUser(payload.sub);
+      const liveStatus = live?.app_metadata.status;
+      const bannedUntil = live?.banned_until
+        ? new Date(live.banned_until).getTime()
+        : 0;
+      if (!live || bannedUntil > Date.now() ||
+          (liveStatus !== 'Active' && !(allowPendingInvitation && liveStatus === 'Pending'))) {
+        throw new ForbiddenException('This account is inactive');
+      }
+    }
 
-    // Resolve the caller's branch names to their core.branches UUIDs once here,
-    // so every domain service can scope by branch_id (AGENTS.md §5/§6) without
-    // repeating the lookup. Only live branches count: this table soft-deletes via
-    // status='inactive', so an inactive/renamed name drops out and scoping fails
-    // closed.
-    const liveBranches = names.length
-      ? await this.branches.find({
-          where: { name: In(names), status: 'active' },
-          select: { id: true },
+    const claimedBranchIds = metadataBranchIds(claims);
+    const legacyBranchNames = metadataBranchNames(claims);
+    const hasUuidScopeClaim = hasMetadataBranchIds(claims);
+
+    // UUIDs are the authorization claim. The name lookup is a rollout-only
+    // compatibility path for sessions created before branch_ids was introduced;
+    // it is ignored as soon as a UUID claim is present, so stale display labels
+    // can never widen an already migrated account.
+    const liveBranches = hasUuidScopeClaim
+      ? claimedBranchIds.length
+        ? await this.branches.find({
+            where: { id: In(claimedBranchIds), status: 'active' },
+            select: { id: true, name: true, ownerId: true },
+          })
+        : []
+      : legacyBranchNames.length
+        ? await this.branches.find({
+            where: { name: In(legacyBranchNames), status: 'active' },
+            select: { id: true, name: true, ownerId: true },
+          })
+        : [];
+
+    const liveById = new Map(liveBranches.map((branch) => [branch.id, branch]));
+    const liveByName = new Map<string, Branch[]>();
+    for (const branch of liveBranches) {
+      liveByName.set(branch.name, [...(liveByName.get(branch.name) ?? []), branch]);
+    }
+    const claimedLiveBranches = hasUuidScopeClaim
+      ? claimedBranchIds.flatMap((id) => {
+          const branch = liveById.get(id);
+          return branch ? [branch] : [];
         })
-      : [];
+      : legacyBranchNames.flatMap((name) => {
+          const matches = liveByName.get(name) ?? [];
+          return matches.length === 1 ? matches : [];
+        });
+
+    // For migrated Branch Owners, intersect the protected UUID claim with the
+    // canonical branch row. This blocks a reassigned branch immediately even if
+    // an older access token still contains its UUID. The legacy name path stays
+    // available only long enough to run the documented UUID backfill.
+    const orderedBranches =
+      claimedRole === 'branch-owner' && hasUuidScopeClaim
+        ? claimedLiveBranches.filter((branch) => branch.ownerId === payload.sub)
+        : claimedLiveBranches;
+
+    if (claimedRole === 'branch-manager' && orderedBranches.length !== 1) {
+      throw new ForbiddenException('Branch Manager must have exactly one active branch');
+    }
 
     const principal: Principal = {
       userId: payload.sub,
-      role: role as Role,
+      role: claimedRole,
       email: typeof payload.email === 'string' ? payload.email : null,
       username: typeof claims.username === 'string' ? claims.username : null,
       displayName: typeof claims.display_name === 'string' ? claims.display_name : null,
       phone: typeof claims.phone === 'string' ? claims.phone : null,
-      // Inactive accounts were rejected above, so every constructed principal is active.
-      status: 'Active',
-      branches: names,
-      branchIds: liveBranches.map((b) => b.id),
+      status: allowPendingInvitation ? 'Pending' : 'Active',
+      accountType:
+        claims.account_type === 'household' || claims.account_type === 'commercial'
+          ? claims.account_type
+          : undefined,
+      branches: orderedBranches.map((branch) => branch.name),
+      branchIds: orderedBranches.map((branch) => branch.id),
     };
     Object.defineProperty(request, REQUEST_PRINCIPAL, {
       value: principal,

@@ -1,13 +1,22 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { randomBytes } from 'crypto';
-import { QueryFailedError, Repository } from 'typeorm';
+import { In, QueryFailedError, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
-import { GoTrueAdminService } from '../users/gotrue-admin.service';
+import {
+  hasMetadataBranchIds,
+  metadataBranchIds,
+  metadataBranchNames,
+  withBranchScope,
+} from '../auth/branch-scope';
+import { GovernanceAuditService } from '../governance/governance-audit.service';
+import { GoTrueAdminService, GoTrueUser } from '../users/gotrue-admin.service';
 import { Branch, BranchGeofence } from './branch.entity';
 import { CreateBranchDto } from './dto/create-branch.dto';
 import { UpdateBranchDto } from './dto/update-branch.dto';
@@ -35,13 +44,22 @@ export interface BranchRow {
   name: string;
   code: string;
   status: 'active' | 'inactive';
+  region: string | null;
   province: string | null;
   city: string | null;
   address: string | null;
   contact_number: string | null;
   geofence: BranchGeofence | null;
   source_store_location_id: string | null;
+  owner_id: string | null;
   created_at: Date;
+}
+
+/** Branch configuration visible to a Branch Owner for an assigned branch. */
+export interface AssignedBranchRow {
+  id: string;
+  name: string;
+  geofence: BranchGeofence | null;
 }
 
 /** URL-safe temp password; 16 chars easily clears Supabase's default policy. */
@@ -78,33 +96,53 @@ export class BranchesService {
     @InjectRepository(Branch)
     private readonly branches: Repository<Branch>,
     private readonly goTrue: GoTrueAdminService,
+    @Optional()
+    private readonly governanceAudit?: GovernanceAuditService,
   ) {}
 
-  async create(_principal: Principal, dto: CreateBranchDto): Promise<CreateBranchResult> {
+  async create(principal: Principal, dto: CreateBranchDto): Promise<CreateBranchResult> {
     const name = dto.name.trim();
 
-    // "New owner" path: create a real Branch Owner login. Role + branch
-    // membership are written to the auth user's app_metadata (service-role-only),
-    // which is where the API reads them from — there is no profiles table. Owner
-    // identity is NOT stored on core.branches (it has no owner columns).
+    let existingOwner: GoTrueUser | null = null;
+    if (dto.ownerType === 'existing') {
+      existingOwner = dto.ownerId
+        ? await this.goTrue.getUser(dto.ownerId)
+        : dto.ownerEmail
+          ? await this.goTrue.findByEmail(dto.ownerEmail)
+          : null;
+      if (
+        !existingOwner ||
+        existingOwner.app_metadata?.role !== 'branch-owner' ||
+        existingOwner.app_metadata?.status === 'Inactive'
+      ) {
+        throw new BadRequestException('Select an active Branch Owner account');
+      }
+    }
+
+    // The branch UUID does not exist until persistence, so a new owner's initial
+    // protected scope starts empty and is filled immediately after the branch row
+    // is saved. Names remain display-only metadata; branch_ids is authoritative.
     let owner: ProvisionedOwner | null = null;
+    let newOwnerMetadata: Record<string, unknown> | null = null;
     if (dto.ownerType === 'new') {
       if (!dto.ownerEmail || !dto.ownerName) {
         throw new BadRequestException('A new owner requires a name and email address');
       }
       const tempPassword = generateTempPassword();
+      newOwnerMetadata = {
+        username: dto.ownerEmail.split('@')[0],
+        display_name: dto.ownerName,
+        role: 'branch-owner',
+        branch_ids: [],
+        branches: [],
+        phone: dto.ownerMobile ?? null,
+        status: 'Active',
+      };
       const { id } = await this.goTrue.createUser({
         email: dto.ownerEmail,
         password: tempPassword,
         email_confirm: true,
-        app_metadata: {
-          username: dto.ownerEmail.split('@')[0],
-          display_name: dto.ownerName,
-          role: 'branch-owner',
-          branches: [name],
-          phone: dto.ownerMobile ?? null,
-          status: 'Active',
-        },
+        app_metadata: newOwnerMetadata,
       });
       owner = { id, email: dto.ownerEmail, tempPassword };
     }
@@ -126,6 +164,7 @@ export class BranchesService {
         province: dto.province?.trim() ? dto.province.trim() : null,
         city: dto.city?.trim() ? dto.city.trim() : null,
         status: 'active',
+        ownerId: owner?.id ?? existingOwner?.id ?? null,
         sourceStoreLocationId: dto.sourceStoreLocationId ?? null,
         geofence: dto.geofence ?? null,
         createdAt: now,
@@ -152,47 +191,95 @@ export class BranchesService {
       throw lastErr;
     }
 
-    // "Existing owner" path: the branch persisted, so grant that owner access by
-    // adding this branch to their profile. Without this the branch has no linked
-    // owner and the Edit screen reports "No Branch Owner is linked to this
-    // branch". (The "new owner" path already seeded its branch via GoTrue
-    // metadata above.) Kept out of the retry loop so a link failure never trips
-    // the branch-code re-roll.
-    if (dto.ownerType === 'existing') {
-      await this.linkExistingOwner(dto, saved.name);
+    // Project the persisted UUID into the owner's protected claims. A single
+    // owner can accumulate multiple branch UUIDs; the branch row retains the
+    // inverse owner_id association for registry queries and audit attribution.
+    let linkedOwner: { id: string; email: string | null } | null = null;
+    try {
+      if (existingOwner) {
+        linkedOwner = await this.linkOwner(existingOwner, saved);
+      } else if (owner && newOwnerMetadata) {
+        await this.goTrue.updateUser(owner.id, {
+          app_metadata: withBranchScope(newOwnerMetadata, [{ id: saved.id, name: saved.name }]),
+        });
+        linkedOwner = { id: owner.id, email: owner.email };
+      }
+    } catch (error) {
+      // GoTrue and Postgres cannot share a transaction. Fail closed by retiring
+      // the just-created branch if its protected UUID projection cannot be
+      // completed; preserve the row for audit instead of hard-deleting it.
+      saved.status = 'inactive';
+      saved.updatedAt = new Date();
+      await this.branches.save(saved).catch(() => undefined);
+      if (owner) await this.goTrue.banUser(owner.id).catch(() => undefined);
+      throw error;
+    }
+
+    if (linkedOwner && this.governanceAudit) {
+      await this.governanceAudit.record({
+        category: 'branch-owner-change',
+        action: 'branch-owner-initial-assignment',
+        actor: principal,
+        affectedRecordType: 'branch-owner-assignment',
+        affectedRecordId: saved.id,
+        branchId: saved.id,
+        beforeState: null,
+        afterState: {
+          branch: saved.name,
+          ownerId: linkedOwner.id,
+          ownerEmail: linkedOwner.email,
+        },
+        reason: 'Initial Branch Owner assignment during branch registration',
+      });
     }
 
     return { id: saved.id, code: saved.code, owner };
   }
 
-  /**
-   * Adds `branchName` to the selected existing owner's branch scope so they gain
-   * Branch Owner access to it (tenancy is keyed by branch name in the auth user's
-   * app_metadata.branches — AGENTS.md §5). Idempotent: the branch is appended
-   * only when not already present, preserving the existing order. The owner is
-   * matched by id when supplied (the integrity boundary), else by email as a
-   * fallback for older clients. A no-op if neither identifier resolves a user.
-   */
-  private async linkExistingOwner(
-    dto: CreateBranchDto,
-    branchName: string,
-  ): Promise<void> {
-    const owner = dto.ownerId
-      ? await this.goTrue.getUser(dto.ownerId)
-      : dto.ownerEmail
-        ? await this.goTrue.findByEmail(dto.ownerEmail)
-        : null;
-    if (!owner) return; // nothing to match on / owner not found — leave auth untouched
-
-    const meta = owner.app_metadata ?? {};
-    const branches = Array.isArray(meta.branches)
-      ? (meta.branches as unknown[]).filter((b): b is string => typeof b === 'string')
-      : [];
-    if (branches.includes(branchName)) return; // idempotent
+  /** Adds one immutable branch UUID to an existing owner's protected scope. */
+  private async linkOwner(
+    owner: GoTrueUser,
+    branch: Pick<Branch, 'id' | 'name'>,
+  ): Promise<{ id: string; email: string | null } | null> {
+    const scope = await this.scopeFromMetadata(owner.app_metadata);
+    if (scope.some((assigned) => assigned.id === branch.id)) {
+      return { id: owner.id, email: owner.email };
+    }
 
     await this.goTrue.updateUser(owner.id, {
-      app_metadata: { ...meta, branches: [...branches, branchName] },
+      app_metadata: withBranchScope(owner.app_metadata, [...scope, branch]),
     });
+    return { id: owner.id, email: owner.email };
+  }
+
+  /** Resolves UUID claims, with a legacy-name fallback used only during rollout. */
+  private async scopeFromMetadata(
+    metadata: Record<string, unknown> | undefined,
+  ): Promise<Array<{ id: string; name: string }>> {
+    const ids = metadataBranchIds(metadata);
+    const names = metadataBranchNames(metadata);
+    const hasUuidScope = hasMetadataBranchIds(metadata);
+    const rows = hasUuidScope
+      ? ids.length
+        ? await this.branches.find({ where: { id: In(ids) }, select: { id: true, name: true } })
+        : []
+      : names.length
+        ? await this.branches.find({
+            where: { name: In(names) },
+            select: { id: true, name: true },
+          })
+        : [];
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    const byName = new Map<string, Branch[]>();
+    for (const row of rows) {
+      byName.set(row.name, [...(byName.get(row.name) ?? []), row]);
+    }
+    return hasUuidScope
+      ? ids.flatMap((id) => (byId.has(id) ? [byId.get(id)!] : []))
+      : names.flatMap((branchName) => {
+          const matches = byName.get(branchName) ?? [];
+          return matches.length === 1 ? matches : [];
+        });
   }
 
   /**
@@ -203,6 +290,29 @@ export class BranchesService {
   async list(): Promise<BranchRow[]> {
     const rows = await this.branches.find({ order: { createdAt: 'DESC' } });
     return rows.map((b) => this.toRow(b));
+  }
+
+  /**
+   * Returns only active branches already resolved into the authenticated Branch
+   * Owner's scope by AuthGuard. The client may choose among these rows for its
+   * branch selector, but it cannot supply or widen the authorization scope.
+   */
+  async listAssigned(principal: Principal): Promise<AssignedBranchRow[]> {
+    if (principal.branchIds.length === 0) {
+      throw new ForbiddenException('No active branch is assigned to this account');
+    }
+
+    const rows = await this.branches.find({
+      where: { id: In(principal.branchIds), status: 'active' },
+      select: { id: true, name: true, geofence: true },
+      order: { name: 'ASC' },
+    });
+
+    return rows.map((branch) => ({
+      id: branch.id,
+      name: branch.name,
+      geofence: branch.geofence,
+    }));
   }
 
   /**
@@ -232,24 +342,20 @@ export class BranchesService {
 
     const saved = await this.branches.save(branch);
 
-    // Tenancy is keyed by branch NAME in each user's app_metadata.branches
-    // (AGENTS.md §5), so a rename must cascade to every user (owners and
-    // managers) referencing the old name — otherwise they silently lose access
-    // to the renamed branch. No profiles table to UPDATE now, so we page the
-    // auth users and patch the ones that reference it.
+    // UUID scope survives renames. Refresh display-only branch labels for users
+    // assigned to this UUID; legacy-name accounts are included during rollout.
     if (saved.name !== oldName) {
       const users = await this.goTrue.listUsers();
       for (const u of users) {
-        const meta = u.app_metadata ?? {};
-        const branches = Array.isArray(meta.branches)
-          ? (meta.branches as unknown[]).filter((b): b is string => typeof b === 'string')
-          : [];
-        if (!branches.includes(oldName)) continue;
+        const ids = metadataBranchIds(u.app_metadata);
+        const legacyNames = metadataBranchNames(u.app_metadata);
+        if (!ids.includes(saved.id) && !legacyNames.includes(oldName)) continue;
+        const resolved = await this.scopeFromMetadata(u.app_metadata);
+        const scope = resolved.some((assigned) => assigned.id === saved.id)
+          ? resolved
+          : [...resolved, { id: saved.id, name: saved.name }];
         await this.goTrue.updateUser(u.id, {
-          app_metadata: {
-            ...meta,
-            branches: branches.map((b) => (b === oldName ? saved.name : b)),
-          },
+          app_metadata: withBranchScope(u.app_metadata, scope),
         });
       }
     }
@@ -278,12 +384,14 @@ export class BranchesService {
       name: b.name,
       code: b.code,
       status: b.status,
+      region: b.region,
       province: b.province,
       city: b.city,
       address: b.address,
       contact_number: b.contactNumber,
       geofence: b.geofence,
       source_store_location_id: b.sourceStoreLocationId,
+      owner_id: b.ownerId,
       created_at: b.createdAt,
     };
   }

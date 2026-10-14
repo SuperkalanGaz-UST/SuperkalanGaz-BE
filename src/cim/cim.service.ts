@@ -1,14 +1,14 @@
 import { ForbiddenException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { ILike, In, IsNull, Repository } from 'typeorm';
+import { In, IsNull, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Customer } from './customer.entity';
 import { CreateCustomerDto } from './dto/create-customer.dto';
 import { SearchCustomersQuery } from './dto/search-customers.query';
 
 /** A matched customer plus their most recent order date (MAX requested_at across
- * their non-deleted Service Requests), or null when they have no linked orders.
- * The controller flattens this into the snake_case CustomerRow. */
+ * their non-deleted Service Requests). The search query only returns customers
+ * with an order in the same branch, so this is non-null for persisted results. */
 export interface CustomerListItem {
   customer: Customer;
   lastOrderDate: Date | null;
@@ -33,33 +33,61 @@ export class CimService {
   ) {}
 
   /**
-   * Search the caller's branch(es) for customers whose name OR contact_number
-   * matches the term (case-insensitive substring), excluding soft-deleted rows,
-   * ordered by name and capped at 20. The term is validated (required, >= 2
-   * chars) by SearchCustomersQuery upstream. Branch scope comes from the
-   * principal; request input can never widen it (AGENTS.md §5).
+   * List / search the caller's branch(es) for customers who have at least one
+   * linked, non-deleted Service Request in that same branch. This prevents a
+   * profile created for another branch—or an abandoned inline registration—from
+   * appearing in the caller's directory. Two modes on the same handler:
+   *  - with a term (>= 2 chars, validated upstream): the intake autocomplete —
+   *    name OR contact_number case-insensitive substring, capped at 20;
+   *  - without a term: the CIM Customers directory (BM-031) — the whole branch,
+   *    capped at 200 so it stays bounded.
+   * Branch scope comes from the principal; request input can never widen it
+   * (AGENTS.md §5).
    */
   async search(
     principal: Principal,
     query: SearchCustomersQuery,
   ): Promise<CustomerListItem[]> {
-    const branchIds = this.requireBranches(principal);
-    const term = `%${query.search.trim()}%`;
+    let branchIds = this.requireBranches(principal);
+    if (query.branchId) {
+      if (!branchIds.includes(query.branchId)) {
+        throw new ForbiddenException('Branch not assigned to caller');
+      }
+      branchIds = [query.branchId];
+    }
+    const term = query.search?.trim();
 
-    // Each OR branch must carry the full scope (branch + soft-delete); an ILIKE
-    // on name in one and on contact_number in the other. TypeORM ORs the array.
-    const scope = { branchId: In(branchIds), deletedAt: IsNull() };
-    const customers = await this.customers.find({
-      where: [
-        { ...scope, name: ILike(term) },
-        { ...scope, contactNumber: ILike(term) },
-      ],
-      order: { name: 'ASC' },
-      take: 20,
-    });
+    const customerQuery = this.customers
+      .createQueryBuilder('customer')
+      .where('customer.branch_id IN (:...branchIds)', { branchIds })
+      .andWhere('customer.deleted_at IS NULL')
+      .andWhere(
+        `EXISTS (
+          SELECT 1
+          FROM srd.service_requests service_request
+          WHERE service_request.customer_id = customer.id
+            AND service_request.branch_id = customer.branch_id
+            AND service_request.deleted_at IS NULL
+        )`,
+      );
+
+    if (term) {
+      customerQuery.andWhere(
+        '(customer.name ILIKE :term OR customer.contact_number ILIKE :term)',
+        { term: `%${term}%` },
+      );
+    }
+
+    const customers = await customerQuery
+      .orderBy('customer.name', 'ASC')
+      .take(term ? 20 : 200)
+      .getMany();
     if (customers.length === 0) return [];
 
-    const lastOrders = await this.lastOrderDates(customers.map((c) => c.id));
+    const lastOrders = await this.lastOrderDates(
+      customers.map((c) => c.id),
+      branchIds,
+    );
     return customers.map((customer) => ({
       customer,
       lastOrderDate: lastOrders.get(customer.id) ?? null,
@@ -77,18 +105,105 @@ export class CimService {
     const now = new Date();
     const customer = this.customers.create({
       branchId,
+      authUserId: null,
       name: dto.name.trim(),
       contactNumber: dto.contactNumber.trim(),
       deliveryAddress: dto.deliveryAddress.trim(),
       // BM-created profiles are always staff-created (story BM-031); the client
       // never gets to set this.
       registrationSource: 'staff-created',
+      accountType: dto.accountType,
       createdAt: now,
       updatedAt: now,
       deletedAt: null,
     });
 
-    return this.customers.save(customer);
+    const saved = await this.customers.save(customer);
+    // customer_code is assigned by a DB trigger (migration 0029), invisible to
+    // the in-memory entity returned by save() — reload to pick it up.
+    return this.customers.findOneByOrFail({ id: saved.id });
+  }
+
+  /**
+   * Materialize an authenticated mobile customer into the selected branch's
+   * CIM directory when they place an order. Registration itself cannot create
+   * this row because a mobile account is global and has no branch until an
+   * order is addressed to one.
+   *
+   * The unique (branch_id, auth_user_id) index makes this an idempotent,
+   * race-safe upsert. Only server-verified identity and the already-validated
+   * order branch reach this method; neither value comes from an editable
+   * customer profile field.
+   */
+  async upsertSelfRegisteredInBranch(input: {
+    authUserId: string;
+    branchId: string;
+    name: string;
+    contactNumber: string;
+    deliveryAddress: string;
+    accountType: 'household' | 'commercial';
+  }): Promise<Customer> {
+    const now = new Date();
+    await this.customers.upsert(
+      {
+        branchId: input.branchId,
+        authUserId: input.authUserId,
+        name: input.name.trim(),
+        contactNumber: input.contactNumber.trim(),
+        deliveryAddress: input.deliveryAddress.trim(),
+        registrationSource: 'self-registered',
+        accountType: input.accountType,
+        // created_at is omitted so the DB default handles inserts and repeat
+        // orders never rewrite the profile's original creation timestamp.
+        updatedAt: now,
+        deletedAt: null,
+      },
+      {
+        conflictPaths: ['branchId', 'authUserId'],
+        skipUpdateIfNoValuesChanged: true,
+      },
+    );
+
+    return this.customers.findOneByOrFail({
+      branchId: input.branchId,
+      authUserId: input.authUserId,
+      deletedAt: IsNull(),
+    });
+  }
+
+  /** Resolve every live branch-owned CIM profile belonging to one authenticated
+   * mobile customer. Used only for that customer's own order history. */
+  async profileIdsForAuthUser(authUserId: string): Promise<string[]> {
+    const profiles = await this.customers.find({
+      where: { authUserId, deletedAt: IsNull() },
+      select: { id: true },
+      take: 200,
+    });
+    return profiles.map((profile) => profile.id);
+  }
+
+  /** Batch id → customer_code lookup (H-00001 / C-00001, migration 0029) used to
+   * annotate order rows without an N+1 query per row. Ids with no live profile
+   * are simply absent from the map. */
+  async codesByIds(ids: string[]): Promise<Map<string, string | null>> {
+    if (ids.length === 0) return new Map();
+    const rows = await this.customers.find({
+      where: { id: In(ids) },
+      select: { id: true, customerCode: true },
+    });
+    return new Map(rows.map((row) => [row.id, row.customerCode]));
+  }
+
+  /** Live branch projections for one authenticated mobile customer. Loyalty uses
+   * both id and branch id so catalog/redemption reads never cross branch scope. */
+  async profilesForAuthUser(
+    authUserId: string,
+  ): Promise<Pick<Customer, 'id' | 'branchId' | 'accountType'>[]> {
+    return this.customers.find({
+      where: { authUserId, deletedAt: IsNull() },
+      select: { id: true, branchId: true, accountType: true },
+      take: 200,
+    });
   }
 
   /**
@@ -108,6 +223,19 @@ export class CimService {
     });
   }
 
+  /** Same as findInBranch, but scoped to any of the caller's branches — for BM
+   * principals that may carry more than one (AGENTS.md §5: request input can
+   * only narrow, but the caller's own branch set may legitimately have more
+   * than one). */
+  async findInBranches(
+    customerId: string,
+    branchIds: string[],
+  ): Promise<Customer | null> {
+    return this.customers.findOne({
+      where: { id: customerId, branchId: In(branchIds), deletedAt: IsNull() },
+    });
+  }
+
   /**
    * Most-recent order date per customer: MAX(requested_at) over their
    * non-deleted Service Requests. Referenced by the fully-qualified table name
@@ -119,6 +247,7 @@ export class CimService {
    */
   private async lastOrderDates(
     customerIds: string[],
+    branchIds: string[],
   ): Promise<Map<string, Date>> {
     const rows = await this.customers.manager
       .createQueryBuilder()
@@ -126,6 +255,7 @@ export class CimService {
       .addSelect('MAX(sr.requested_at)', 'last_order_date')
       .from('srd.service_requests', 'sr')
       .where('sr.customer_id IN (:...customerIds)', { customerIds })
+      .andWhere('sr.branch_id IN (:...branchIds)', { branchIds })
       .andWhere('sr.deleted_at IS NULL')
       .groupBy('sr.customer_id')
       .getRawMany<{ customer_id: string; last_order_date: Date }>();

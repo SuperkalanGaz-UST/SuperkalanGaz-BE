@@ -1,0 +1,11 @@
+[Unit]
+Description=Traccar consistent backup and GCS upload
+After=superkalan-traccar.service network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/superkalan-traccar
+EnvironmentFile=/opt/superkalan-traccar/backup.env
+UMask=0077
+ExecStart=/bin/bash /opt/superkalan-traccar/scripts/vm-backup.sh
+TimeoutStartSec=1800
