@@ -20,6 +20,7 @@ import { Branch } from '../branches/branch.entity';
 import { NotificationsService } from '../notifications/notifications.service';
 import { PricesService } from '../prices/prices.service';
 import { CYLINDER_SIZES, CylinderSize, UpdatePricesDto } from '../prices/dto/update-prices.dto';
+import { isRegionCode, RegionCode } from '../prices/philippine-regions';
 import { SlaConfiguration, SlaSegment } from '../service-requests/sla-configuration.entity';
 import { GoTrueAdminService, GoTrueUser } from '../users/gotrue-admin.service';
 import { CreateGovernanceRequestDto } from './dto/create-governance-request.dto';
@@ -43,6 +44,7 @@ interface AppliedRequestResult {
 }
 
 interface PricePayload {
+  regionCode?: RegionCode;
   prices: { cylinderSize: CylinderSize; unitPrice: number }[];
 }
 
@@ -107,6 +109,17 @@ export class GovernanceService {
     }
     await this.validateRequestPayload(dto);
 
+    let payload = dto.payload;
+    if (dto.type === 'price-configuration' && dto.payload.regionCode !== undefined) {
+      const parsed = this.pricePayload(dto.payload);
+      const current = await this.prices.list(parsed.regionCode);
+      // The API captures the approval baseline; client-supplied baselines are never trusted.
+      payload = { ...parsed, currentPrices: current.map((product) => ({ cylinderSize: product.cylinderSize, unitPrice: product.unitPrice })) };
+      if (!parsed.prices.some((price) => current.find((product) => product.cylinderSize === price.cylinderSize)?.unitPrice !== price.unitPrice)) {
+        throw new BadRequestException('Change at least one price before submitting a proposal');
+      }
+    }
+
     const request = this.requests.create({
       type: dto.type,
       status: 'pending',
@@ -116,7 +129,7 @@ export class GovernanceService {
       branchId: dto.branchId ?? null,
       requestedBy: principal.userId,
       requestedByName: actorName(principal),
-      payload: dto.payload,
+      payload,
       submittedAt: new Date(),
       decidedBy: null,
       decidedByName: null,
@@ -207,6 +220,7 @@ export class GovernanceService {
     let applied: AppliedRequestResult | null = null;
     try {
       if (dto.decision === 'approve') {
+        request.decisionReason = dto.reason.trim();
         applied = await this.applyApprovedRequest(principal, request);
       }
     } catch (error) {
@@ -242,7 +256,7 @@ export class GovernanceService {
       reason: dto.reason,
     });
 
-    if (applied) {
+    if (applied && request.type !== 'price-configuration') {
       await this.audit.record({
         category: this.categoryFor(request.type),
         action: `${request.type}-applied`,
@@ -592,7 +606,7 @@ export class GovernanceService {
   ): Promise<AppliedRequestResult> {
     switch (request.type) {
       case 'price-configuration':
-        return this.applyPriceRequest(request);
+        return this.applyPriceRequest(principal, request);
       case 'sla-threshold':
         return this.applySlaRequest(principal, request);
       case 'franchise-admin-account':
@@ -610,12 +624,26 @@ export class GovernanceService {
     }
   }
 
-  private async applyPriceRequest(request: GovernanceRequest): Promise<AppliedRequestResult> {
+  private async applyPriceRequest(principal: Principal, request: GovernanceRequest): Promise<AppliedRequestResult> {
     const payload = this.pricePayload(request.payload);
-    const before = await this.prices.list();
-    const after = await this.prices.updateAll(payload as UpdatePricesDto);
+    const before = await this.prices.list(payload.regionCode);
+    const baseline = request.payload.currentPrices;
+    const expected = Array.isArray(baseline) ? this.pricePayload({ prices: baseline }).prices : undefined;
+    const after = await this.prices.updateAll(payload as UpdatePricesDto, undefined, expected, async (lockedBefore, appliedAfter, manager) => {
+      const snapshot = (products: typeof lockedBefore) => ({
+        regionCode: payload.regionCode ?? null,
+        prices: products.map((product) => ({ productId: product.id, cylinderSize: product.cylinderSize, unitPrice: product.unitPrice })),
+      });
+      await this.audit.record({
+        category: 'price-change', action: 'price-configuration-applied', actor: principal,
+        affectedRecordType: payload.regionCode ? 'regional-price-list' : 'shared-price-catalog',
+        governanceRequestId: request.id, beforeState: snapshot(lockedBefore), afterState: snapshot(appliedAfter),
+        reason: request.decisionReason,
+      }, manager);
+    });
     return {
       beforeState: {
+        ...(payload.regionCode ? { regionCode: payload.regionCode } : {}),
         prices: before.map((product) => ({
           productId: product.id,
           cylinderSize: product.cylinderSize,
@@ -623,13 +651,14 @@ export class GovernanceService {
         })),
       },
       afterState: {
+        ...(payload.regionCode ? { regionCode: payload.regionCode } : {}),
         prices: after.map((product) => ({
           productId: product.id,
           cylinderSize: product.cylinderSize,
           unitPrice: product.unitPrice,
         })),
       },
-      affectedRecordType: 'shared-price-catalog',
+      affectedRecordType: payload.regionCode ? 'regional-price-list' : 'shared-price-catalog',
       affectedRecordId: null,
     };
   }
@@ -970,6 +999,9 @@ export class GovernanceService {
   }
 
   private pricePayload(payload: Record<string, unknown>): PricePayload {
+    if (payload.regionCode !== undefined && !isRegionCode(payload.regionCode)) {
+      throw new BadRequestException('Invalid pricing region');
+    }
     const rows = payload.prices;
     if (!Array.isArray(rows) || rows.length !== CYLINDER_SIZES.length) {
       throw new BadRequestException('Submit one price for every supported cylinder size');
@@ -984,7 +1016,8 @@ export class GovernanceService {
         !CYLINDER_SIZES.includes(input.cylinderSize as CylinderSize) ||
         typeof input.unitPrice !== 'number' ||
         !Number.isFinite(input.unitPrice) ||
-        input.unitPrice <= 0
+        input.unitPrice < 0.01 || input.unitPrice > 99999999.99 ||
+        Math.abs(input.unitPrice * 100 - Math.round(input.unitPrice * 100)) > 0.000001
       ) {
         throw new BadRequestException('Invalid price request payload');
       }
@@ -996,7 +1029,7 @@ export class GovernanceService {
     if (new Set(parsed.map((row) => row.cylinderSize)).size !== CYLINDER_SIZES.length) {
       throw new BadRequestException('Cylinder sizes must be unique');
     }
-    return { prices: parsed };
+    return { prices: parsed, ...(isRegionCode(payload.regionCode) ? { regionCode: payload.regionCode } : {}) };
   }
 
   private defaultRisk(type: GovernanceRequestType): 'low' | 'medium' | 'high' {

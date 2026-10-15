@@ -12,3 +12,6 @@ coverage
 **/certs
 **/backups
 deploy/gcp/.local
+
+# Short-lived Google GitHub Actions credentials
+gha-creds-*.json

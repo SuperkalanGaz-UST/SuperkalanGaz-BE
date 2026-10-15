@@ -31,6 +31,7 @@ describe('GovernanceService', () => {
   const makeService = (
     requestOverrides: Partial<Repository<GovernanceRequest>> = {},
     goTrueOverrides: Partial<GoTrueAdminService> = {},
+    priceOverrides: Partial<PricesService> = {},
   ) => {
     const requests = {
       create: jest.fn((value: GovernanceRequest) => value),
@@ -49,12 +50,13 @@ describe('GovernanceService', () => {
     const goTrue = {
       ...goTrueOverrides,
     } as unknown as jest.Mocked<GoTrueAdminService>;
+    const prices = { ...priceOverrides } as unknown as jest.Mocked<PricesService>;
     const service = new GovernanceService(
       requests,
       { findOne: jest.fn() } as unknown as Repository<Branch>,
       {} as Repository<SlaConfiguration>,
       audit,
-      {} as PricesService,
+      prices,
       notifications,
       goTrue,
       {} as DataSource,
@@ -64,7 +66,7 @@ describe('GovernanceService', () => {
         ),
       } as unknown as ConfigService,
     );
-    return { service, requests, audit, notifications, goTrue };
+    return { service, requests, audit, notifications, goTrue, prices };
   };
 
   it('stores a complete price proposal without applying prices before approval', async () => {
@@ -93,6 +95,32 @@ describe('GovernanceService', () => {
     expect(notifications.publishForRole).toHaveBeenCalledWith(
       expect.objectContaining({ audienceRole: 'super-admin' }),
     );
+  });
+
+  it('captures a regional baseline server-side and never applies a pending proposal', async () => {
+    const current = CYLINDER_SIZES.map((cylinderSize, index) => ({ cylinderSize, unitPrice: 200 + index * 100 }));
+    const { service, prices } = makeService({}, {}, {
+      list: jest.fn(async () => current) as unknown as PricesService['list'],
+      updateAll: jest.fn(),
+    });
+    const result = await service.submit(franchiseAdmin, {
+      type: 'price-configuration', title: 'CALABARZON prices', reason: 'Regional transport costs changed.',
+      payload: { regionCode: 'IV-A', currentPrices: [{ cylinderSize: '11kg', unitPrice: 1 }], prices: current.map((price) => ({ ...price, unitPrice: price.unitPrice + 20 })) },
+    });
+    expect(result.status).toBe('pending');
+    expect(result.payload.regionCode).toBe('IV-A');
+    expect(result.payload.currentPrices).toEqual(current);
+    expect(prices.list).toHaveBeenCalledWith('IV-A');
+    expect(prices.updateAll).not.toHaveBeenCalled();
+  });
+
+  it('rejects unknown regions without storing a proposal', async () => {
+    const { service, requests } = makeService();
+    await expect(service.submit(franchiseAdmin, {
+      type: 'price-configuration', title: 'Unknown region', reason: 'Regional adjustment.',
+      payload: { regionCode: 'unknown', prices: CYLINDER_SIZES.map((cylinderSize) => ({ cylinderSize, unitPrice: 200 })) },
+    })).rejects.toThrow('Invalid pricing region');
+    expect(requests.save).not.toHaveBeenCalled();
   });
 
   it('rejects the retired Franchise Administrator account request path', async () => {

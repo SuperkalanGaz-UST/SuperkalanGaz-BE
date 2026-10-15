@@ -10,6 +10,7 @@ import {
   Matches,
 } from 'class-validator';
 import { BranchGeofence } from '../branch.entity';
+import { REGION_CODES, RegionCode } from '../../prices/philippine-regions';
 
 /**
  * Payload from the "Register new branch account" wizard. The ValidationPipe
@@ -21,6 +22,10 @@ import { BranchGeofence } from '../branch.entity';
  * sends them. The geofence polygon, however, IS persisted (jsonb column).
  */
 export class CreateBranchDto {
+  @IsOptional()
+  @IsIn(REGION_CODES)
+  region?: RegionCode | null;
+
   @IsString()
   @IsNotEmpty()
   name!: string;

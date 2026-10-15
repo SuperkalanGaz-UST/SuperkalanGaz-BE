@@ -942,7 +942,7 @@ describe('ServiceRequestsService', () => {
 
       // Price is re-derived from the catalog (650/unit), never trusted from the
       // client and never left at the stale 500/unit snapshot.
-      expect(prices.findByCylinderSize).toHaveBeenCalledWith('22kg');
+      expect(prices.findByCylinderSize).toHaveBeenCalledWith('22kg', 'branch-uuid-1');
       expect(result.unitPrice).toBe(650);
       expect(result.totalAmount).toBe(3250); // 650 * 5, not the stale 500 * 5
       expect(qb.execute).toHaveBeenCalledTimes(1);
