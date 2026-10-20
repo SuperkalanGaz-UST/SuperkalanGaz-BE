@@ -49,6 +49,7 @@ describe('AuthGuard UUID branch scope', () => {
           role: 'branch-owner',
           status: 'Active',
           branch_ids: [firstBranchId, secondBranchId],
+          branches: ['Beta'],
         },
       }),
     } as unknown as SupabaseJwtService;

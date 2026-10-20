@@ -144,7 +144,7 @@ export class CsatService {
       throw new BadRequestException('from date must not be later than to date');
     }
 
-    const branchIds = this.requireBranches(principal);
+    const branchIds = this.reportBranchIds(principal, query.branchId);
 
     // Only filter by star range if explicitly requested. When maxStars is
     // omitted the caller wants the full picture (e.g. the "All" view on the
@@ -332,8 +332,8 @@ export class CsatService {
    * 1–3 star band the follow-up queue actually shows. averageStars is the
    * headline satisfaction figure, null when the branch has no ratings yet.
    */
-  async getSummary(principal: Principal): Promise<CsatSummary> {
-    const branchIds = this.requireBranches(principal);
+  async getSummary(principal: Principal, requestedBranchId?: string): Promise<CsatSummary> {
+    const branchIds = this.reportBranchIds(principal, requestedBranchId);
     return this.fetchAggregatedSummary(branchIds);
   }
 
@@ -658,6 +658,9 @@ export class CsatService {
   /** A client value can narrow verified JWT scope, never widen it. */
   private reportBranchIds(principal: Principal, requestedBranchId?: string): string[] {
     const branchIds = this.requireBranches(principal);
+    if (!requestedBranchId && principal.role === 'branch-owner' && branchIds.length > 1) {
+      throw new ForbiddenException('Select an authorized branch');
+    }
     if (!requestedBranchId) return branchIds;
     if (!branchIds.includes(requestedBranchId)) {
       throw new ForbiddenException('Requested branch is outside the caller scope');
