@@ -79,12 +79,14 @@ describe('ExpensesService', () => {
     const repo = makeRepo();
     const service = new ExpensesService(repo);
 
-    await service.list(principal(['branch-1', 'branch-2']), { month: '2026-07' });
+    await service.list(principal(), { month: '2026-07' });
 
     const where = repo.find.mock.calls[0][0]?.where as Record<string, unknown>;
     expect(where).toHaveProperty('branchId');
     expect(where).toHaveProperty('expenseDate');
     expect(where).toHaveProperty('deletedAt');
+    expect(where.branchId).toBe('branch-1');
+    expect(where).toHaveProperty('category');
     expect(repo.find.mock.calls[0][0]?.order).toEqual({ expenseDate: 'DESC', createdAt: 'DESC' });
   });
 
@@ -111,5 +113,33 @@ describe('ExpensesService', () => {
       service.update(principal(), 'expense-1', { description: 'Changed' }),
     ).rejects.toBeInstanceOf(BadRequestException);
     expect(repo.save).not.toHaveBeenCalled();
+  });
+
+  it('rejects salary creation and recategorization by a Branch Manager', async () => {
+    const repo = makeRepo();
+    const service = new ExpensesService(repo);
+    await expect(service.create(principal(), { ...dto(), category: 'Salary & Wages' })).rejects.toBeInstanceOf(ForbiddenException);
+    await expect(service.update(principal(), 'salary-id', { category: 'Salary & Wages' })).rejects.toBeInstanceOf(ForbiddenException);
+    expect(repo.save).not.toHaveBeenCalled();
+    expect(repo.findOne).not.toHaveBeenCalled();
+  });
+
+  it('cannot expose or alter an existing salary record through the ordinary update route', async () => {
+    const repo = makeRepo();
+    repo.findOne.mockResolvedValue({ id: 'salary-id', category: 'Salary & Wages', expenseDate: currentDate() } as Expense);
+    const service = new ExpensesService(repo);
+    await expect(service.update(principal(), 'salary-id', { category: 'Utilities' })).rejects.toBeInstanceOf(NotFoundException);
+    expect(repo.save).not.toHaveBeenCalled();
+  });
+
+  it('requires explicit authorized branch context for a multi-branch Owner', async () => {
+    const repo = makeRepo();
+    const service = new ExpensesService(repo);
+    const owner: Principal = { ...principal(['branch-1', 'branch-2']), role: 'branch-owner' };
+    await expect(service.list(owner, {})).rejects.toBeInstanceOf(ForbiddenException);
+    await expect(service.list(owner, { branchId: 'outside' })).rejects.toBeInstanceOf(ForbiddenException);
+    expect(repo.find).not.toHaveBeenCalled();
+    await service.list(owner, { branchId: 'branch-2' });
+    expect(repo.find.mock.calls[0][0]?.where).toMatchObject({ branchId: 'branch-2' });
   });
 });
