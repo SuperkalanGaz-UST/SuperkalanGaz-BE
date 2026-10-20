@@ -1,5 +1,6 @@
 import { Type } from 'class-transformer';
 import { IsIn, IsInt, IsISO8601, IsOptional, Max, Min } from 'class-validator';
+import { BranchSelectionQuery } from '../../common/dto/branch-selection.query';
 
 /** Resolution filters for the CSAT queue: the two lifecycle states plus 'all'
  * (no filter). Single source of truth, reused by the validator below. */
@@ -17,7 +18,7 @@ export type ResolutionFilter = (typeof RESOLUTION_FILTERS)[number];
  * Neither value can widen scope — results are always the caller's own branch(es)
  * (AGENTS.md §5).
  */
-export class ListRatingsQuery {
+export class ListRatingsQuery extends BranchSelectionQuery {
   /** Inclusive upper bound on stars. Defaults to 3 (the low-CSAT band) in the
    * service. Constrained to the DB's own 1–5 rating range. */
   @IsOptional()

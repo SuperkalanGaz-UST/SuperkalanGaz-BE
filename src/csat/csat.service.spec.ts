@@ -1,6 +1,6 @@
 import { ForbiddenException } from '@nestjs/common';
 import { describe, expect, it, jest } from '@jest/globals';
-import { DataSource, Repository } from 'typeorm';
+import { DataSource, In, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
 import { Rider } from '../fleet/rider.entity';
@@ -79,5 +79,39 @@ describe('CsatService branch reports', () => {
       }),
     ).rejects.toBeInstanceOf(ForbiddenException);
     expect(serviceRequests.find).not.toHaveBeenCalled();
+  });
+
+  it('rejects ratings requested for a stale display-name branch outside the UUID scope', async () => {
+    const { service, ratings } = makeService();
+    await expect(service.listRatings(
+      { ...principal, branches: ['Beta'] },
+      { resolution: 'all', branchId: 'branch-uuid-2' },
+    )).rejects.toBeInstanceOf(ForbiddenException);
+    expect(ratings.find).not.toHaveBeenCalled();
+  });
+
+  it('narrows ratings to the selected authorized branch for a multi-branch owner', async () => {
+    const { service, ratings } = makeService();
+    ratings.find.mockResolvedValue([]);
+    await service.listRatings(
+      { ...principal, branchIds: ['branch-uuid-1', 'branch-uuid-2'] },
+      { resolution: 'all', branchId: 'branch-uuid-2' },
+    );
+    expect(ratings.find).toHaveBeenCalledWith(expect.objectContaining({
+      where: { branchId: In(['branch-uuid-2']) },
+    }));
+  });
+
+  it('requires a selection before loading ratings or summaries for a multi-branch owner', async () => {
+    const { service, ratings } = makeService();
+    const owner = { ...principal, branchIds: ['branch-uuid-1', 'branch-uuid-2'] };
+    await expect(service.listRatings(owner, { resolution: 'all' })).rejects.toBeInstanceOf(ForbiddenException);
+    await expect(service.getSummary(owner)).rejects.toBeInstanceOf(ForbiddenException);
+    expect(ratings.find).not.toHaveBeenCalled();
+  });
+
+  it('rejects a summary for a branch outside the UUID scope before querying ratings', async () => {
+    const { service } = makeService();
+    await expect(service.getSummary(principal, 'branch-uuid-2')).rejects.toBeInstanceOf(ForbiddenException);
   });
 });

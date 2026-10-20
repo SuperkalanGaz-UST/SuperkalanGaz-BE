@@ -21,6 +21,7 @@ import { ResolveRatingDto } from './dto/resolve-rating.dto';
 import { CreateIncidentDto } from './dto/create-incident.dto';
 import { ListIncidentsQuery } from './dto/list-incidents.query';
 import { BranchReportQuery } from '../common/dto/branch-report.query';
+import { BranchSelectionQuery } from '../common/dto/branch-selection.query';
 import { CreateRatingDto } from './dto/create-rating.dto';
 
 /**
@@ -87,9 +88,9 @@ export class CsatController {
     @CurrentPrincipal() principal: Principal,
     @Query() query: BranchReportQuery,
   ) {
-    const summary = await this.csat.getSummaryForBranch(
+    const summary = await this.csat.getSummary(
       principal,
-      query.branchId ?? principal.branchIds[0],
+      query.branchId,
     );
     return {
       report: {
@@ -142,8 +143,9 @@ export class CsatController {
   @Roles('branch-manager', 'branch-owner')
   async summary(
     @CurrentPrincipal() principal: Principal,
+    @Query() query: BranchSelectionQuery,
   ): Promise<{ summary: ReturnType<CsatController['toSummaryRow']> }> {
-    const s = await this.csat.getSummary(principal);
+    const s = await this.csat.getSummary(principal, query.branchId);
     return { summary: this.toSummaryRow(s) };
   }
 

@@ -21,6 +21,7 @@ import { ServiceRequestsModule } from './service-requests/service-requests.modul
 import { UsersModule } from './users/users.module';
 import { GovernanceModule } from './governance/governance.module';
 import { HealthModule } from './health/health.module';
+import { FranchiseReportsModule } from './franchise-reports/franchise-reports.module';
 
 /**
  * Modular monolith root (AGENTS.md §4). Supabase PostgreSQL is accessed through
@@ -145,6 +146,7 @@ import { HealthModule } from './health/health.module';
     }),
     AuthModule,
     HealthModule,
+    FranchiseReportsModule,
     UsersModule,
     BranchesModule,
     ReferenceModule,
