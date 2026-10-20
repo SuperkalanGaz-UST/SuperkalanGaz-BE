@@ -211,7 +211,7 @@ Hard constraints:
 
 ## 8. Module & Domain Rules `[api] [web] [mobile]`
 
-**5 confirmed modules. There is no Supply Chain module.**
+**5 confirmed modules, plus the approved salary/overtime expense extension in §11. There is no Supply Chain module.**
 
 1. **Customer Information Management (CIM)** — profiles, addresses, purchase history.
 2. **Service Request & Dispatch (SRD)** — digital order creation, Delivery Rider offer/assignment,
@@ -304,9 +304,20 @@ Management as practices this system implements. Vocabulary: "Service Request" (o
 
 Do not write code for, scaffold, or suggest:
 - Live corporate **ERP** integration for supply-chain replenishment.
-- **HR / payroll**, employee records, **BIR / tax** reporting, or **accounting**.
+- General **HR / payroll**, employee records, **BIR / tax** reporting, or **accounting**,
+  except the salary/overtime expense extension in workspace [AGENTS.md §11](../AGENTS.md#11-prohibited--out-of-scope-all).
 - Additional ITIL practices beyond the four in §9.
-- Any feature outside the 5 modules in §8.
+- Any feature outside the 5 modules in §8 and that approved expense extension.
+
+**Client-approved exception (2026-10-20):** Follow the workspace §11 salary/overtime
+expense extension for Branch Owner recording and OPEX reporting. Its Owner-only restriction
+overrides §7's general SA/FA read visibility; every read/write must use verified branch scope
+and live ownership. Exclude compensation and compensation-inclusive aggregates from Branch
+Manager responses, reports, charts, and exports. Scope/design approval does not establish an
+implementation or release; reconcile Jira acceptance criteria before implementing.
+The approved hours-based behavior is tracked in [SK-183 / BO-069](https://ust-capstone-superkalan.atlassian.net/browse/SK-183):
+regular hours × hourly rate plus overtime hours × a separately confirmed overtime hourly
+rate, calculated by NestJS. No statutory multiplier or rate is assumed.
 
 **In scope (do not confuse with the above):** low-stock alerts and reorder *logging* —
 configurable thresholds against a **mock JSON supply endpoint**. Only the *live ERP
