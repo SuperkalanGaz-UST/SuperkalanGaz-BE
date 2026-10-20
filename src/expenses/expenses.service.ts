@@ -5,12 +5,13 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Between, In, IsNull, Repository } from 'typeorm';
+import { Between, IsNull, Not, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { CreateExpenseDto } from './dto/create-expense.dto';
 import { ListExpensesQuery } from './dto/list-expenses.query';
 import { UpdateExpenseDto } from './dto/update-expense.dto';
 import { Expense } from './expense.entity';
+import { expenseBranch } from './expense-scope';
 
 const BUSINESS_TIME_ZONE = 'Asia/Manila';
 
@@ -27,13 +28,14 @@ export class ExpensesService {
   ) {}
 
   async list(principal: Principal, query: ListExpensesQuery): Promise<Expense[]> {
-    const branchIds = this.requireBranches(principal);
+    const branchId = expenseBranch(principal, query.branchId);
     const month = query.month ?? this.currentBusinessMonth();
     const { firstDate, lastDate } = this.monthBounds(month);
 
     return this.expenses.find({
       where: {
-        branchId: In(branchIds),
+        branchId,
+        ...(principal.role === 'branch-owner' ? {} : { category: Not('Salary & Wages') }),
         expenseDate: Between(firstDate, lastDate),
         deletedAt: IsNull(),
       },
@@ -42,7 +44,8 @@ export class ExpensesService {
   }
 
   async create(principal: Principal, dto: CreateExpenseDto): Promise<Expense> {
-    const branchId = this.requireBranches(principal)[0];
+    this.assertOperationalWrite(principal, dto.category);
+    const branchId = expenseBranch(principal);
     this.assertCurrentMonth(dto.expenseDate);
     const description = dto.description.trim();
     if (!description) throw new BadRequestException('Description is required');
@@ -70,16 +73,17 @@ export class ExpensesService {
     id: string,
     dto: UpdateExpenseDto,
   ): Promise<Expense> {
-    const branchIds = this.requireBranches(principal);
+    this.assertOperationalWrite(principal, dto.category);
+    const branchId = expenseBranch(principal);
     const suppliedFields = Object.values(dto).filter((value) => value !== undefined);
     if (suppliedFields.length === 0) {
       throw new BadRequestException('Provide at least one expense field to update');
     }
 
     const expense = await this.expenses.findOne({
-      where: { id, branchId: In(branchIds), deletedAt: IsNull() },
+      where: { id, branchId, category: Not('Salary & Wages'), deletedAt: IsNull() },
     });
-    if (!expense) throw new NotFoundException('Expense not found');
+    if (!expense || expense.category === 'Salary & Wages') throw new NotFoundException('Expense not found');
 
     // Closed months remain immutable even if a caller replays an old edit request.
     this.assertCurrentMonth(expense.expenseDate);
@@ -128,10 +132,9 @@ export class ExpensesService {
     };
   }
 
-  private requireBranches(principal: Principal): string[] {
-    if (principal.branchIds.length === 0) {
-      throw new ForbiddenException('Caller has no active branch');
+  private assertOperationalWrite(principal: Principal, category?: string): void {
+    if (principal.role !== 'branch-manager' || category === 'Salary & Wages') {
+      throw new ForbiddenException('Salary expenses can only be recorded by the Branch Owner');
     }
-    return principal.branchIds;
   }
 }
