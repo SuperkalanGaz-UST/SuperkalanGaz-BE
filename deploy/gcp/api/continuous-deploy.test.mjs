@@ -32,7 +32,7 @@ test('verifies the no-traffic candidate before promoting digest-pinned images', 
   const f = fixture();
   const result = await release(f);
   assert.equal(result.previous, 'previous');
-  assert.equal(f.requests.length, 7);
+  assert.equal(f.requests.length, 9);
   const update = f.calls.find((args) => args.includes('update'));
   assert.ok(update.includes('--no-traffic'));
   assert.equal(update.filter((arg) => arg.startsWith('--image=')).length, 2);
@@ -83,3 +83,15 @@ test('a candidate missing the regional pricing endpoint cannot receive traffic',
   await assert.rejects(release(f), /prices\/regions: expected 200, received 404/);
   assert.ok(!f.calls.some((args) => args.includes('update-traffic')));
 });
+
+for (const path of ['/api/salary-expenses', '/api/salary-expenses/staff']) {
+  test(`a candidate missing ${path} cannot receive production traffic`, async () => {
+    const f = fixture();
+    const request = f.request;
+    f.request = async (url, options) => url.endsWith(path)
+      ? new Response(JSON.stringify({ message: `Cannot GET ${path}` }), { status: 404 })
+      : request(url, options);
+    await assert.rejects(release(f), /salary-expenses.*expected 401, received 404/);
+    assert.ok(!f.calls.some((args) => args.includes('update-traffic')));
+  });
+}
