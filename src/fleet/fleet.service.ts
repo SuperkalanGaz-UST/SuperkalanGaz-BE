@@ -33,8 +33,8 @@ import { TraccarClient } from './traccar/traccar.client';
  * Fleet roster (Fleet module). This slice is minimal: list the caller's branch
  * riders for the dispatch dropdown, an internal lookup the SRD service reuses
  * to validate a rider at dispatch time, and optional server-side Traccar
- * provisioning after vehicle registration. Live position ingestion remains a separate,
- * hardware-dependent Fleet slice.
+ * provisioning after vehicle registration. GpsMileageService materializes bounded,
+ * request-bound Traccar mileage; live map ingestion remains a separate Fleet slice.
  *
  * All scoping derives from the verified Principal, never from request input
  * (AGENTS.md §5). Isolation is enforced here in the application layer, not by the
@@ -613,8 +613,8 @@ export class FleetService {
   }
 
   /** The caller's branch vehicle roster (story BM-042), plate order. */
-  async listVehiclesForBranch(principal: Principal): Promise<Vehicle[]> {
-    const branchIds = this.requireBranches(principal);
+  async listVehiclesForBranch(principal: Principal, requestedBranchId?: string): Promise<Vehicle[]> {
+    const branchIds = this.scopedBranchIds(principal, requestedBranchId);
     return this.vehicles.find({
       where: { branchId: In(branchIds) },
       order: { plateNumber: 'ASC' },
@@ -654,8 +654,8 @@ export class FleetService {
 
   /** A single vehicle, scoped to the caller's branch(es). 404 if unknown or
    * out-of-branch — never distinguishes the two to the caller. */
-  async getVehicle(principal: Principal, vehicleId: string): Promise<Vehicle> {
-    const branchIds = this.requireBranches(principal);
+  async getVehicle(principal: Principal, vehicleId: string, requestedBranchId?: string): Promise<Vehicle> {
+    const branchIds = this.scopedBranchIds(principal, requestedBranchId);
     const vehicle = await this.vehicles.findOne({
       where: { id: vehicleId, branchId: In(branchIds) },
     });
@@ -668,8 +668,9 @@ export class FleetService {
   async listMaintenanceLogs(
     principal: Principal,
     vehicleId: string,
+    requestedBranchId?: string,
   ): Promise<VehicleMaintenanceLog[]> {
-    const branchIds = this.requireBranches(principal);
+    const branchIds = this.scopedBranchIds(principal, requestedBranchId);
     return this.maintenanceLogs.find({
       where: { vehicleId, branchId: In(branchIds) },
       order: { loggedAt: 'DESC' },
@@ -695,63 +696,82 @@ export class FleetService {
     dto: LogMileageDto,
   ): Promise<Vehicle> {
     const branchIds = this.requireBranches(principal);
-    const vehicle = await this.vehicles.findOne({
-      where: { id: vehicleId, branchId: In(branchIds) },
-    });
-    if (!vehicle) throw new NotFoundException('Vehicle not found');
-    if (dto.odometerKm < vehicle.currentOdometerKm) {
-      throw new BadRequestException(
-        'Odometer reading cannot be lower than the current reading',
-      );
-    }
+    return this.vehicles.manager.transaction(async (manager) => {
+      const vehicles = manager.getRepository(Vehicle);
+      const riders = manager.getRepository(Rider);
+      const maintenanceLogs = manager.getRepository(VehicleMaintenanceLog);
+      const vehicle = await vehicles.findOne({
+        where: { id: vehicleId, branchId: In(branchIds) },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!vehicle) throw new NotFoundException('Vehicle not found');
+      if (dto.odometerKm < vehicle.currentOdometerKm) {
+        throw new BadRequestException(
+          'Odometer reading cannot be lower than the current reading',
+        );
+      }
 
-    const branch = await this.branches.findOne({ where: { id: vehicle.branchId } });
-    const threshold = branch?.maintenanceThresholdKm ?? 3000;
-    const dueForMaintenance = dto.odometerKm - vehicle.lastPmsOdometerKm >= threshold;
-    const now = new Date();
+      const branch = await manager.getRepository(Branch).findOne({ where: { id: vehicle.branchId } });
+      const threshold = branch?.maintenanceThresholdKm ?? 3000;
+      const dueForMaintenance = dto.odometerKm - vehicle.lastPmsOdometerKm >= threshold;
+      const now = new Date();
 
-    const result = await this.vehicles.update(
-      { id: vehicle.id, currentOdometerKm: LessThanOrEqual(dto.odometerKm) },
-      {
-        currentOdometerKm: dto.odometerKm,
-        updatedAt: now,
-        ...(dueForMaintenance ? { status: 'maintenance' } : {}),
-      },
-    );
-    if (!result.affected) {
-      throw new ConflictException(
-        'A newer odometer reading was already recorded for this vehicle',
-      );
-    }
-
-    if (dueForMaintenance && vehicle.assignedRiderId) {
-      await this.riders.update(
-        { id: vehicle.assignedRiderId, status: 'Available' },
+      const result = await vehicles.update(
+        { id: vehicle.id, branchId: vehicle.branchId, currentOdometerKm: LessThanOrEqual(dto.odometerKm) },
         {
-          status: 'Maintenance Due',
+          currentOdometerKm: dto.odometerKm,
           updatedAt: now,
-          ...this.emptyOperationalLocation(),
+          ...(dueForMaintenance ? { status: 'maintenance' } : {}),
         },
       );
-    }
+      if (!result.affected) {
+        throw new ConflictException(
+          'A newer odometer reading was already recorded for this vehicle',
+        );
+      }
 
-    const loggedAt = dto.loggedAt ? new Date(dto.loggedAt) : now;
-    await this.maintenanceLogs.save(
-      this.maintenanceLogs.create({
-        vehicleId: vehicle.id,
-        branchId: vehicle.branchId,
-        odometerKm: dto.odometerKm,
-        fuelLiters: dto.fuelLiters ?? null,
-        loggedBy: principal.userId,
-        loggedAt,
-        createdAt: now,
-      }),
-    );
+      if (dueForMaintenance && vehicle.assignedRiderId) {
+        await riders.update(
+          { id: vehicle.assignedRiderId, branchId: vehicle.branchId, status: 'Available' },
+          {
+            status: 'Maintenance Due',
+            updatedAt: now,
+            ...this.emptyOperationalLocation(),
+          },
+        );
+      }
 
-    vehicle.currentOdometerKm = dto.odometerKm;
-    vehicle.updatedAt = now;
-    if (dueForMaintenance) vehicle.status = 'maintenance';
-    return vehicle;
+      const loggedAt = dto.loggedAt ? new Date(dto.loggedAt) : now;
+      await maintenanceLogs.save(
+        maintenanceLogs.create({
+          vehicleId: vehicle.id,
+          branchId: vehicle.branchId,
+          odometerKm: dto.odometerKm,
+          fuelLiters: dto.fuelLiters ?? null,
+          loggedBy: principal.userId,
+          loggedAt,
+          createdAt: now,
+        }),
+      );
+
+      // Manual readings recalibrate the GPS cursor. Otherwise the next sync
+      // could count travel already included in this manually entered reading.
+      await manager.query(`
+        INSERT INTO fleet.vehicle_gps_mileage AS cache (vehicle_id, branch_id, device_id, baseline_after, next_poll_at)
+        SELECT id, branch_id, traccar_device_id, clock_timestamp(), clock_timestamp()
+        FROM fleet.vehicles WHERE id = $1 AND branch_id = $2
+          AND traccar_device_id IS NOT NULL AND traccar_provisioning_status = 'provisioned'
+        ON CONFLICT (vehicle_id) DO UPDATE SET device_id = EXCLUDED.device_id,
+          total_distance_m = NULL, remainder_m = 0, position_at = NULL,
+          baseline_after = EXCLUDED.baseline_after, synced_at = NULL,
+          next_poll_at = EXCLUDED.next_poll_at, status = 'waiting', failures = 0
+        WHERE cache.branch_id = $2
+      `, [vehicle.id, vehicle.branchId]);
+      vehicle.currentOdometerKm = dto.odometerKm;
+      vehicle.updatedAt = now;
+      if (dueForMaintenance) vehicle.status = 'maintenance';
+      return vehicle;
+    });
   }
 
   /**
@@ -763,31 +783,36 @@ export class FleetService {
    */
   async resetPms(principal: Principal, vehicleId: string): Promise<Vehicle> {
     const branchIds = this.requireBranches(principal);
-    const vehicle = await this.vehicles.findOne({
-      where: { id: vehicleId, branchId: In(branchIds) },
-    });
-    if (!vehicle) throw new NotFoundException('Vehicle not found');
+    return this.vehicles.manager.transaction(async (manager) => {
+      const vehicles = manager.getRepository(Vehicle);
+      const riders = manager.getRepository(Rider);
+      const vehicle = await vehicles.findOne({
+        where: { id: vehicleId, branchId: In(branchIds) },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!vehicle) throw new NotFoundException('Vehicle not found');
 
-    const now = new Date();
-    const result = await this.vehicles.update(
-      { id: vehicle.id, status: 'maintenance' },
-      { lastPmsOdometerKm: vehicle.currentOdometerKm, status: 'active', updatedAt: now },
-    );
-    if (!result.affected) {
-      throw new ConflictException('Vehicle is not currently flagged for maintenance');
-    }
-
-    if (vehicle.assignedRiderId) {
-      await this.riders.update(
-        { id: vehicle.assignedRiderId, status: 'Maintenance Due' },
-        { status: 'Available', updatedAt: now },
+      const now = new Date();
+      const result = await vehicles.update(
+        { id: vehicle.id, branchId: vehicle.branchId, status: 'maintenance' },
+        { lastPmsOdometerKm: vehicle.currentOdometerKm, status: 'active', updatedAt: now },
       );
-    }
+      if (!result.affected) {
+        throw new ConflictException('Vehicle is not currently flagged for maintenance');
+      }
 
-    vehicle.lastPmsOdometerKm = vehicle.currentOdometerKm;
-    vehicle.status = 'active';
-    vehicle.updatedAt = now;
-    return vehicle;
+      if (vehicle.assignedRiderId) {
+        await riders.update(
+          { id: vehicle.assignedRiderId, branchId: vehicle.branchId, status: 'Maintenance Due' },
+          { status: 'Available', updatedAt: now },
+        );
+      }
+
+      vehicle.lastPmsOdometerKm = vehicle.currentOdometerKm;
+      vehicle.status = 'active';
+      vehicle.updatedAt = now;
+      return vehicle;
+    });
   }
 
   /** Resolve rider names by id (no branch filter — callers already scoped the

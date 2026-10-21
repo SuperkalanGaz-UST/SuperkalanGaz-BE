@@ -16,6 +16,7 @@ import { Vehicle } from './vehicle.entity';
 import { VehicleMaintenanceLog } from './vehicle-maintenance-log.entity';
 import { VehiclesController } from './vehicles.controller';
 import { TraccarClient } from './traccar/traccar.client';
+import { GpsMileageService } from './traccar/gps-mileage.service';
 
 /**
  * Fleet module (rider roster + dispatch validation, and vehicle mileage/PMS
@@ -44,7 +45,7 @@ import { TraccarClient } from './traccar/traccar.client';
     DeliveryRiderInvitationsController,
     DeliveryRiderController,
   ],
-  providers: [FleetService, TraccarClient, DeliveryRiderInvitationsService],
+  providers: [FleetService, TraccarClient, GpsMileageService, DeliveryRiderInvitationsService],
   exports: [FleetService],
 })
 export class FleetModule {}

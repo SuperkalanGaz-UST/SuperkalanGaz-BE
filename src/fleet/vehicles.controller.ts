@@ -1,25 +1,26 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { ConnectVehicleGpsDto } from './dto/connect-vehicle-gps.dto';
 import { CreateVehicleDto } from './dto/create-vehicle.dto';
+import { VehicleBranchQuery } from './dto/vehicle-branch.query';
 import { LogMileageDto } from './dto/log-mileage.dto';
 import { FleetService } from './fleet.service';
 import { Vehicle } from './vehicle.entity';
 import { VehicleMaintenanceLog } from './vehicle-maintenance-log.entity';
+import { GpsMileageService, GpsMileageInfo } from './traccar/gps-mileage.service';
 
 /**
- * Vehicle roster + mileage/PMS tracking (story BM-US-09). Branch Manager only —
- * unlike /riders/:id, there is no customer-facing use case here, so this
- * controller never widens @Roles beyond the class-level 'branch-manager'.
+ * Vehicle roster and history are view-only for Branch Owners in their selected
+ * live branch. The class-level Branch Manager restriction remains on every write.
  */
 @Controller('vehicles')
 @UseGuards(AuthGuard, RolesGuard)
 @Roles('branch-manager')
 export class VehiclesController {
-  constructor(private readonly fleet: FleetService) {}
+  constructor(private readonly fleet: FleetService, private readonly gpsMileage: GpsMileageService) {}
 
   @Post()
   async create(
@@ -35,30 +36,43 @@ export class VehiclesController {
   }
 
   @Get()
+  @Roles('branch-manager', 'branch-owner')
   async list(
     @CurrentPrincipal() principal: Principal,
-  ): Promise<{ vehicles: ReturnType<VehiclesController['toRow']>[] }> {
-    const vehicles = await this.fleet.listVehiclesForBranch(principal);
+    @Query() query: VehicleBranchQuery,
+  ): Promise<{ vehicles: ReturnType<VehiclesController['toRow']>[]; gps_refresh_interval_ms: number }> {
+    // Owner reads use saved mileage; they do not trigger operational telemetry writes.
+    const mileage = principal.role === 'branch-manager'
+      ? await this.gpsMileage.refresh(principal)
+      : null;
+    const vehicles = await this.fleet.listVehiclesForBranch(principal, query.branchId);
     const [riderNames, thresholds] = await Promise.all([
       this.fleet.riderNamesFor(this.assignedRiderIds(vehicles)),
       this.fleet.maintenanceThresholdsForBranches([...new Set(vehicles.map((v) => v.branchId))]),
     ]);
-    return { vehicles: vehicles.map((v) => this.toRow(v, riderNames, thresholds)) };
+    return {
+      vehicles: vehicles.map((v) => this.toRow(v, riderNames, thresholds, mileage ? (mileage.get(v.id) ?? {
+        status: this.gpsMileage.enabled ? 'waiting' : 'disabled', position_at: null, synced_at: null,
+      }) : undefined)),
+      gps_refresh_interval_ms: this.gpsMileage.intervalMs,
+    };
   }
 
   @Get(':id')
+  @Roles('branch-manager', 'branch-owner')
   async detail(
     @CurrentPrincipal() principal: Principal,
     @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: VehicleBranchQuery,
   ): Promise<{
     vehicle: ReturnType<VehiclesController['toRow']>;
     maintenanceLogs: ReturnType<VehiclesController['toLogRow']>[];
   }> {
-    const vehicle = await this.fleet.getVehicle(principal, id);
+    const vehicle = await this.fleet.getVehicle(principal, id, query.branchId);
     const [riderNames, thresholds, logs] = await Promise.all([
       this.fleet.riderNamesFor(this.assignedRiderIds([vehicle])),
       this.fleet.maintenanceThresholdsForBranches([vehicle.branchId]),
-      this.fleet.listMaintenanceLogs(principal, id),
+      this.fleet.listMaintenanceLogs(principal, id, query.branchId),
     ]);
     return {
       vehicle: this.toRow(vehicle, riderNames, thresholds),
@@ -131,6 +145,7 @@ export class VehiclesController {
     vehicle: Vehicle,
     riderNames: Map<string, string>,
     thresholds: Map<string, number>,
+    gpsMileage?: GpsMileageInfo,
   ) {
     return {
       id: vehicle.id,
@@ -145,6 +160,7 @@ export class VehiclesController {
       gps_provisioning_status: vehicle.traccarProvisioningStatus,
       gps_provisioning_error: vehicle.traccarProvisioningError,
       gps_provisioned_at: vehicle.traccarProvisionedAt,
+      gps_mileage: gpsMileage ?? null,
       current_odometer_km: vehicle.currentOdometerKm,
       last_pms_odometer_km: vehicle.lastPmsOdometerKm,
       km_since_last_pms: vehicle.currentOdometerKm - vehicle.lastPmsOdometerKm,
