@@ -60,8 +60,8 @@ export class Vehicle {
   @Column({ name: 'traccar_provisioned_at', type: 'timestamptz', nullable: true })
   traccarProvisionedAt!: Date | null;
 
-  /** Latest logged odometer reading. Advances only via logMileage's race-safe
-   * conditional update — never decreases. */
+  /** Entered odometer plus accepted Traccar distance deltas. Manual readings,
+   * GPS sync and PMS reset serialize on this vehicle row; mileage never decreases. */
   @Column({ name: 'current_odometer_km', type: 'int', default: 0 })
   currentOdometerKm!: number;
 

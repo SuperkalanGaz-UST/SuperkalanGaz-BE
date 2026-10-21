@@ -18,6 +18,42 @@ describe('TraccarClient', () => {
     jest.restoreAllMocks();
   });
 
+  it('batches scoped device/position reads and accepts only matched valid distances', async () => {
+    const fetchMock = jest.spyOn(global, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify([
+        { id: 41, uniqueId: 'hardware-41', positionId: 101 },
+        { id: 42, uniqueId: 'hardware-42', positionId: 102 },
+        { id: 99, uniqueId: 'other-branch', positionId: 999 },
+      ])))
+      .mockResolvedValueOnce(new Response(JSON.stringify([
+        { id: 101, deviceId: 41, valid: true, fixTime: '2026-01-01T00:00:00Z', attributes: { totalDistance: 1250 } },
+        { id: 102, deviceId: 42, valid: false, fixTime: '2026-01-01T00:00:00Z', attributes: { totalDistance: 999 } },
+        { id: 999, deviceId: 99, valid: true, fixTime: '2026-01-01T00:00:00Z', attributes: { totalDistance: 5000 } },
+      ])));
+    expect(await makeClient().latestDistances([{ id: '41', uniqueId: 'hardware-41' }, { id: '42', uniqueId: 'hardware-42' }]))
+      .toEqual([{ deviceId: '41', totalDistanceM: 1250, positionAt: new Date('2026-01-01T00:00:00Z') }]);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'http://192.168.1.6:8082/api/devices?id=41&id=42',
+      'http://192.168.1.6:8082/api/positions?id=101&id=102',
+    ]);
+  });
+
+  it('does not make unfiltered requests for an empty list or a mismatched hardware ID', async () => {
+    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue(new Response(JSON.stringify([
+      { id: 41, uniqueId: 'wrong-hardware', positionId: 101 },
+    ])));
+    expect(await makeClient().latestDistances([])).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await makeClient().latestDistances([{ id: '41', uniqueId: 'hardware-41' }])).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not immediately retry mileage reads during an outage', async () => {
+    const fetchMock = jest.spyOn(global, 'fetch').mockRejectedValue(new Error('network failure'));
+    await expect(makeClient().latestDistances([{ id: '41', uniqueId: 'hardware-41' }])).rejects.toThrow('Traccar is unreachable');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('creates a Traccar device after confirming the hardware id is absent', async () => {
     const fetchMock = jest
       .spyOn(global, 'fetch')

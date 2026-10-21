@@ -1,5 +1,5 @@
 import { ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
-import { Repository } from 'typeorm';
+import { EntityManager, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
 import { CimService } from '../cim/cim.service';
@@ -110,7 +110,23 @@ describe('FleetService', () => {
     traccar = makeTraccar(),
     serviceRequestRepo = makeServiceRequestRepo(),
     cim = makeCim(),
-  ) => new FleetService(
+  ) => {
+    // Transactions reuse these repository fakes for unit coverage.
+    const manager = {
+      getRepository: jest.fn((entity: unknown) => {
+        if (entity === Vehicle) return vehicleRepo;
+        if (entity === Rider) return riderRepo;
+        if (entity === Branch) return branchRepo;
+        if (entity === VehicleMaintenanceLog) return logRepo;
+        throw new Error('Unexpected repository');
+      }),
+      query: jest.fn().mockResolvedValue([]),
+    };
+    Object.defineProperty(vehicleRepo, 'manager', {
+      value: { transaction: (work: (value: EntityManager) => Promise<unknown>) => work(manager as unknown as EntityManager) },
+      configurable: true,
+    });
+    return new FleetService(
     riderRepo,
     vehicleRepo,
     logRepo,
@@ -118,7 +134,8 @@ describe('FleetService', () => {
     traccar,
     serviceRequestRepo,
     cim,
-  );
+    );
+  };
 
   const principal = (branchIds: string[]): Principal => ({
     userId: 'user-1',
@@ -139,6 +156,57 @@ describe('FleetService', () => {
     role: 'driver',
     branches: ['Alpha'],
     branchIds,
+  });
+
+  describe('Branch Owner vehicle visibility', () => {
+    it('requires an explicit selection for multi-branch owners before any read', async () => {
+      const vehicleRepo = makeVehicleRepo();
+      const logRepo = makeLogRepo();
+      const service = makeService(makeRiderRepo(), vehicleRepo, logRepo);
+      const owner = branchOwnerPrincipal(['branch-uuid-1', 'branch-uuid-2']);
+      await expect(service.listVehiclesForBranch(owner)).rejects.toThrow(ForbiddenException);
+      await expect(service.getVehicle(owner, 'vehicle-1')).rejects.toThrow(ForbiddenException);
+      await expect(service.listMaintenanceLogs(owner, 'vehicle-1')).rejects.toThrow(ForbiddenException);
+      expect(vehicleRepo.find).not.toHaveBeenCalled();
+      expect(vehicleRepo.findOne).not.toHaveBeenCalled();
+      expect(logRepo.find).not.toHaveBeenCalled();
+    });
+
+    it('narrows roster, detail, and history queries to the selected authorized UUID', async () => {
+      const vehicleRepo = makeVehicleRepo();
+      const logRepo = makeLogRepo();
+      const service = makeService(makeRiderRepo(), vehicleRepo, logRepo);
+      const owner = branchOwnerPrincipal(['branch-uuid-1', 'branch-uuid-2']);
+      await service.listVehiclesForBranch(owner, 'branch-uuid-2');
+      await service.getVehicle(owner, 'vehicle-1', 'branch-uuid-2');
+      await service.listMaintenanceLogs(owner, 'vehicle-1', 'branch-uuid-2');
+      for (const mock of [vehicleRepo.find, vehicleRepo.findOne, logRepo.find]) {
+        expect(mock).toHaveBeenCalledWith(expect.objectContaining({
+          where: expect.objectContaining({ branchId: expect.objectContaining({ _value: ['branch-uuid-2'] }) }),
+        }));
+      }
+    });
+
+    it('rejects an unowned or reassigned branch for every vehicle read', async () => {
+      const vehicleRepo = makeVehicleRepo();
+      const logRepo = makeLogRepo();
+      const service = makeService(makeRiderRepo(), vehicleRepo, logRepo);
+      const owner = branchOwnerPrincipal(['branch-uuid-1']);
+      await expect(service.listVehiclesForBranch(owner, 'branch-uuid-2')).rejects.toThrow(ForbiddenException);
+      await expect(service.getVehicle(owner, 'vehicle-1', 'branch-uuid-2')).rejects.toThrow(ForbiddenException);
+      await expect(service.listMaintenanceLogs(owner, 'vehicle-1', 'branch-uuid-2')).rejects.toThrow(ForbiddenException);
+      expect(vehicleRepo.find).not.toHaveBeenCalled();
+      expect(vehicleRepo.findOne).not.toHaveBeenCalled();
+      expect(logRepo.find).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 when the requested vehicle is absent from the selected branch', async () => {
+      const vehicleRepo = makeVehicleRepo();
+      vehicleRepo.findOne.mockResolvedValue(null);
+      const service = makeService(makeRiderRepo(), vehicleRepo);
+      await expect(service.getVehicle(branchOwnerPrincipal(['branch-uuid-1']), 'other-vehicle', 'branch-uuid-1'))
+        .rejects.toThrow(NotFoundException);
+    });
   });
 
   it('returns the rider assignment on the mobile dashboard after dispatch', async () => {
@@ -702,7 +770,7 @@ describe('FleetService', () => {
     expect((patch as Partial<Vehicle>).status).toBe('maintenance');
     // Rider pulled out of the Available pool.
     const [riderCriteria, riderPatch] = riderRepo.update.mock.calls[0];
-    expect(riderCriteria).toEqual({ id: 'rider-1', status: 'Available' });
+    expect(riderCriteria).toEqual({ id: 'rider-1', branchId: 'branch-uuid-1', status: 'Available' });
     expect((riderPatch as Partial<Rider>).status).toBe('Maintenance Due');
     expect(logRepo.save).toHaveBeenCalledTimes(1);
   });

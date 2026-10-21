@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { DistanceReading } from './gps-mileage';
 
 export interface TraccarDevice {
   id: number;
@@ -23,6 +24,49 @@ class TraccarRequestError extends Error {
 @Injectable()
 export class TraccarClient {
   constructor(private readonly config: ConfigService) {}
+
+  /** Two bounded batch reads, only for server-resolved devices. Fetch device
+   * position IDs first: /positions?deviceId is singular, not a batch filter.
+   * Never fall back to an unfiltered all-device request. */
+  async latestDistances(devices: { id: string; uniqueId: string }[]): Promise<DistanceReading[]> {
+    if (devices.length === 0) return [];
+    if (devices.length > 100 || devices.some(({ id }) => !/^[1-9]\d*$/.test(id))) {
+      throw new TraccarRequestError('Invalid device batch', false);
+    }
+    const expected = new Map(devices.map((device) => [device.id, device.uniqueId]));
+    const deviceQuery = new URLSearchParams(devices.map(({ id }): [string, string] => ['id', id]));
+    const rows = await this.request<unknown>(`/api/devices?${deviceQuery}`, { method: 'GET' }, 2000);
+    if (!Array.isArray(rows)) throw new TraccarRequestError('Invalid device response', false);
+    const positionIds = new Map<string, string>();
+    for (const value of rows) {
+      if (!value || typeof value !== 'object') continue;
+      const row = value as Record<string, unknown>;
+      if (
+        Number.isSafeInteger(row.id) && expected.get(String(row.id)) === row.uniqueId &&
+        Number.isSafeInteger(row.positionId) && Number(row.positionId) > 0
+      ) positionIds.set(String(row.positionId), String(row.id));
+    }
+    if (positionIds.size === 0) return [];
+    const query = new URLSearchParams([...positionIds.keys()].map((id): [string, string] => ['id', id]));
+    const positions = await this.request<unknown>(`/api/positions?${query}`, { method: 'GET' }, 2000);
+    if (!Array.isArray(positions)) throw new TraccarRequestError('Invalid position response', false);
+    const readings: DistanceReading[] = [];
+    for (const value of positions) {
+      if (!value || typeof value !== 'object') continue;
+      const row = value as Record<string, unknown>;
+      const attributes = row.attributes as Record<string, unknown> | null;
+      const distance = attributes?.totalDistance;
+      const deviceId = String(row.deviceId);
+      const positionAt = typeof row.fixTime === 'string' ? new Date(row.fixTime) : new Date(NaN);
+      if (
+        positionIds.get(String(row.id)) !== deviceId || !expected.has(deviceId) ||
+        row.valid !== true || typeof distance !== 'number' || !Number.isFinite(distance) ||
+        distance < 0 || distance >= 1e12 || !Number.isFinite(positionAt.getTime())
+      ) continue;
+      readings.push({ deviceId, totalDistanceM: distance, positionAt });
+    }
+    return readings;
+  }
 
   /** Lookup-before-create makes a retry safe when the first POST succeeded in
    * Traccar but its response was lost to a timeout. */
@@ -87,10 +131,10 @@ export class TraccarClient {
     return device;
   }
 
-  private async request<T>(path: string, init: RequestInit): Promise<T> {
+  private async request<T>(path: string, init: RequestInit, timeoutLimitMs = 30_000): Promise<T> {
     const baseUrl = this.requiredSetting('TRACCAR_BASE_URL').replace(/\/$/, '');
     const token = this.requiredSetting('TRACCAR_TOKEN');
-    const timeoutMs = this.integerSetting('TRACCAR_TIMEOUT_MS', 5000, 500, 30000);
+    const timeoutMs = Math.min(this.integerSetting('TRACCAR_TIMEOUT_MS', 5000, 500, 30000), timeoutLimitMs);
 
     try {
       const response = await fetch(`${baseUrl}${path}`, {
