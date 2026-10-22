@@ -1,7 +1,8 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, IsNull, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
+import { Branch } from '../branches/branch.entity';
 import { LpgProduct } from '../prices/lpg-product.entity';
 import { PricesService } from '../prices/prices.service';
 import { IntakeStockDto } from './dto/intake-stock.dto';
@@ -57,6 +58,27 @@ export class InventoryService {
       }
     }
     return views;
+  }
+
+  async listForOwner(principal: Principal, branchId: string): Promise<StockLevelView[]> {
+    if (principal.role !== 'branch-owner') {
+      throw new ForbiddenException('Only Branch Owners can access this inventory view');
+    }
+    if (!branchId) throw new BadRequestException('Select a branch to load its inventory');
+    if (!principal.branchIds.includes(branchId)) {
+      throw new ForbiddenException('Branch is outside your authorized scope');
+    }
+
+    // Check live ownership as well as claim membership, including legacy sessions
+    // whose branch scope AuthGuard resolved from branch names rather than UUIDs.
+    const branch = await this.stockLevels.manager.getRepository(Branch).findOne({
+      where: { id: branchId, ownerId: principal.userId, status: 'active' },
+      select: { id: true },
+    });
+    if (!branch) throw new ForbiddenException('Branch is outside your authorized scope');
+
+    // Reuse the Manager's stock/catalog merge, narrowed to exactly this branch.
+    return this.listForBranch({ ...principal, branchIds: [branchId] });
   }
 
   async logStockCheck(principal: Principal): Promise<void> {
