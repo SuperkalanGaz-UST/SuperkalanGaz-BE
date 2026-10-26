@@ -9,6 +9,23 @@ describe('GoTrueAdminService', () => {
     jest.restoreAllMocks();
   });
 
+  it('exchanges a password using the public Auth key and returns only session tokens', async () => {
+    const fetchMock: jest.MockedFunction<typeof fetch> = jest.fn().mockResolvedValue(
+      new Response(JSON.stringify({ access_token: 'access', refresh_token: 'refresh', user: { email: 'private@example.com' } }), { status: 200 }),
+    );
+    global.fetch = fetchMock;
+    const service = new GoTrueAdminService({
+      get: jest.fn((key: string) => key === 'SUPABASE_PUBLISHABLE_KEY' ? 'sb_publishable_test' : undefined),
+      getOrThrow: jest.fn((key: string) => key === 'SUPABASE_URL' ? 'https://project.supabase.co' : 'sb_secret_test'),
+    } as unknown as ConfigService);
+    expect(await service.signInWithPassword('private@example.com', 'secret')).toEqual({ access_token: 'access', refresh_token: 'refresh' });
+    expect(fetchMock).toHaveBeenCalledWith('https://project.supabase.co/auth/v1/token?grant_type=password', expect.objectContaining({
+      method: 'POST',
+      headers: expect.objectContaining({ apikey: 'sb_publishable_test' }),
+      body: JSON.stringify({ email: 'private@example.com', password: 'secret' }),
+    }));
+  });
+
   it('sends an Auth invitation with a redirect and no protected role in user metadata', async () => {
     const fetchMock: jest.MockedFunction<typeof fetch> = jest.fn();
     fetchMock.mockResolvedValue(

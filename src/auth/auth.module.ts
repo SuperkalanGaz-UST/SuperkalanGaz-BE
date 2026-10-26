@@ -8,6 +8,7 @@ import { AuthGuard } from './auth.guard';
 import { CustomerBootstrapGuard } from './customer-bootstrap.guard';
 import { RolesGuard } from './roles.guard';
 import { SupabaseJwtService } from './supabase-jwt.service';
+import { StaffLoginService } from './staff-login.service';
 
 @Module({
   // Branch is registered so the guard can validate protected branch UUID claims
@@ -16,6 +17,7 @@ import { SupabaseJwtService } from './supabase-jwt.service';
   controllers: [AuthController],
   providers: [
     AuthRegistrationService,
+    StaffLoginService,
     SupabaseJwtService,
     GoTrueAdminService,
     AuthGuard,

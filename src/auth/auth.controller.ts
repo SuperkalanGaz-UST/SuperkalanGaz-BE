@@ -1,17 +1,17 @@
-import { Body, Controller, HttpCode, Post } from '@nestjs/common';
+import { Body, Controller, Header, HttpCode, Post } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import { AuthRegistrationService } from './auth-registration.service';
 import { RegisterDto } from './dto/register.dto';
 import { ResendSignUpCodeDto } from './dto/resend-sign-up-code.dto';
+import { StaffLoginDto } from './dto/staff-login.dto';
+import { StaffLoginService } from './staff-login.service';
 
-/** M3 fix: these are unauthenticated and trigger OTP email/SMS sends, so a
- * much tighter limit than the app-wide default applies — a legitimate caller
- * never needs more than a handful of these per minute. */
+/** Public account/credential endpoints need a tighter limit than dashboard reads. */
 const PUBLIC_AUTH_THROTTLE = { default: { limit: 5, ttl: 60_000 } };
 
 /**
  * Public auth endpoints that do NOT require a Bearer token.
- * Currently: customer self-registration via the mobile app.
+ * Customer self-registration and the website's staff username sign-in.
  *
  * Registration stays behind NestJS: the service starts Supabase's signup flow
  * (which delivers the OTP) and then uses the Admin API to attach the protected
@@ -19,7 +19,18 @@ const PUBLIC_AUTH_THROTTLE = { default: { limit: 5, ttl: 60_000 } };
  */
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly registrations: AuthRegistrationService) {}
+  constructor(
+    private readonly registrations: AuthRegistrationService,
+    private readonly staffLogin: StaffLoginService,
+  ) {}
+
+  @Post('staff/sign-in')
+  @HttpCode(200)
+  @Header('Cache-Control', 'no-store')
+  @Throttle(PUBLIC_AUTH_THROTTLE)
+  signInStaff(@Body() dto: StaffLoginDto) {
+    return this.staffLogin.signIn(dto.username, dto.password);
+  }
 
   /**
    * POST /api/auth/register

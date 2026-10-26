@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -135,15 +136,27 @@ export class UsersService {
     dto: UpdateOwnProfileDto,
   ): Promise<OwnProfile> {
     const target = this.ownProfileFromPrincipal(principal);
+    if (dto.username !== undefined) {
+      const username = dto.username.trim().toLowerCase();
+      const users = await this.goTrue.listUsers();
+      if (users.some((user) =>
+        user.id !== principal.userId &&
+        typeof user.app_metadata.username === 'string' &&
+        user.app_metadata.username.trim().toLowerCase() === username,
+      )) {
+        throw new ConflictException('This username is already in use. Choose another username.');
+      }
+      dto.username = username;
+    }
     // Only self-service fields go in this write. role/branch_ids/branches/status
     // must NEVER be re-derived from the token and written back here: the token
     // can be stale (issued before an admin demoted/deactivated this user), and
     // doing so would silently resurrect revoked access on every profile save
     // (H1 fix — this endpoint is reachable by every role on every save).
     const nextMetadata: Record<string, unknown> = {
-      username: target.username,
-      display_name: dto.name ?? target.displayName,
-      phone: dto.phone !== undefined ? dto.phone : target.phone,
+      ...(dto.username !== undefined ? { username: dto.username } : {}),
+      ...(dto.name !== undefined ? { display_name: dto.name } : {}),
+      ...(dto.phone !== undefined ? { phone: dto.phone } : {}),
     };
 
     await this.goTrue.updateUser(principal.userId, {
@@ -153,6 +166,7 @@ export class UsersService {
 
     return {
       ...target,
+      username: dto.username ?? target.username,
       email: dto.email ?? target.email,
       displayName: dto.name ?? target.displayName,
       phone: dto.phone !== undefined ? dto.phone : target.phone,
