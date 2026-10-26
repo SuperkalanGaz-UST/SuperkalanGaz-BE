@@ -32,17 +32,33 @@ export class FleetController {
   async list(
     @CurrentPrincipal() principal: Principal,
     @Query() query: ListRidersQuery,
-  ): Promise<{ riders: ReturnType<FleetController['toRow']>[] }> {
+  ) {
     const rows = await this.fleet.listForBranch(principal, query);
-    const currentOrders = await this.fleet.currentOrdersForRiders(rows);
+    const [currentOrders, assignedVehicles] = await Promise.all([
+      this.fleet.currentOrdersForRiders(rows),
+      principal.role === 'branch-manager'
+        ? this.fleet.assignedVehiclesForRiders(rows)
+        : Promise.resolve(null),
+    ]);
     return {
-      riders: rows.map((r) => ({
-        ...this.toRow(r),
-        current_order: currentOrders.get(r.id) ?? null,
-        ...(principal.role === 'branch-manager'
-          ? { operational_location: this.fleet.operationalLocationFor(r) }
-          : {}),
-      })),
+      riders: rows.map((r) => {
+        const vehicle = assignedVehicles?.get(r.id);
+        return {
+          ...this.toRow(r),
+          current_order: currentOrders.get(r.id) ?? null,
+          ...(principal.role === 'branch-manager'
+            ? {
+                operational_location: this.fleet.operationalLocationFor(r),
+                // Association only: hardware coordinates/IDs stay on the vehicle path.
+                assigned_vehicle: vehicle ? {
+                  id: vehicle.id,
+                  plate_number: vehicle.plateNumber,
+                  status: vehicle.status,
+                } : null,
+              }
+            : {}),
+        };
+      }),
     };
   }
 

@@ -1,5 +1,5 @@
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
-import { Repository } from 'typeorm';
+import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { In, IsNull, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { LpgProduct } from '../prices/lpg-product.entity';
 import { PricesService } from '../prices/prices.service';
@@ -18,7 +18,8 @@ describe('InventoryService', () => {
       ...overrides,
     }) as LpgProduct;
 
-  const makeRepo = (opts?: { found?: StockLevel[]; findOneResult?: StockLevel }) => {
+  const makeRepo = (opts?: { found?: StockLevel[]; findOneResult?: StockLevel; owned?: boolean }) => {
+    const branches = { findOne: jest.fn().mockResolvedValue(opts?.owned === false ? null : { id: 'branch-2' }) };
     const insertQb = {
       into: jest.fn().mockReturnThis(),
       values: jest.fn().mockReturnThis(),
@@ -30,7 +31,10 @@ describe('InventoryService', () => {
       insert: jest.fn().mockResolvedValue({}),
     };
     const repo = {
-      manager: { transaction: jest.fn(async (work: (value: typeof manager) => Promise<void>) => work(manager)) },
+      manager: {
+        transaction: jest.fn(async (work: (value: typeof manager) => Promise<void>) => work(manager)),
+        getRepository: jest.fn(() => branches),
+      },
       find: jest.fn(() => Promise.resolve(opts?.found ?? [])),
       findOneByOrFail: jest.fn(() =>
         Promise.resolve(
@@ -47,7 +51,7 @@ describe('InventoryService', () => {
       ),
       createQueryBuilder: jest.fn(() => ({ insert: jest.fn(() => insertQb) })),
     } as unknown as jest.Mocked<Repository<StockLevel>>;
-    return { repo, insertQb, manager };
+    return { repo, insertQb, manager, branches };
   };
 
   const makePrices = (products: LpgProduct[]) =>
@@ -108,6 +112,64 @@ describe('InventoryService', () => {
       const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
 
       await expect(service.listForBranch(principal([]))).rejects.toThrow(ForbiddenException);
+    });
+  });
+
+  describe('listForOwner', () => {
+    const owner = (): Principal => ({
+      userId: 'owner-1', role: 'branch-owner', branches: ['Alpha', 'Beta'],
+      branchIds: ['branch-1', 'branch-2'],
+    });
+
+    it('reads only the selected owned branch through the same stock/catalog merge without writes', async () => {
+      const { repo, branches, insertQb } = makeRepo({ found: [{
+        id: 'stock-2', branchId: 'branch-2', productId: 'product-11kg',
+        currentQty: 42, thresholdQty: 8, capacityQty: 60,
+      } as StockLevel] });
+      const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
+      const views = await service.listForOwner(owner(), 'branch-2');
+
+      expect(branches.findOne).toHaveBeenCalledWith({
+        where: { id: 'branch-2', ownerId: 'owner-1', status: 'active' }, select: { id: true },
+      });
+      expect(repo.find).toHaveBeenCalledWith({
+        where: { branchId: In(['branch-2']), deletedAt: IsNull() },
+      });
+      expect(views).toEqual([expect.objectContaining({
+        branchId: 'branch-2', currentQty: 42, thresholdQty: 8, capacityQty: 60,
+      })]);
+      expect(repo.manager.transaction).not.toHaveBeenCalled();
+      expect(insertQb.execute).not.toHaveBeenCalled();
+    });
+
+    it('does not default even a single-branch Owner when branchId is missing', async () => {
+      const { repo, branches } = makeRepo();
+      const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
+      await expect(service.listForOwner({ ...owner(), branchIds: ['branch-1'] }, '')).rejects.toThrow(BadRequestException);
+      expect(branches.findOne).not.toHaveBeenCalled();
+      expect(repo.find).not.toHaveBeenCalled();
+    });
+
+    it('rejects a branch outside the verified claim before querying inventory', async () => {
+      const { repo, branches } = makeRepo();
+      const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
+      await expect(service.listForOwner(owner(), 'outside')).rejects.toThrow(ForbiddenException);
+      expect(branches.findOne).not.toHaveBeenCalled();
+      expect(repo.find).not.toHaveBeenCalled();
+    });
+
+    it('rejects inactive, reassigned or legacy name-scoped branches that fail live ownership', async () => {
+      const { repo } = makeRepo({ owned: false });
+      const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
+      await expect(service.listForOwner(owner(), 'branch-2')).rejects.toThrow(ForbiddenException);
+      expect(repo.find).not.toHaveBeenCalled();
+    });
+
+    it('rejects non-Owners even if their branch matches', async () => {
+      const { repo } = makeRepo();
+      const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
+      await expect(service.listForOwner(principal(), 'branch-1')).rejects.toThrow(ForbiddenException);
+      expect(repo.find).not.toHaveBeenCalled();
     });
   });
 

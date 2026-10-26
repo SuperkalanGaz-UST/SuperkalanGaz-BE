@@ -112,6 +112,28 @@ export class FleetService {
     return currentOrders;
   }
 
+  /** Read the manager's saved assignment; phone positions never identify or
+   * mutate a vehicle. Callers pass only their guard-scoped, live roster rows. */
+  async assignedVehiclesForRiders(riders: Rider[]): Promise<Map<string, Vehicle>> {
+    if (riders.length === 0) return new Map();
+    const riderBranches = new Map(riders.map(rider => [rider.id, rider.branchId]));
+    const vehicles = await this.vehicles.find({
+      where: {
+        branchId: In([...new Set(riders.map(rider => rider.branchId))]),
+        assignedRiderId: In(riders.map(rider => rider.id)),
+        status: Not('inactive'),
+      },
+    });
+    const assigned = new Map<string, Vehicle>();
+    for (const vehicle of vehicles) {
+      if (vehicle.assignedRiderId && vehicle.status !== 'inactive'
+        && riderBranches.get(vehicle.assignedRiderId) === vehicle.branchId) {
+        assigned.set(vehicle.assignedRiderId, vehicle);
+      }
+    }
+    return assigned;
+  }
+
   /** Minimal authoritative mobile workspace for an activated Delivery Rider. */
   async deliveryRiderDashboard(principal: Principal) {
     const branchId = this.requireSingleBranch(principal);
@@ -616,7 +638,8 @@ export class FleetService {
   async listVehiclesForBranch(principal: Principal, requestedBranchId?: string): Promise<Vehicle[]> {
     const branchIds = this.scopedBranchIds(principal, requestedBranchId);
     return this.vehicles.find({
-      where: { branchId: In(branchIds) },
+      // Inactive vehicles are retained as soft-archived records, not active roster entries.
+      where: { branchId: In(branchIds), status: Not('inactive') },
       order: { plateNumber: 'ASC' },
     });
   }
@@ -657,7 +680,7 @@ export class FleetService {
   async getVehicle(principal: Principal, vehicleId: string, requestedBranchId?: string): Promise<Vehicle> {
     const branchIds = this.scopedBranchIds(principal, requestedBranchId);
     const vehicle = await this.vehicles.findOne({
-      where: { id: vehicleId, branchId: In(branchIds) },
+      where: { id: vehicleId, branchId: In(branchIds), status: Not('inactive') },
     });
     if (!vehicle) throw new NotFoundException('Vehicle not found');
     return vehicle;
@@ -701,7 +724,7 @@ export class FleetService {
       const riders = manager.getRepository(Rider);
       const maintenanceLogs = manager.getRepository(VehicleMaintenanceLog);
       const vehicle = await vehicles.findOne({
-        where: { id: vehicleId, branchId: In(branchIds) },
+        where: { id: vehicleId, branchId: In(branchIds), status: Not('inactive') },
         lock: { mode: 'pessimistic_write' },
       });
       if (!vehicle) throw new NotFoundException('Vehicle not found');
@@ -787,7 +810,7 @@ export class FleetService {
       const vehicles = manager.getRepository(Vehicle);
       const riders = manager.getRepository(Rider);
       const vehicle = await vehicles.findOne({
-        where: { id: vehicleId, branchId: In(branchIds) },
+        where: { id: vehicleId, branchId: In(branchIds), status: Not('inactive') },
         lock: { mode: 'pessimistic_write' },
       });
       if (!vehicle) throw new NotFoundException('Vehicle not found');

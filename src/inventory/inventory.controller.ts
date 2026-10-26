@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
@@ -17,6 +17,16 @@ export class InventoryController {
     @CurrentPrincipal() principal: Principal,
   ): Promise<{ stockLevels: ReturnType<InventoryController['toRow']>[] }> {
     const views = await this.inventory.listForBranch(principal);
+    return { stockLevels: views.map((view) => this.toRow(view)) };
+  }
+
+  @Get('stock-levels/owner')
+  @Roles('branch-owner')
+  async listOwnerStockLevels(
+    @CurrentPrincipal() principal: Principal,
+    @Query('branchId', new ParseUUIDPipe()) branchId: string,
+  ): Promise<{ stockLevels: ReturnType<InventoryController['toRow']>[] }> {
+    const views = await this.inventory.listForOwner(principal, branchId);
     return { stockLevels: views.map((view) => this.toRow(view)) };
   }
 
