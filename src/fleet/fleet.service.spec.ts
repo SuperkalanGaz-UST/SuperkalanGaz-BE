@@ -158,6 +158,40 @@ describe('FleetService', () => {
     branchIds,
   });
 
+  describe('automatic Delivery Rider vehicle context', () => {
+    it('uses saved UUID assignments in the matching branch, never plate text or phone coordinates', async () => {
+      const rider = Object.assign(new Rider(), { id: 'rider-1', branchId: 'branch-uuid-1', plate: 'STALE PLATE' });
+      const vehicles = makeVehicleRepo();
+      vehicles.find.mockResolvedValue([
+        vehicles.__vehicle,
+        { ...vehicles.__vehicle, id: 'wrong-branch', branchId: 'branch-uuid-2' },
+        { ...vehicles.__vehicle, id: 'archived', status: 'inactive' },
+      ]);
+      const service = makeService(makeRiderRepo(), vehicles);
+      const assigned = await service.assignedVehiclesForRiders([rider]);
+      expect(vehicles.find).toHaveBeenCalledWith({
+        where: {
+          branchId: expect.objectContaining({ _value: ['branch-uuid-1'] }),
+          assignedRiderId: expect.objectContaining({ _value: ['rider-1'] }),
+          status: expect.objectContaining({ _value: 'inactive' }),
+        },
+      });
+      expect(assigned.get('rider-1')).toBe(vehicles.__vehicle);
+      expect(assigned.size).toBe(1);
+    });
+
+    it('returns no association for an unassigned rider and avoids unscoped queries for an empty roster', async () => {
+      const vehicles = makeVehicleRepo();
+      vehicles.find.mockResolvedValue([]);
+      const service = makeService(makeRiderRepo(), vehicles);
+      expect((await service.assignedVehiclesForRiders([])).size).toBe(0);
+      expect(vehicles.find).not.toHaveBeenCalled();
+      expect((await service.assignedVehiclesForRiders([
+        Object.assign(new Rider(), { id: 'rider-1', branchId: 'branch-uuid-1' }),
+      ])).size).toBe(0);
+    });
+  });
+
   describe('Branch Owner vehicle visibility', () => {
     it('requires an explicit selection for multi-branch owners before any read', async () => {
       const vehicleRepo = makeVehicleRepo();
