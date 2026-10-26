@@ -42,6 +42,11 @@ export interface GoTrueUser {
   phone_confirmed_at?: string | null;
 }
 
+export interface GoTrueSessionTokens {
+  access_token: string;
+  refresh_token: string;
+}
+
 @Injectable()
 export class GoTrueAdminService {
   private readonly authUrl: string;
@@ -137,6 +142,18 @@ export class GoTrueAdminService {
   /** Updates auth-owned fields (email / password / ban) and/or metadata. */
   async updateUser(id: string, attrs: GoTrueUserAttrs): Promise<void> {
     await this.request('PUT', `/users/${id}`, attrs);
+  }
+
+  /** Password exchanges use the public key, never admin privileges. */
+  async signInWithPassword(email: string, password: string): Promise<GoTrueSessionTokens> {
+    return this.sessionTokens(await this.authRequest('POST', '/token?grant_type=password', { email, password }));
+  }
+
+  private sessionTokens(data: Record<string, unknown>): GoTrueSessionTokens {
+    if (typeof data.access_token !== 'string' || typeof data.refresh_token !== 'string') {
+      throw new BadRequestException('Authentication did not return a session');
+    }
+    return { access_token: data.access_token, refresh_token: data.refresh_token };
   }
 
   /**

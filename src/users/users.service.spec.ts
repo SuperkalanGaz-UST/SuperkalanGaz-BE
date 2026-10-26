@@ -1,10 +1,13 @@
-import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException } from '@nestjs/common';
+import { plainToInstance } from 'class-transformer';
+import { validate } from 'class-validator';
 import { Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
 import { GovernanceAuditService } from '../governance/governance-audit.service';
 import { GoTrueAdminService, GoTrueUser } from './gotrue-admin.service';
 import { UsersService } from './users.service';
+import { UpdateOwnProfileDto } from './dto/update-own-profile.dto';
 
 /** M1: every test constructs a fresh no-op audit mock unless it asserts on it. */
 const makeAudit = () =>
@@ -39,7 +42,7 @@ describe('UsersService self-service account updates', () => {
     created_at: '2026-01-10T00:00:00.000Z',
   };
 
-  let goTrue: jest.Mocked<Pick<GoTrueAdminService, 'getUser' | 'updateUser'>>;
+  let goTrue: jest.Mocked<Pick<GoTrueAdminService, 'getUser' | 'updateUser' | 'listUsers'>>;
   const branchRepository = {
     find: jest.fn().mockResolvedValue([]),
   } as unknown as Repository<Branch>;
@@ -49,6 +52,7 @@ describe('UsersService self-service account updates', () => {
     goTrue = {
       getUser: jest.fn().mockResolvedValue(authUser),
       updateUser: jest.fn().mockResolvedValue(undefined),
+      listUsers: jest.fn().mockResolvedValue([authUser]),
     };
     service = new UsersService(
       goTrue as unknown as GoTrueAdminService,
@@ -70,7 +74,6 @@ describe('UsersService self-service account updates', () => {
     expect(goTrue.updateUser).toHaveBeenCalledWith(principal.userId, {
       email: 'franchise.admin@superkalan.com',
       app_metadata: {
-        username: 'admin',
         display_name: 'Franchise Admin',
         phone: '+639189876543',
       },
@@ -87,6 +90,38 @@ describe('UsersService self-service account updates', () => {
     });
   });
 
+  it.each<Principal['role']>(['super-admin', 'franchise-admin', 'branch-owner', 'branch-manager'])(
+    'lets %s update only its own username without rewriting stale scope', async (role) => {
+      const updated = await service.updateOwnProfile({ ...principal, role }, { username: ' New.Name ' });
+      expect(goTrue.updateUser).toHaveBeenCalledWith(principal.userId, {
+        app_metadata: { username: 'new.name' },
+      });
+      expect(updated.username).toBe('new.name');
+    },
+  );
+
+  it('reserves case-insensitive usernames even for inactive accounts', async () => {
+    goTrue.listUsers.mockResolvedValue([{ ...authUser, id: 'another-user', app_metadata: {
+      username: 'TAKEN', role: 'branch-manager', status: 'Inactive',
+    } }]);
+    await expect(service.updateOwnProfile(principal, { username: 'taken' })).rejects.toBeInstanceOf(ConflictException);
+    expect(goTrue.updateUser).not.toHaveBeenCalled();
+  });
+
+  it('does not overwrite the current username when a stale session saves another field', async () => {
+    await service.updateOwnProfile(principal, { phone: '+639189876543' });
+    expect(goTrue.updateUser).toHaveBeenCalledWith(principal.userId, {
+      app_metadata: { phone: '+639189876543' },
+    });
+    expect(goTrue.listUsers).not.toHaveBeenCalled();
+  });
+
+  it('does not write when username availability cannot be checked', async () => {
+    goTrue.listUsers.mockRejectedValue(new Error('Auth unavailable'));
+    await expect(service.updateOwnProfile(principal, { username: 'new.name' })).rejects.toThrow('Auth unavailable');
+    expect(goTrue.updateUser).not.toHaveBeenCalled();
+  });
+
   it('changes only the authenticated caller password', async () => {
     await service.changeOwnPassword(principal, 'new-password-123');
 
@@ -94,6 +129,21 @@ describe('UsersService self-service account updates', () => {
     expect(goTrue.updateUser).toHaveBeenCalledWith(principal.userId, {
       password: 'new-password-123',
     });
+  });
+});
+
+describe('self-service username validation', () => {
+  it.each(['', 'ab', 'bad name', 'bad@email.com', 'a'.repeat(65), null, 123])('rejects %p', async (username) => {
+    const errors = await validate(plainToInstance(UpdateOwnProfileDto, { username }));
+    expect(errors.some((error) => error.property === 'username')).toBe(true);
+  });
+
+  it('normalizes usernames and strips privilege changes at the request boundary', async () => {
+    const dto = plainToInstance(UpdateOwnProfileDto, {
+      username: ' New.Name_1 ', role: 'super-admin', branch_ids: ['outside'], status: 'Active',
+    });
+    expect(await validate(dto, { whitelist: true })).toEqual([]);
+    expect(dto).toEqual({ username: 'new.name_1' });
   });
 });
 
