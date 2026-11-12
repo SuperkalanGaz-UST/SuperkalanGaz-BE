@@ -467,6 +467,41 @@ describe('ServiceRequestsService', () => {
     ).rejects.toBeInstanceOf(NotFoundException);
   });
 
+  describe('franchiseSlaReport (Franchise Administrator dashboard)', () => {
+    it('summarizes SLA per active branch, including branches with no deliveries', async () => {
+      const { repo } = makeRepo();
+      const requestedAt = new Date('2026-11-02T01:00:00Z');
+      repo.find = jest.fn(() => Promise.resolve([{
+        id: 'sr-1',
+        branchId: 'branch-a',
+        orderSource: 'Walk-in/Phone',
+        requestedAt,
+        dispatchedAt: new Date(requestedAt.getTime() + 30 * 60_000),
+        inTransitAt: null,
+        deliveredAt: new Date(requestedAt.getTime() + 60 * 60_000),
+      } as ServiceRequest])) as never;
+      const branches = {
+        find: jest.fn(() => Promise.resolve([
+          { id: 'branch-a', name: 'Alpha' },
+          { id: 'branch-b', name: 'Beta' },
+        ])),
+      } as unknown as jest.Mocked<Repository<Branch>>;
+      const sla = makeSlaConfig([
+        { branchId: null, segment: 'request_to_dispatch', thresholdMinutes: 15, orderSource: 'all', isActive: true },
+      ]);
+      const service = makeService(repo, makeHistory(), makeFleet(null), makeCim(null), sla, branches);
+
+      const report = await service.franchiseSlaReport({ from: '2026-11-01', to: '2026-11-30' });
+
+      expect(branches.find).toHaveBeenCalledWith(expect.objectContaining({ where: { status: 'active' } }));
+      expect(report).toEqual([
+        expect.objectContaining({ branchId: 'branch-a', branchName: 'Alpha', totalServiceRequests: 1, breaches: 1, overallComplianceRate: 0 }),
+        expect.objectContaining({ branchId: 'branch-b', branchName: 'Beta', totalServiceRequests: 0, breaches: 0, overallComplianceRate: null }),
+      ]);
+      expect(report[0].segments.request_to_dispatch).toEqual(expect.objectContaining({ breached: 1, averageMinutes: 30 }));
+    });
+  });
+
   describe('dispatch', () => {
     it('assigns the rider, stamps dispatch, and flips the rider to On Delivery', async () => {
       const { repo, qb } = makeRepo(1);

@@ -50,6 +50,12 @@ export class ReorderRequestsService {
     private readonly inventory: InventoryService,
   ) {}
 
+  /** Read-only reorder log for the Branch Owner's explicitly selected branch. */
+  async listForOwner(principal: Principal, branchId: string): Promise<ReorderRequestView[]> {
+    await this.inventory.assertOwnedBranch(principal, branchId);
+    return this.listForBranch({ ...principal, branchIds: [branchId] });
+  }
+
   async listForBranch(principal: Principal): Promise<ReorderRequestView[]> {
     const branchIds = this.requireBranches(principal);
     const [rows, products] = await Promise.all([

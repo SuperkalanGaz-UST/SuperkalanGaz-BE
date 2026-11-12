@@ -7,7 +7,6 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { randomBytes } from 'node:crypto';
 import { DataSource, In, IsNull, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import {
@@ -40,7 +39,6 @@ interface AppliedRequestResult {
   afterState: Record<string, unknown> | null;
   affectedRecordType: string;
   affectedRecordId: string | null;
-  temporaryPassword?: string;
 }
 
 interface PricePayload {
@@ -183,10 +181,7 @@ export class GovernanceService {
     principal: Principal,
     id: string,
     dto: DecideGovernanceRequestDto,
-  ): Promise<{
-    request: GovernanceRequest;
-    temporaryPassword?: string;
-  }> {
+  ): Promise<{ request: GovernanceRequest }> {
     const current = await this.requests.findOne({ where: { id, deletedAt: IsNull() } });
     if (!current) throw new NotFoundException('Governance request not found');
     if (current.requestedBy === principal.userId) {
@@ -278,12 +273,7 @@ export class GovernanceService {
       message: `${request.title}: ${dto.reason.trim()}`,
     });
 
-    return {
-      request: saved,
-      ...(applied?.temporaryPassword
-        ? { temporaryPassword: applied.temporaryPassword }
-        : {}),
-    };
+    return { request: saved };
   }
 
   async dashboard() {
@@ -610,7 +600,8 @@ export class GovernanceService {
       case 'sla-threshold':
         return this.applySlaRequest(principal, request);
       case 'franchise-admin-account':
-        return this.applyFranchiseAdminAccount(request);
+        // decide() rejects these first; FA accounts are invitation-only (AGENTS.md §7).
+        throw new ForbiddenException('Franchise Administrator accounts are created by invitation');
       case 'branch-owner-change':
         return this.applyBranchOwnerChange(request);
       case 'branch-account':
@@ -717,51 +708,6 @@ export class GovernanceService {
         affectedRecordId: saved.id,
       };
     });
-  }
-
-  private async applyFranchiseAdminAccount(
-    request: GovernanceRequest,
-  ): Promise<AppliedRequestResult> {
-    const email = request.payload.email;
-    const name = request.payload.name;
-    const phone = request.payload.phone;
-    const username = request.payload.username;
-    if (
-      typeof email !== 'string' ||
-      typeof name !== 'string' ||
-      (phone !== undefined && phone !== null && typeof phone !== 'string') ||
-      (username !== undefined && typeof username !== 'string')
-    ) {
-      throw new BadRequestException('Invalid Franchise Administrator account payload');
-    }
-    const existing = await this.goTrue.findByEmail(email);
-    if (existing) {
-      throw new ConflictException('An account with this email already exists');
-    }
-
-    const temporaryPassword = this.generateTemporaryPassword();
-    const created = await this.goTrue.createUser({
-      email,
-      password: temporaryPassword,
-      email_confirm: true,
-      app_metadata: {
-        username: username?.trim() || email.split('@')[0],
-        display_name: name.trim(),
-        role: 'franchise-admin',
-        branch_ids: [],
-        branches: [],
-        phone: phone ?? null,
-        status: 'Active',
-        must_change_password: true,
-      },
-    });
-    return {
-      beforeState: null,
-      afterState: { id: created.id, email, name: name.trim(), status: 'Active' },
-      affectedRecordType: 'franchise-admin-account',
-      affectedRecordId: created.id,
-      temporaryPassword,
-    };
   }
 
   private async applyBranchOwnerChange(
@@ -1054,7 +1000,4 @@ export class GovernanceService {
     }
   }
 
-  private generateTemporaryPassword(): string {
-    return `SkGz-${randomBytes(8).toString('base64url')}!9`;
-  }
 }

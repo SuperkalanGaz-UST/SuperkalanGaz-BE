@@ -82,7 +82,7 @@ export class LoyaltyController {
    * current points_balance for the queue UI.
    */
   @Get('redemptions')
-  @Roles('branch-manager')
+  @Roles('branch-manager', 'branch-owner')
   async list(
     @CurrentPrincipal() principal: Principal,
     @Query() query: ListRedemptionsQuery,

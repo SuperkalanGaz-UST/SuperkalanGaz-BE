@@ -128,6 +128,11 @@ export interface SlaBranchReport {
   dailyStockCheck: DailyStockCheckMetric;
 }
 
+export interface FranchiseSlaBranchSummary extends Omit<SlaBranchReport, 'dailyStockCheck'> {
+  branchId: string;
+  branchName: string;
+}
+
 export interface BranchDashboardMetrics {
   ordersToday: number;
   totalOrders: number;
@@ -715,6 +720,51 @@ export class ServiceRequestsService {
     });
     const thresholdsByBranch = await this.resolveThresholdsForBranches(branchIds);
 
+    return {
+      ...this.summarizeSla(requests, thresholdsByBranch),
+      dailyStockCheck: await this.calculateDailyStockCheck(branchIds, start, endExclusive),
+    };
+  }
+
+  /**
+   * Cross-branch SLA compliance for the Franchise Administrator dashboard (read
+   * only, AGENTS.md §7). One summary per active branch, built with the same
+   * per-segment evaluation the Branch Owner report uses, so both screens agree.
+   */
+  async franchiseSlaReport(query: BranchReportQuery): Promise<FranchiseSlaBranchSummary[]> {
+    const { start, endExclusive } = reportRangeFrom(query);
+    const branches = await this.branches.find({
+      where: { status: 'active', ...(query.branchId ? { id: query.branchId } : {}) },
+      select: { id: true, name: true },
+    });
+    if (branches.length === 0) return [];
+    const branchIds = branches.map((branch) => branch.id);
+    const [requests, thresholdsByBranch] = await Promise.all([
+      this.serviceRequests.find({
+        where: {
+          branchId: In(branchIds),
+          deliveredAt: And(MoreThanOrEqual(start), LessThan(endExclusive)),
+          deletedAt: IsNull(),
+        },
+      }),
+      this.resolveThresholdsForBranches(branchIds),
+    ]);
+
+    const byBranch = new Map<string, ServiceRequest[]>();
+    for (const request of requests) {
+      byBranch.set(request.branchId, [...(byBranch.get(request.branchId) ?? []), request]);
+    }
+    return branches.map((branch) => ({
+      branchId: branch.id,
+      branchName: branch.name,
+      ...this.summarizeSla(byBranch.get(branch.id) ?? [], thresholdsByBranch),
+    }));
+  }
+
+  private summarizeSla(
+    requests: ServiceRequest[],
+    thresholdsByBranch: Map<string, ThresholdMap>,
+  ): Omit<SlaBranchReport, 'dailyStockCheck'> {
     const segments: SlaBranchReport['segments'] = {
       request_to_dispatch: this.emptySlaMetric(),
       dispatch_to_in_transit: this.emptySlaMetric(),
@@ -806,7 +856,6 @@ export class ServiceRequestsService {
       overallComplianceRate: this.complianceRate(withinSla, evaluatedRequests),
       segments,
       orderSources,
-      dailyStockCheck: await this.calculateDailyStockCheck(branchIds, start, endExclusive),
     };
   }
 

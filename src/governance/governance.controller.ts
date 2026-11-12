@@ -65,12 +65,7 @@ export class GovernanceController {
     @Body() dto: DecideGovernanceRequestDto,
   ) {
     const result = await this.governance.decide(principal, id, dto);
-    return {
-      request: this.toRequestRow(result.request),
-      ...(result.temporaryPassword
-        ? { temporary_password: result.temporaryPassword }
-        : {}),
-    };
+    return { request: this.toRequestRow(result.request) };
   }
 
   @Get('dashboard')

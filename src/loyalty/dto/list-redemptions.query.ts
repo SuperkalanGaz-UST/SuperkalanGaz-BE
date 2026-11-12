@@ -1,4 +1,4 @@
-import { IsIn, IsOptional } from 'class-validator';
+import { IsIn, IsOptional, IsUUID } from 'class-validator';
 
 /**
  * The queue filter values for GET /loyalty/redemptions. The five lifecycle states
@@ -40,4 +40,9 @@ export class ListRedemptionsQuery {
   @IsOptional()
   @IsIn(REDEMPTION_TRACKS as unknown as string[])
   track?: RedemptionTrack;
+
+  /** Branch Owner's selected branch; it can only narrow their verified scope. */
+  @IsOptional()
+  @IsUUID()
+  branchId?: string;
 }
