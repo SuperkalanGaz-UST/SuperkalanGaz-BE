@@ -72,7 +72,8 @@ export class StaffRegistrationService {
 
     return (await this.goTrue.listUsers())
       .filter((user) => !isBanned(user))
-      .filter((user) => user.app_metadata?.status === 'Pending' && user.app_metadata?.branch_owner_invitation !== true)
+      .filter((user) => user.app_metadata?.status === 'Pending' && user.app_metadata?.branch_owner_invitation !== true &&
+        user.app_metadata?.branch_manager_invitation !== true)
       .filter((user) => requestedRoles.has(user.app_metadata?.role as ReviewableRole))
       .map((user) => this.toRow(user))
       .sort(
@@ -108,6 +109,7 @@ export class StaffRegistrationService {
       !user ||
       isBanned(user) ||
       user.app_metadata?.status !== 'Pending' ||
+      user.app_metadata.branch_manager_invitation === true ||
       !isReviewableRole(user.app_metadata?.role)
     ) {
       throw new NotFoundException('Staff registration request not found');

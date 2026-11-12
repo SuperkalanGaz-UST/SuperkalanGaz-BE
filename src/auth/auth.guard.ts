@@ -71,7 +71,8 @@ export class AuthGuard implements CanActivate {
     }
     const allowPendingInvitation =
       (claims.role === 'franchise-admin' || claims.role === 'driver' ||
-        (claims.role === 'branch-owner' && claims.branch_owner_invitation === true)) &&
+        (claims.role === 'branch-owner' && claims.branch_owner_invitation === true) ||
+        (claims.role === 'branch-manager' && claims.branch_manager_invitation === true)) &&
       claims.status === 'Pending' &&
       this.reflector.getAllAndOverride<boolean>(ALLOW_PENDING_INVITATION_KEY, [
         context.getHandler(),
