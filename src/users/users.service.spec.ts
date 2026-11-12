@@ -1,4 +1,5 @@
 import { BadRequestException, ConflictException, ForbiddenException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { Repository } from 'typeorm';
@@ -7,11 +8,14 @@ import { Branch } from '../branches/branch.entity';
 import { GovernanceAuditService } from '../governance/governance-audit.service';
 import { GoTrueAdminService, GoTrueUser } from './gotrue-admin.service';
 import { UsersService } from './users.service';
+import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateOwnProfileDto } from './dto/update-own-profile.dto';
 
 /** M1: every test constructs a fresh no-op audit mock unless it asserts on it. */
 const makeAudit = () =>
   ({ record: jest.fn().mockResolvedValue(undefined) }) as unknown as jest.Mocked<GovernanceAuditService>;
+
+const config = new ConfigService({ WEB_ORIGIN: 'https://crm.example.invalid' });
 
 describe('UsersService self-service account updates', () => {
   const principal: Principal = {
@@ -58,6 +62,7 @@ describe('UsersService self-service account updates', () => {
       goTrue as unknown as GoTrueAdminService,
       branchRepository,
       makeAudit(),
+      config,
     );
   });
 
@@ -179,7 +184,7 @@ describe('UsersService governance boundaries', () => {
         { id: branchId, name: 'Quezon City', status: 'active' },
       ]),
     } as unknown as Repository<Branch>;
-    const service = new UsersService(goTrue, branchRepository, makeAudit());
+    const service = new UsersService(goTrue, branchRepository, makeAudit(), config);
 
     await expect(
       service.update(principal, owner.id, {
@@ -212,7 +217,7 @@ describe('UsersService governance boundaries', () => {
       ]),
     } as unknown as Repository<Branch>;
     const audit = makeAudit();
-    const service = new UsersService(goTrue, branchRepository, audit);
+    const service = new UsersService(goTrue, branchRepository, audit, config);
     const faPrincipal: Principal = {
       userId: 'fa-1',
       role: 'franchise-admin',
@@ -261,7 +266,7 @@ describe('UsersService governance boundaries', () => {
       ]),
     } as unknown as Repository<Branch>;
     const audit = makeAudit();
-    const service = new UsersService(goTrue, branchRepository, audit);
+    const service = new UsersService(goTrue, branchRepository, audit, config);
 
     await service.update(principal, target.id, { phone: '+639171234567' });
 
@@ -281,7 +286,7 @@ describe('UsersService multi-branch owner scope', () => {
     const branchRepository = {
       find: jest.fn(),
     } as unknown as Repository<Branch>;
-    const service = new UsersService(goTrue, branchRepository, makeAudit());
+    const service = new UsersService(goTrue, branchRepository, makeAudit(), config);
     const owner: Principal = {
       userId: 'owner',
       role: 'branch-owner',
@@ -292,7 +297,7 @@ describe('UsersService multi-branch owner scope', () => {
     await expect(
       service.create(owner, {
         email: 'manager@example.com',
-        password: 'password123',
+        name: 'Invited Manager',
         role: 'branch-manager',
         branchIds: [firstBranchId, secondBranchId],
       }),
@@ -330,7 +335,7 @@ describe('UsersService multi-branch owner scope', () => {
         { id: outsideBranchId, name: 'Outside', status: 'active' },
       ]),
     } as unknown as Repository<Branch>;
-    const service = new UsersService(goTrue, branchRepository, makeAudit());
+    const service = new UsersService(goTrue, branchRepository, makeAudit(), config);
     const owner: Principal = {
       userId: 'owner',
       role: 'branch-owner',
@@ -357,7 +362,7 @@ describe('Branch Owner invitation account boundaries', () => {
       app_metadata: { role: 'branch-owner', status: 'Pending', branch_owner_invitation: true, branch_ids: ['branch-a'] } };
     const auth = { getUser: jest.fn().mockResolvedValue(user), listUsers: jest.fn().mockResolvedValue([user]), createUser: jest.fn(), updateUser: jest.fn() };
     const branches = { find: jest.fn().mockResolvedValue([{ id: 'branch-a', name: 'Branch A', ownerId: user.id }]) };
-    return { service: new UsersService(auth as unknown as GoTrueAdminService, branches as unknown as Repository<Branch>, makeAudit()), auth };
+    return { service: new UsersService(auth as unknown as GoTrueAdminService, branches as unknown as Repository<Branch>, makeAudit(), config), auth };
   }
   it('preserves Pending status in the directory rather than advertising active access', async () => {
     const { service } = setup();
@@ -368,9 +373,115 @@ describe('Branch Owner invitation account boundaries', () => {
     await expect(service.update(principal, 'invited-owner', { status: 'Active', password: 'AdminChosenPassword1' })).rejects.toBeInstanceOf(ForbiddenException);
     expect(auth.updateUser).not.toHaveBeenCalled();
   });
-  it('cannot bypass the invitation path through generic password-based account creation', async () => {
+});
+
+describe('Branch Manager email invitations', () => {
+  const branch = { id: '00000000-0000-4000-8000-000000000001', name: 'Branch A', ownerId: 'owner-a' };
+  const owner: Principal = {
+    userId: branch.ownerId, role: 'branch-owner', branchIds: [branch.id], branches: [branch.name],
+  };
+  const email = 'manager@example.invalid';
+  const invited: GoTrueUser = {
+    id: 'manager-a', email, banned_until: null,
+    created_at: '2026-01-10T00:00:00.000Z', user_metadata: {}, app_metadata: {},
+  };
+  const manager: Principal = {
+    userId: invited.id, role: 'branch-manager', email, status: 'Pending',
+    branchIds: [branch.id], branches: [branch.name],
+  };
+
+  function setup() {
+    const auth = {
+      inviteUser: jest.fn().mockResolvedValue(invited),
+      findByEmail: jest.fn().mockResolvedValue(null),
+      getUser: jest.fn(),
+      updateUser: jest.fn().mockResolvedValue(undefined),
+      sendExistingUserLink: jest.fn().mockResolvedValue(undefined),
+    };
+    const locked = { findOne: jest.fn().mockResolvedValue(branch), query: jest.fn() };
+    const repo = { manager: { transaction: jest.fn((callback) => callback(locked)) } };
+    const service = new UsersService(
+      auth as unknown as GoTrueAdminService, repo as unknown as Repository<Branch>, makeAudit(), config,
+    );
+    const pending: GoTrueUser = {
+      ...invited,
+      email_confirmed_at: '2026-01-10T00:01:00.000Z',
+      app_metadata: {
+        role: 'branch-manager', status: 'Pending', branch_ids: [branch.id],
+        branch_manager_invitation: true, invitation_email: email,
+        invitation_expires_at: new Date(Date.now() + 60_000).toISOString(),
+      },
+    };
+    auth.getUser.mockResolvedValue(pending);
+    return { service, auth, locked, pending };
+  }
+
+  it('rejects other roles and strips legacy credential fields at the account creation boundary', async () => {
+    const dto = plainToInstance(CreateUserDto, {
+      email, name: 'New Manager', branchIds: [branch.id], role: 'branch-owner',
+      password: 'AdminChosenPassword1', status: 'Active',
+    });
+    expect((await validate(dto, { whitelist: true })).map((error) => error.property)).toEqual(['role']);
+    expect(dto).not.toHaveProperty('password');
+    expect(dto).not.toHaveProperty('status');
+  });
+
+  it('sends the email and assigns protected Pending claims without a password', async () => {
+    const { service, auth, locked } = setup();
+    await expect(service.create(owner, { email: email.toUpperCase(), name: 'New Manager', branchIds: [branch.id] }))
+      .resolves.toEqual({ id: invited.id });
+    expect(locked.findOne).toHaveBeenCalledWith(Branch, expect.objectContaining({
+      where: { id: branch.id, ownerId: owner.userId, status: 'active' },
+    }));
+    expect(auth.inviteUser).toHaveBeenCalledWith(email, 'New Manager', 'https://crm.example.invalid/?invitation=branch-manager');
+    expect(auth.updateUser).toHaveBeenCalledWith(invited.id, {
+      app_metadata: expect.objectContaining({
+        role: 'branch-manager', status: 'Pending', branch_ids: [branch.id], invitation_email: email,
+      }),
+    });
+  });
+
+  it('refuses duplicate addresses and a branch whose ownership no longer matches', async () => {
+    const { service, auth, locked } = setup();
+    const input = { email, name: 'New Manager', branchIds: [branch.id] };
+    auth.findByEmail.mockResolvedValue(invited);
+    await expect(service.create(owner, input)).rejects.toThrow('Email already in use');
+    locked.findOne.mockResolvedValue(null);
+    await expect(service.create(owner, input)).rejects.toBeInstanceOf(ForbiddenException);
+    expect(auth.inviteUser).not.toHaveBeenCalled();
+  });
+
+  it.each(['unverified', 'expired', 'wrong branch', 'wrong email', 'revoked'])(
+    'denies %s invitations without writing a password',
+    async (condition) => {
+      const { service, auth, pending } = setup();
+      if (condition === 'unverified') pending.email_confirmed_at = null;
+      if (condition === 'expired') pending.app_metadata.invitation_expires_at = new Date(0).toISOString();
+      if (condition === 'wrong branch') pending.app_metadata.branch_ids = ['other-branch'];
+      if (condition === 'wrong email') pending.email = 'other@example.invalid';
+      if (condition === 'revoked') pending.app_metadata.status = 'Inactive';
+      await expect(service.acceptManagerInvitation(manager, 'ChosenPassword1')).rejects.toBeInstanceOf(ForbiddenException);
+      expect(auth.updateUser).not.toHaveBeenCalled();
+    },
+  );
+
+  it('activates once and leaves the chosen password intact when the request is replayed', async () => {
+    const { service, auth, pending } = setup();
+    await service.acceptManagerInvitation(manager, 'ChosenPassword1');
+    expect(auth.updateUser).toHaveBeenCalledWith(invited.id, {
+      password: 'ChosenPassword1',
+      app_metadata: { status: 'Active', invitation_accepted_at: expect.any(String) },
+    });
+    pending.app_metadata.status = 'Active';
+    pending.app_metadata.invitation_accepted_at = new Date().toISOString();
+    await service.acceptManagerInvitation(manager, 'DifferentPassword1');
+    expect(auth.updateUser).toHaveBeenCalledTimes(1);
+  });
+
+  it('resends a fresh email to the already verified pending identity without creating another user', async () => {
     const { service, auth } = setup();
-    await expect(service.create(principal, { role: 'branch-owner', name: 'Owner', email: 'owner@example.invalid', password: 'AdminChosenPassword1', branchIds: ['branch-a'] })).rejects.toBeInstanceOf(ForbiddenException);
-    expect(auth.createUser).not.toHaveBeenCalled();
+    await service.resendManagerInvitation(owner, invited.id, branch.id);
+    expect(auth.sendExistingUserLink).toHaveBeenCalledWith(email, 'https://crm.example.invalid/?invitation=branch-manager');
+    expect(auth.inviteUser).not.toHaveBeenCalled();
   });
 });

@@ -13,8 +13,9 @@ import {
 } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
-import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
+import { AllowPendingInvitation, CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
+import { AcceptBranchManagerInvitationDto } from './dto/accept-branch-manager-invitation.dto';
 import { CreateUserDto } from './dto/create-user.dto';
 import { ChangeOwnPasswordDto } from './dto/change-own-password.dto';
 import { ListUsersQuery } from './dto/list-users.query';
@@ -92,6 +93,29 @@ export class UsersController {
     return this.users.create(principal, dto);
   }
 
+  @Post('branch-manager-invitations/accept')
+  @HttpCode(200)
+  @Roles('branch-manager')
+  @AllowPendingInvitation()
+  async acceptManagerInvitation(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: AcceptBranchManagerInvitationDto,
+  ): Promise<{ ok: true }> {
+    await this.users.acceptManagerInvitation(principal, dto.password);
+    return { ok: true };
+  }
+
+  @Post(':id/branch-manager-invitation/resend')
+  @HttpCode(200)
+  async resendManagerInvitation(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query('branchId', ParseUUIDPipe) branchId: string,
+  ): Promise<{ ok: true }> {
+    await this.users.resendManagerInvitation(principal, id, branchId);
+    return { ok: true };
+  }
+
   @Patch(':id')
   async update(
     @CurrentPrincipal() principal: Principal,
@@ -107,8 +131,9 @@ export class UsersController {
   async remove(
     @CurrentPrincipal() principal: Principal,
     @Param('id', ParseUUIDPipe) id: string,
+    @Query('branchId', new ParseUUIDPipe({ optional: true })) branchId?: string,
   ): Promise<{ ok: true }> {
-    await this.users.softDelete(principal, id);
+    await this.users.softDelete(principal, id, branchId);
     return { ok: true };
   }
 
@@ -125,6 +150,7 @@ export class UsersController {
       status: u.status,
       created_at: u.createdAt,
       last_login_at: u.lastLoginAt,
+      pending_manager_invitation: u.pendingManagerInvitation,
     };
   }
 

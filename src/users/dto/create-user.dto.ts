@@ -1,11 +1,14 @@
+import { Transform } from 'class-transformer';
 import {
-  ArrayNotEmpty,
+  ArrayMaxSize,
+  ArrayMinSize,
   IsArray,
   IsEmail,
   IsIn,
   IsOptional,
   IsString,
   IsUUID,
+  Matches,
   MaxLength,
   MinLength,
 } from 'class-validator';
@@ -14,39 +17,27 @@ export class CreateUserDto {
   @IsEmail()
   email!: string;
 
-  // L5 fix: was MinLength(6), weaker than the rest of the app's password rules.
+  @Transform(({ value }) => typeof value === 'string' ? value.trim() : value)
   @IsString()
-  @MinLength(8)
-  @MaxLength(72)
-  password!: string;
+  @MinLength(1)
+  @MaxLength(120)
+  name!: string;
 
   @IsOptional()
-  @IsString()
-  name?: string;
-
-  @IsOptional()
-  @IsString()
+  @Matches(/^\+639\d{9}$/)
   phone?: string;
 
   @IsOptional()
   @IsString()
   username?: string;
 
-  /**
-   * Franchise Administrator accounts cannot be provisioned through this
-   * endpoint; they require the dedicated Super Administrator invitation path.
-   * BO callers are further restricted to 'branch-manager' in the service.
-   */
   @IsOptional()
-  @IsIn(['branch-owner', 'branch-manager'])
-  role?: 'branch-owner' | 'branch-manager';
+  @IsIn(['branch-manager'])
+  role?: 'branch-manager';
 
   @IsArray()
-  @ArrayNotEmpty()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(1)
   @IsUUID(undefined, { each: true })
   branchIds!: string[];
-
-  @IsOptional()
-  @IsIn(['Active', 'Inactive'])
-  status?: 'Active' | 'Inactive';
 }

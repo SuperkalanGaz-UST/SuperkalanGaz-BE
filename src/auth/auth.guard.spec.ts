@@ -165,14 +165,16 @@ describe('AuthGuard UUID branch scope', () => {
       ForbiddenException,
     );
   });
-  it.each([
-    { allowed: true, invited: true, expected: true },
-    { allowed: false, invited: true, expected: false },
-    { allowed: true, invited: false, expected: false },
-  ])('admits pending Branch Owner only for their invitation handler: %o', async ({ allowed, invited, expected }) => {
+  it.each(
+    (['branch-owner', 'branch-manager'] as const).flatMap((role) => [
+      { role, allowed: true, invited: true, expected: true },
+      { role, allowed: false, invited: true, expected: false },
+      { role, allowed: true, invited: false, expected: false },
+    ]),
+  )('admits pending branch staff only for their invitation handler: %o', async ({ role, allowed, invited, expected }) => {
     const request = { headers: { authorization: 'Bearer token' }, method: 'POST', path: '/api/branches/owner-invitations/accept' };
     const jwt = { verify: jest.fn<() => Promise<unknown>>().mockResolvedValue({ sub: 'owner-1', app_metadata: {
-      role: 'branch-owner', status: 'Pending', branch_owner_invitation: invited, branch_ids: [firstBranchId],
+      role, status: 'Pending', [role === 'branch-owner' ? 'branch_owner_invitation' : 'branch_manager_invitation']: invited, branch_ids: [firstBranchId],
     } }) } as unknown as SupabaseJwtService;
     const branches = { find: jest.fn<() => Promise<unknown>>().mockResolvedValue([{ id: firstBranchId, name: 'Alpha', ownerId: 'owner-1' }]) } as unknown as Repository<Branch>;
     const reflector = { getAllAndOverride: jest.fn().mockReturnValue(allowed) } as unknown as Reflector;

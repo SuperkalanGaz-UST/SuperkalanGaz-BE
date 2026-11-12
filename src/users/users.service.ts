@@ -5,6 +5,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import {
@@ -35,10 +36,11 @@ export interface CrmUser {
   status: 'Active' | 'Inactive' | 'Pending';
   createdAt: Date;
   lastLoginAt: Date | null;
+  pendingManagerInvitation: boolean;
 }
 
 /** Current-user projection available directly from the already verified JWT. */
-export type OwnProfile = Omit<CrmUser, 'createdAt' | 'lastLoginAt'>;
+export type OwnProfile = Omit<CrmUser, 'createdAt' | 'lastLoginAt' | 'pendingManagerInvitation'>;
 
 function str(v: unknown): string | null {
   return typeof v === 'string' && v !== '' ? v : null;
@@ -79,7 +81,8 @@ function toCrmUser(u: GoTrueUser, directory: BranchDirectory): CrmUser {
     phone: str(m.phone),
     status: m.status === 'Pending' ? 'Pending' : m.status === 'Inactive' ? 'Inactive' : 'Active',
     createdAt: new Date(u.created_at),
-    lastLoginAt: u.last_sign_in_at ? new Date(u.last_sign_in_at) : null,
+    pendingManagerInvitation: m.role === 'branch-manager' && m.status === 'Pending' && m.branch_manager_invitation === true,
+    lastLoginAt: m.status !== 'Pending' && u.last_sign_in_at ? new Date(u.last_sign_in_at) : null,
   };
 }
 
@@ -98,6 +101,7 @@ export class UsersService {
     @InjectRepository(Branch)
     private readonly branchRepository: Repository<Branch>,
     private readonly audit: GovernanceAuditService,
+    private readonly config: ConfigService,
   ) {}
 
   /**
@@ -216,34 +220,140 @@ export class UsersService {
   }
 
   async create(principal: Principal, dto: CreateUserDto): Promise<{ id: string }> {
-    const role = dto.role ?? 'branch-manager';
-    if (role === 'branch-owner') {
-      throw new ForbiddenException('Create Branch Owners through branch registration to send a password-setup invitation');
-    }
-    if (principal.role === 'branch-owner' && role !== 'branch-manager') {
-      throw new ForbiddenException('Branch Owners may only create Branch Manager accounts');
-    }
-    if (role === 'branch-manager' && new Set(dto.branchIds).size !== 1) {
+    const [branchId] = dto.branchIds;
+    if (!branchId || dto.branchIds.length !== 1) {
       throw new BadRequestException('A Branch Manager must be assigned to exactly one branch');
     }
-    const branches = await this.resolveRequestedBranches(principal, dto.branchIds);
+    this.assertBranchInScope(principal, branchId);
+    const email = dto.email.trim().toLowerCase();
+    const name = dto.name.trim();
 
-    // Identity AND CRM claims both live in Supabase Auth. The claims go in
-    // app_metadata — service-role-only, so a user can never edit their own role
-    // or branch scope (AGENTS.md §5).
-    return this.goTrue.createUser({
-      email: dto.email,
-      password: dto.password,
-      email_confirm: true,
-      app_metadata: {
-        username: dto.username ?? dto.email.split('@')[0],
-        display_name: dto.name ?? null,
-        role,
-        ...withBranchScope(undefined, branches),
-        phone: dto.phone ?? null,
-        status: dto.status ?? 'Active',
-      },
+    return this.branchRepository.manager.transaction(async (manager) => {
+      const branch = await manager.findOne(Branch, {
+        where: {
+          id: branchId, status: 'active',
+          ...(principal.role === 'branch-owner' ? { ownerId: principal.userId } : {}),
+        },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!branch) throw new ForbiddenException('The selected branch is unavailable');
+      // Supabase can resend an invitation to an unconfirmed address. Serialize
+      // manager invitations across branches so two sends cannot claim one identity.
+      await manager.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
+        'branch-manager-invitation', email,
+      ]);
+      if (await this.goTrue.findByEmail(email)) throw new ConflictException('Email already in use');
+
+      const invited = await this.goTrue.inviteUser(email, name, this.managerInvitationRedirect());
+      if (invited.app_metadata?.role) throw new ConflictException('Email already in use');
+      const sentAt = invited.confirmation_sent_at ?? invited.invited_at ?? new Date().toISOString();
+      const expiresAt = this.managerInvitationExpiry(sentAt);
+      try {
+        await this.audit.record({
+          category: 'admin-account', action: 'branch-manager-invitation-sent',
+          actor: principal, affectedRecordType: 'user', affectedRecordId: invited.id, branchId,
+          afterState: { status: 'Pending', email, expiresAt },
+        }, manager);
+        await this.goTrue.updateUser(invited.id, {
+          app_metadata: {
+            ...withBranchScope(invited.app_metadata, [branch]),
+            role: 'branch-manager', status: 'Pending', display_name: name,
+            username: dto.username?.trim() || email.split('@')[0], phone: dto.phone ?? null,
+            branch_manager_invitation: true, invitation_email: email, invited_by: principal.userId,
+            invited_at: sentAt, invitation_expires_at: expiresAt,
+          },
+        });
+      } catch (error) {
+        await this.goTrue.banUser(invited.id).catch(() => undefined);
+        throw error;
+      }
+      return { id: invited.id };
     });
+  }
+
+  async resendManagerInvitation(principal: Principal, id: string, branchId: string): Promise<void> {
+    this.assertBranchInScope(principal, branchId);
+    await this.branchRepository.manager.transaction(async (manager) => {
+      const branch = await manager.findOne(Branch, {
+        where: {
+          id: branchId, status: 'active',
+          ...(principal.role === 'branch-owner' ? { ownerId: principal.userId } : {}),
+        },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!branch) throw new NotFoundException('Branch Manager invitation not found');
+
+      const current = await this.goTrue.getUser(id);
+      if (!current || !this.matchesManagerInvitation(current, branchId) || isBanned(current) ||
+          current.app_metadata.status !== 'Pending' || !current.email) {
+        throw new NotFoundException('Pending Branch Manager invitation not found');
+      }
+
+      const redirect = this.managerInvitationRedirect();
+      if (current.email_confirmed_at) {
+        await this.goTrue.sendExistingUserLink(current.email, redirect);
+      } else {
+        await this.goTrue.inviteUser(current.email, str(current.app_metadata.display_name) ?? current.email, redirect);
+      }
+      const expiresAt = this.managerInvitationExpiry(new Date().toISOString());
+      await this.audit.record({
+        category: 'admin-account', action: 'branch-manager-invitation-resent',
+        actor: principal, affectedRecordType: 'user', affectedRecordId: id, branchId,
+        afterState: { status: 'Pending', expiresAt },
+      }, manager);
+      await this.goTrue.updateUser(id, { app_metadata: { invitation_expires_at: expiresAt } });
+    });
+  }
+
+  async acceptManagerInvitation(principal: Principal, password: string): Promise<void> {
+    const [branchId] = principal.branchIds;
+    if (!branchId || principal.branchIds.length !== 1) {
+      throw new ForbiddenException('This Branch Manager invitation is not valid');
+    }
+    await this.branchRepository.manager.transaction(async (manager) => {
+      const branch = await manager.findOne(Branch, {
+        where: { id: branchId, status: 'active' },
+        lock: { mode: 'pessimistic_write' },
+      });
+      const current = await this.goTrue.getUser(principal.userId);
+      if (!branch || !current || !this.matchesManagerInvitation(current, branchId) ||
+          isBanned(current) || !current.email_confirmed_at ||
+          current.email?.toLowerCase() !== principal.email?.toLowerCase()) {
+        throw new ForbiddenException('This Branch Manager invitation is not valid');
+      }
+
+      const metadata = current.app_metadata;
+      // An already accepted invitation must never replace the password on retry.
+      if (metadata.status === 'Active' && typeof metadata.invitation_accepted_at === 'string') return;
+      const expires = Date.parse(String(metadata.invitation_expires_at));
+      if (metadata.status !== 'Pending' || !Number.isFinite(expires) || expires <= Date.now()) {
+        throw new ForbiddenException('This invitation is inactive or expired. Ask your Branch Owner to resend it.');
+      }
+      await this.goTrue.updateUser(current.id, {
+        password,
+        app_metadata: { status: 'Active', invitation_accepted_at: new Date().toISOString() },
+      });
+    });
+  }
+
+  private matchesManagerInvitation(user: GoTrueUser, branchId: string): boolean {
+    const metadata = user.app_metadata;
+    const scope = metadataBranchIds(metadata);
+    return metadata.role === 'branch-manager' && metadata.branch_manager_invitation === true &&
+      scope.length === 1 && scope[0] === branchId &&
+      typeof metadata.invitation_email === 'string' && metadata.invitation_email === user.email?.toLowerCase();
+  }
+
+  private managerInvitationRedirect(): string {
+    const origin = (this.config.get<string>('WEB_ORIGIN') ?? 'http://localhost:3000')
+      .split(',')[0].trim().replace(/\/$/, '');
+    return `${origin}/?invitation=branch-manager`;
+  }
+
+  private managerInvitationExpiry(sentAt: string): string {
+    const configured = Number(this.config.get<string>('SUPABASE_EMAIL_OTP_EXPIRY_SECONDS') ?? '3600');
+    const seconds = Number.isFinite(configured) && configured > 0 ? configured : 3600;
+    return new Date(Date.parse(sentAt) + seconds * 1000).toISOString();
   }
 
   async update(principal: Principal, id: string, dto: UpdateUserDto): Promise<void> {
@@ -326,8 +436,40 @@ export class UsersService {
    * sign in, and flip the status claim inactive. The auth.users row is retained
    * for audit/history; nothing is ever hard-deleted.
    */
-  async softDelete(principal: Principal, id: string): Promise<void> {
+  async softDelete(principal: Principal, id: string, branchId?: string): Promise<void> {
     const target = await this.findManageable(principal, id);
+    if (branchId || target.pendingManagerInvitation) {
+      if (!branchId || !target.pendingManagerInvitation ||
+          !target.branchIds.includes(branchId)) {
+        throw new ConflictException('The invitation has changed. Refresh and try again.');
+      }
+      this.assertBranchInScope(principal, branchId);
+      // Keep revocation and activation mutually exclusive.
+      await this.branchRepository.manager.transaction(async (manager) => {
+        const branch = await manager.findOne(Branch, {
+          where: {
+            id: branchId, status: 'active',
+            ...(principal.role === 'branch-owner' ? { ownerId: principal.userId } : {}),
+          },
+          lock: { mode: 'pessimistic_write' },
+        });
+        const current = await this.goTrue.getUser(id);
+        if (!branch || !current || !this.matchesManagerInvitation(current, branchId) ||
+            current.app_metadata.status !== 'Pending') {
+          throw new ConflictException('The invitation has changed. Refresh and try again.');
+        }
+        await this.audit.record({
+          category: 'admin-account', action: 'branch-manager-invitation-revoked',
+          actor: principal, affectedRecordType: 'user', affectedRecordId: id, branchId,
+          beforeState: { status: 'Pending' }, afterState: { status: 'Inactive' },
+        }, manager);
+        await this.goTrue.updateUser(id, {
+          ban_duration: '876000h',
+          app_metadata: { status: 'Inactive' },
+        });
+      });
+      return;
+    }
 
     await this.goTrue.banUser(id);
     await this.goTrue.updateUser(id, {
