@@ -32,7 +32,7 @@ export interface CrmUser {
   branchIds: string[];
   branches: string[];
   phone: string | null;
-  status: 'Active' | 'Inactive';
+  status: 'Active' | 'Inactive' | 'Pending';
   createdAt: Date;
   lastLoginAt: Date | null;
 }
@@ -77,7 +77,7 @@ function toCrmUser(u: GoTrueUser, directory: BranchDirectory): CrmUser {
     branchIds: scope.map((branch) => branch.id),
     branches: scope.map((branch) => branch.name),
     phone: str(m.phone),
-    status: m.status === 'Inactive' ? 'Inactive' : 'Active',
+    status: m.status === 'Pending' ? 'Pending' : m.status === 'Inactive' ? 'Inactive' : 'Active',
     createdAt: new Date(u.created_at),
     lastLoginAt: u.last_sign_in_at ? new Date(u.last_sign_in_at) : null,
   };
@@ -217,6 +217,9 @@ export class UsersService {
 
   async create(principal: Principal, dto: CreateUserDto): Promise<{ id: string }> {
     const role = dto.role ?? 'branch-manager';
+    if (role === 'branch-owner') {
+      throw new ForbiddenException('Create Branch Owners through branch registration to send a password-setup invitation');
+    }
     if (principal.role === 'branch-owner' && role !== 'branch-manager') {
       throw new ForbiddenException('Branch Owners may only create Branch Manager accounts');
     }
@@ -245,6 +248,9 @@ export class UsersService {
 
   async update(principal: Principal, id: string, dto: UpdateUserDto): Promise<void> {
     const target = await this.findManageable(principal, id);
+    if (target.status === 'Pending') {
+      throw new ForbiddenException('Complete or resend the pending invitation before editing this account');
+    }
 
     // Assigning or removing an existing Branch Owner changes branch governance.
     // It must pass through the Super Administrator queue so the old/new owner,

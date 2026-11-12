@@ -65,8 +65,8 @@ export class CreateBranchDto {
   @IsString()
   ownerName?: string;
 
-  // Integrity boundary for the owner login: the "new owner" path provisions a
-  // real GoTrue user from this value, so it must be a valid address. Normalized
+  // Integrity boundary for the owner invitation: the "new owner" path sends a
+  // real GoTrue invitation to this value, so it must be a valid address. Normalized
   // (trim + lowercase) before validation so the persisted email is canonical.
   // The "existing owner" path sends a real, already-valid address too.
   @IsOptional()
@@ -95,7 +95,7 @@ export class CreateBranchDto {
   sourceStoreLocationId?: string;
 
   // Delivery coverage polygon drawn in the wizard's Geofence step, or null/omitted
-  // when none was drawn. Shape is validated on the client; stored as jsonb.
+  // when none was drawn. The service validates geometry and recomputes circle vertices.
   @IsOptional()
   @IsObject()
   geofence?: BranchGeofence | null;

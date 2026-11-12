@@ -1,3 +1,7 @@
+import { BranchOwnerInvitationsService } from './branch-owner-invitations.service';
+import { AcceptBranchOwnerInvitationDto } from './dto/accept-branch-owner-invitation.dto';
+import { BranchGeocodingService } from './branch-geocoding.service';
+import { LocateBranchAddressDto } from './dto/locate-branch-address.dto';
 import {
   Body,
   Controller,
@@ -12,7 +16,7 @@ import {
 } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
-import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
+import { AllowPendingInvitation, CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import {
   AssignedBranchRow,
@@ -33,7 +37,11 @@ import { UpdateBranchDto } from './dto/update-branch.dto';
 @UseGuards(AuthGuard, RolesGuard)
 @Roles('franchise-admin')
 export class BranchesController {
-  constructor(private readonly branches: BranchesService) {}
+  constructor(
+    private readonly branches: BranchesService,
+    private readonly geocoding: BranchGeocodingService,
+    private readonly ownerInvitations: BranchOwnerInvitationsService,
+  ) {}
 
   /**
    * Branch configuration for the authenticated BO/BM assigned scope.
@@ -63,12 +71,32 @@ export class BranchesController {
     return { branches: branches.filter((branch) => branch.status === 'active') };
   }
 
+  /** User-triggered lookup only; inherits the Franchise Administrator guard. */
+  @Post('locate-address')
+  locateAddress(@Body() dto: LocateBranchAddressDto) {
+    return this.geocoding.locate(dto);
+  }
+
   @Post()
   async create(
     @CurrentPrincipal() principal: Principal,
     @Body() dto: CreateBranchDto,
   ): Promise<CreateBranchResult> {
     return this.branches.create(principal, dto);
+  }
+
+  @Post('owner-invitations/accept')
+  @Roles('branch-owner')
+  @AllowPendingInvitation()
+  async acceptOwnerInvitation(@CurrentPrincipal() principal: Principal, @Body() dto: AcceptBranchOwnerInvitationDto) {
+    await this.ownerInvitations.accept(principal, dto.password);
+    return { ok: true };
+  }
+
+  @Post(':id/owner-invitation/resend')
+  async resendOwnerInvitation(@CurrentPrincipal() principal: Principal, @Param('id', ParseUUIDPipe) id: string) {
+    await this.ownerInvitations.resend(principal, id);
+    return { ok: true };
   }
 
   /** Edit a branch's details. */

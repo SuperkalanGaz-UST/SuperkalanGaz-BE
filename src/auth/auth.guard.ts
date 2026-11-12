@@ -70,7 +70,8 @@ export class AuthGuard implements CanActivate {
       throw new ForbiddenException('No CRM role for this account');
     }
     const allowPendingInvitation =
-      (claims.role === 'franchise-admin' || claims.role === 'driver') &&
+      (claims.role === 'franchise-admin' || claims.role === 'driver' ||
+        (claims.role === 'branch-owner' && claims.branch_owner_invitation === true)) &&
       claims.status === 'Pending' &&
       this.reflector.getAllAndOverride<boolean>(ALLOW_PENDING_INVITATION_KEY, [
         context.getHandler(),
