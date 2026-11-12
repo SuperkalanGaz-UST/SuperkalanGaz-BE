@@ -16,10 +16,8 @@ import { supabaseApiKeyHeaders } from '../common/utils/supabase-api-key-headers'
  */
 interface GoTrueUserAttrs {
   email?: string;
-  phone?: string;
   password?: string;
   email_confirm?: boolean;
-  phone_confirm?: boolean;
   user_metadata?: Record<string, unknown>;
   app_metadata?: Record<string, unknown>;
   ban_duration?: string;
@@ -167,29 +165,6 @@ export class GoTrueAdminService {
   /** Re-enables a retained auth identity; no auth row is deleted. */
   async unbanUser(id: string): Promise<void> {
     await this.updateUser(id, { ban_duration: 'none' });
-  }
-
-  /** Sends an SMS OTP only for an identity already created by the invitation. */
-  async requestPhoneOtp(phone: string): Promise<void> {
-    await this.authRequest('POST', '/otp', { phone, create_user: false });
-  }
-
-  /** Verifies the phone and returns the Auth identity that consumed the code. */
-  async verifyPhoneOtp(phone: string, token: string): Promise<{ userId: string }> {
-    const result = await this.authRequest('POST', '/verify', {
-      phone,
-      token,
-      type: 'sms',
-    });
-    const user = result.user;
-    if (
-      !user ||
-      typeof user !== 'object' ||
-      typeof (user as Record<string, unknown>).id !== 'string'
-    ) {
-      throw new BadRequestException('The mobile verification response was invalid');
-    }
-    return { userId: (user as Record<string, unknown>).id as string };
   }
 
   private async authRequest(

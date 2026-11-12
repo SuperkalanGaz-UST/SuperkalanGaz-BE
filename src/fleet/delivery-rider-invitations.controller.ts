@@ -27,7 +27,6 @@ import {
   DeliveryRiderInvitationTokenDto,
   ListDeliveryRiderInvitationsQuery,
   RevokeDeliveryRiderInvitationDto,
-  VerifyDeliveryRiderSessionMobileDto,
 } from './dto/delivery-rider-invitation.dto';
 
 /** M3 fix: unauthenticated and, per-request, does a full GoTrue user-list scan
@@ -84,16 +83,6 @@ export class DeliveryRiderInvitationsController {
     return { message: 'Delivery Rider account password created' };
   }
 
-  @Post('session/mobile-code')
-  @HttpCode(200)
-  @UseGuards(AuthGuard, RolesGuard)
-  @Roles('driver')
-  @AllowPendingInvitation()
-  async sessionMobileCode(@CurrentPrincipal() principal: Principal) {
-    await this.invitations.sendMobileCodeForSession(principal);
-    return { message: 'Verification code sent' };
-  }
-
   @Get('session/details')
   @UseGuards(AuthGuard, RolesGuard)
   @Roles('driver')
@@ -110,41 +99,6 @@ export class DeliveryRiderInvitationsController {
   async confirmSessionDetails(@CurrentPrincipal() principal: Principal) {
     await this.invitations.confirmDetailsForSession(principal);
     return { message: 'Delivery Rider details confirmed' };
-  }
-
-  @Get('session/mobile-verification')
-  @UseGuards(AuthGuard, RolesGuard)
-  @Roles('driver')
-  @AllowPendingInvitation()
-  async sessionMobileVerification(@CurrentPrincipal() principal: Principal) {
-    return this.invitations.mobileVerificationForSession(principal);
-  }
-
-  @Post('session/verify-mobile')
-  @HttpCode(200)
-  @UseGuards(AuthGuard, RolesGuard)
-  @Roles('driver')
-  @AllowPendingInvitation()
-  async verifySessionMobile(
-    @CurrentPrincipal() principal: Principal,
-    @Body() dto: VerifyDeliveryRiderSessionMobileDto,
-  ) {
-    await this.invitations.verifyMobileForSession(principal, dto.code);
-    return { message: 'Mobile number verified and Delivery Rider account activated' };
-  }
-
-  @Post('session/complete-placeholder-mobile-verification')
-  @HttpCode(200)
-  @UseGuards(AuthGuard, RolesGuard)
-  @Roles('driver')
-  @AllowPendingInvitation()
-  async completePlaceholderMobileVerification(
-    @CurrentPrincipal() principal: Principal,
-  ) {
-    await this.invitations.completePlaceholderMobileVerificationForSession(principal);
-    return {
-      message: 'Temporary mobile verification placeholder completed',
-    };
   }
 
   @Post('session/accept')

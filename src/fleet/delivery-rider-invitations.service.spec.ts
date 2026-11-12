@@ -1,7 +1,6 @@
 import {
   ConflictException,
   ForbiddenException,
-  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Repository } from 'typeorm';
@@ -28,8 +27,6 @@ describe('DeliveryRiderInvitationsService', () => {
   } as Branch;
 
   function setup(options: {
-    verificationMode?: 'sms' | 'placeholder';
-    nodeEnv?: string;
     redirectUrl?: string | null;
   } = {}) {
     const user: GoTrueUser = {
@@ -59,13 +56,8 @@ describe('DeliveryRiderInvitationsService', () => {
           };
         }
         if (typeof attrs.phone === 'string') user.phone = attrs.phone;
-        if (attrs.phone_confirm === true) {
-          user.phone_confirmed_at = new Date().toISOString();
-        }
       }),
       getUser: jest.fn(async () => user),
-      requestPhoneOtp: jest.fn(async () => undefined),
-      verifyPhoneOtp: jest.fn(async () => ({ userId: user.id })),
       banUser: jest.fn(async () => undefined),
       unbanUser: jest.fn(async () => {
         user.banned_until = null;
@@ -100,13 +92,9 @@ describe('DeliveryRiderInvitationsService', () => {
             : options.redirectUrl
           : key === 'WEB_ORIGIN'
             ? 'http://localhost:3000'
-          : key === 'DELIVERY_RIDER_INVITATION_EXPIRY_HOURS'
-            ? '48'
-            : key === 'DELIVERY_RIDER_MOBILE_VERIFICATION_MODE'
-              ? options.verificationMode
-              : key === 'NODE_ENV'
-                ? options.nodeEnv
-            : undefined,
+            : key === 'DELIVERY_RIDER_INVITATION_EXPIRY_HOURS'
+              ? '48'
+              : undefined,
       ),
     } as unknown as ConfigService;
     const service = new DeliveryRiderInvitationsService(
@@ -116,7 +104,7 @@ describe('DeliveryRiderInvitationsService', () => {
       audit,
       config,
     );
-    return { service, user, goTrue, riders, audit, redirect: () => redirectUrl };
+    return { service, user, goTrue, riders, savedRider, audit, redirect: () => redirectUrl };
   }
 
   function acceptedDriver(user: GoTrueUser): Principal {
@@ -129,31 +117,50 @@ describe('DeliveryRiderInvitationsService', () => {
     return { userId: user.id, role: 'driver', status: 'Pending', branches: [branch.name], branchIds: [branchId] };
   }
 
-  it.each(['sms', 'placeholder'] as const)('confirms own details in %s mode without phone verification', async (verificationMode) => {
-    const { service, user, goTrue, riders, audit } = setup({ verificationMode, nodeEnv: 'production' });
+  it('confirms contact details without verifying or attaching an Auth phone', async () => {
+    const { service, user, goTrue, riders, audit } = setup();
     const driver = acceptedDriver(user);
     await expect(service.detailsForSession(driver)).resolves.toMatchObject({ invitationId: user.id });
     await service.confirmDetailsForSession(driver);
     expect(user.app_metadata.status).toBe('Active');
-    expect(user.app_metadata.delivery_rider_mobile_verified_at).toEqual(expect.any(String));
-    expect(user.app_metadata.delivery_rider_mobile_verification_method).toBe('details-confirmation');
-    expect(goTrue.requestPhoneOtp).not.toHaveBeenCalled();
-    expect(goTrue.verifyPhoneOtp).not.toHaveBeenCalled();
-    expect(goTrue.updateUser.mock.calls.every(([id, attrs]) => id === driver.userId && !('phone_confirm' in attrs))).toBe(true);
+    expect(user.app_metadata.delivery_rider_details_confirmed_at).toEqual(expect.any(String));
+    await expect(service.detailsForSession(driver)).resolves.toMatchObject({ mobileVerified: false });
+    expect(goTrue.updateUser.mock.lastCall?.[1]).not.toHaveProperty('phone');
+    expect(goTrue.updateUser.mock.lastCall?.[1]).not.toHaveProperty('phone_confirm');
     expect(riders.create).toHaveBeenCalledWith(expect.objectContaining({ authUserId: driver.userId, branchId, status: 'Offline' }));
     expect(audit.record).toHaveBeenCalledWith(expect.objectContaining({
-      beforeState: expect.objectContaining({ mobileVerification: 'Details Confirmed' }),
+      afterState: expect.objectContaining({ detailsConfirmation: 'Confirmed' }),
     }));
     await service.confirmDetailsForSession(driver);
     expect(riders.save).toHaveBeenCalledTimes(1);
   });
 
-  it.each(['role', 'identity', 'branch', 'unaccepted', 'revoked', 'inactive'] as const)('rejects %s details confirmation', async (reason) => {
+  it('reuses the same branch roster entry when activation is retried after an Auth error', async () => {
+    const { service, user, goTrue, riders, savedRider, audit } = setup();
+    const driver = acceptedDriver(user);
+    goTrue.updateUser.mockRejectedValueOnce(new Error('Auth unavailable'));
+
+    await expect(service.confirmDetailsForSession(driver)).rejects.toThrow('Auth unavailable');
+    expect(user.app_metadata.status).toBe('Pending');
+    jest.mocked(riders.findOne).mockResolvedValueOnce(savedRider);
+
+    await service.confirmDetailsForSession(driver);
+
+    expect(riders.findOne).toHaveBeenLastCalledWith({
+      where: { authUserId: user.id, branchId, deletedAt: expect.anything() },
+    });
+    expect(riders.save).toHaveBeenCalledTimes(1);
+    expect(user.app_metadata.status).toBe('Active');
+    expect(audit.record).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['role', 'identity', 'branch', 'unverified email', 'unaccepted', 'revoked', 'inactive'] as const)('rejects %s details confirmation', async (reason) => {
     const { service, user, goTrue, riders } = setup();
     const driver = acceptedDriver(user);
     if (reason === 'role') driver.role = 'customer';
     if (reason === 'identity') driver.userId = owner.userId;
     if (reason === 'branch') driver.branchIds = [];
+    if (reason === 'unverified email') user.email_confirmed_at = null;
     if (reason === 'unaccepted') delete user.app_metadata.delivery_rider_invitation_accepted_at;
     if (reason === 'revoked') user.app_metadata.delivery_rider_invitation_revoked_at = new Date().toISOString();
     if (reason === 'inactive') user.app_metadata.status = 'Inactive';
@@ -190,6 +197,33 @@ describe('DeliveryRiderInvitationsService', () => {
     expect(new URL(redirect()).searchParams.get('token')).toBeTruthy();
   });
 
+  it('allows a shared contact number without attaching it to the new Auth identity', async () => {
+    const { service, user, goTrue, redirect } = setup();
+    const mobile = '+639171234567';
+    goTrue.listUsers.mockResolvedValueOnce([{
+      ...user,
+      id: owner.userId,
+      email: 'owner@example.com',
+      phone: null,
+      app_metadata: { role: 'branch-owner', phone: mobile },
+    }]);
+
+    await expect(service.create(owner, {
+      recipientName: 'Ana Rider',
+      email: 'rider@example.com',
+      mobile,
+      branchId,
+    })).resolves.toMatchObject({ email: 'rider@example.com', mobile, status: 'Pending' });
+
+    const token = new URL(redirect()).searchParams.get('token')!;
+    await service.createAccount(token, 'private-password');
+
+    expect(user.app_metadata.phone).toBe(mobile);
+    expect(user.phone).toBeNull();
+    expect(goTrue.updateUser.mock.lastCall?.[1]).not.toHaveProperty('phone');
+    expect(goTrue.updateUser.mock.lastCall?.[1]).not.toHaveProperty('phone_confirm');
+  });
+
   it('resends a registration link after email verification but before password creation', async () => {
     const { service, user, goTrue, redirect } = setup({ redirectUrl: null });
     await service.create(owner, {
@@ -212,7 +246,7 @@ describe('DeliveryRiderInvitationsService', () => {
     });
   });
 
-  it('accepts the web invitation first, then activates after app mobile verification', async () => {
+  it('accepts the web invitation first, then activates after app details confirmation', async () => {
     const { service, user, goTrue, riders, audit, redirect } = setup();
 
     const created = await service.create(owner, {
@@ -261,16 +295,13 @@ describe('DeliveryRiderInvitationsService', () => {
       branches: [branch.name],
       branchIds: [branchId],
     };
-    await expect(service.mobileVerificationForSession(driver)).resolves.toMatchObject({
+    await expect(service.detailsForSession(driver)).resolves.toMatchObject({
       accountCreated: true,
       mobileVerified: false,
       status: 'Accepted',
     });
-    await service.sendMobileCodeForSession(driver);
-    await service.verifyMobileForSession(driver, '123456');
-
-    expect(goTrue.requestPhoneOtp).toHaveBeenCalledWith('+639171234567');
-    expect(goTrue.verifyPhoneOtp).toHaveBeenCalledWith('+639171234567', '123456');
+    await service.confirmDetailsForSession(driver);
+    expect(goTrue.updateUser.mock.calls.every(([, attrs]) => !('phone' in attrs))).toBe(true);
     expect(riders.create).toHaveBeenCalledWith(
       expect.objectContaining({
         authUserId: user.id,
@@ -320,98 +351,11 @@ describe('DeliveryRiderInvitationsService', () => {
 
     expect(riders.save).not.toHaveBeenCalled();
     expect(user.app_metadata.status).toBe('Pending');
-    await service.sendMobileCodeForSession(driver);
-    await service.verifyMobileForSession(driver, '123456');
+    await service.confirmDetailsForSession(driver);
 
-    expect(goTrue.requestPhoneOtp).toHaveBeenCalledWith('+639171234567');
+    expect(goTrue.updateUser.mock.calls.every(([, attrs]) => !('phone' in attrs))).toBe(true);
     expect(riders.save).toHaveBeenCalled();
     expect(user.app_metadata.status).toBe('Active');
-  });
-
-  it('uses the explicit development placeholder without claiming provider verification', async () => {
-    const { service, user, goTrue, riders, audit, redirect } = setup({
-      verificationMode: 'placeholder',
-      nodeEnv: 'development',
-    });
-    await service.create(owner, {
-      recipientName: 'Ana Rider',
-      email: 'rider@example.com',
-      mobile: '+639171234567',
-      branchId,
-    });
-    const token = new URL(redirect()).searchParams.get('token');
-    await service.createAccount(token!, 'private-password');
-    await service.accept(token!);
-    const driver: Principal = {
-      userId: user.id,
-      role: 'driver',
-      status: 'Pending',
-      email: user.email,
-      displayName: 'Ana Rider',
-      branches: [branch.name],
-      branchIds: [branchId],
-    };
-
-    await expect(service.mobileVerificationForSession(driver)).resolves.toMatchObject({
-      verificationMode: 'placeholder',
-    });
-    await expect(service.sendMobileCodeForSession(driver)).rejects.toBeInstanceOf(
-      ConflictException,
-    );
-    await service.completePlaceholderMobileVerificationForSession(driver);
-
-    expect(goTrue.requestPhoneOtp).not.toHaveBeenCalled();
-    expect(goTrue.verifyPhoneOtp).not.toHaveBeenCalled();
-    expect(goTrue.updateUser).toHaveBeenCalledWith(
-      user.id,
-      expect.objectContaining({ phone_confirm: false }),
-    );
-    expect(user.phone_confirmed_at).toBeUndefined();
-    expect(user.app_metadata).toMatchObject({
-      status: 'Active',
-      delivery_rider_mobile_verification_method: 'placeholder',
-    });
-    expect(riders.save).toHaveBeenCalled();
-    expect(audit.record).toHaveBeenCalledWith(
-      expect.objectContaining({
-        action: 'delivery-rider-account-activated',
-        afterState: expect.objectContaining({
-          mobileVerificationMethod: 'placeholder',
-        }),
-      }),
-    );
-  });
-
-  it('fails closed when placeholder verification is configured in production', async () => {
-    const { service, user, redirect } = setup({
-      verificationMode: 'placeholder',
-      nodeEnv: 'production',
-    });
-    await service.create(owner, {
-      recipientName: 'Ana Rider',
-      email: 'rider@example.com',
-      mobile: '+639171234567',
-      branchId,
-    });
-    const token = new URL(redirect()).searchParams.get('token');
-    await service.createAccount(token!, 'private-password');
-    await service.accept(token!);
-    const driver: Principal = {
-      userId: user.id,
-      role: 'driver',
-      status: 'Pending',
-      email: user.email,
-      displayName: 'Ana Rider',
-      branches: [branch.name],
-      branchIds: [branchId],
-    };
-
-    await expect(service.mobileVerificationForSession(driver)).rejects.toBeInstanceOf(
-      ServiceUnavailableException,
-    );
-    await expect(
-      service.completePlaceholderMobileVerificationForSession(driver),
-    ).rejects.toBeInstanceOf(ServiceUnavailableException);
   });
 
   it('reissues a revoked invitation through the retained confirmed Auth identity', async () => {
@@ -563,7 +507,7 @@ describe('DeliveryRiderInvitationsService', () => {
     expect(goTrue.unbanUser).not.toHaveBeenCalled();
   });
 
-  it('does not reissue when the submitted mobile belongs to another identity', async () => {
+  it('reissues a revoked invitation with a shared contact number', async () => {
     const { service, user, goTrue } = setup();
     user.app_metadata = {
       role: 'driver',
@@ -591,8 +535,9 @@ describe('DeliveryRiderInvitationsService', () => {
         mobile: '+639181234567',
         branchId,
       }),
-    ).rejects.toThrow('An account or invitation with this mobile number already exists');
-    expect(goTrue.sendExistingUserLink).not.toHaveBeenCalled();
+    ).resolves.toMatchObject({ mobile: '+639181234567', status: 'Pending' });
+    expect(goTrue.sendExistingUserLink).toHaveBeenCalledWith(user.email, expect.any(String));
+    expect(goTrue.updateUser.mock.calls.every(([, attrs]) => !('phone' in attrs))).toBe(true);
   });
 
   it('restores the revoked state if the replacement link cannot be sent', async () => {
