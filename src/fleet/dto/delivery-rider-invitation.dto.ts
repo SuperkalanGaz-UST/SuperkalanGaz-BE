@@ -3,7 +3,6 @@ import {
   IsOptional,
   IsString,
   IsUUID,
-  Matches,
   MaxLength,
   MinLength,
 } from 'class-validator';
@@ -33,11 +32,6 @@ export class CreateDeliveryRiderSessionAccountDto {
   @MinLength(8)
   @MaxLength(72)
   password!: string;
-}
-
-export class VerifyDeliveryRiderSessionMobileDto {
-  @Matches(/^\d{6}$/, { message: 'Enter the 6-digit verification code' })
-  code!: string;
 }
 
 export class RevokeDeliveryRiderInvitationDto {

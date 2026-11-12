@@ -197,12 +197,11 @@ Hard constraints:
   invitee sets their own password.
 - **Delivery Rider web access is registration-only.** The token-gated web page reviews the
   invitation, creates the password, and records final invitation acceptance before handing
-  off to the app. PH mobile verification happens only after app sign-in, and web must never
-  authorize a Delivery Rider operations dashboard.
+  off to the app for details confirmation. Web access ends at registration.
   Pending-session endpoints may accept only a verified `driver` JWT on handlers explicitly
   marked for invitation activation; every normal protected endpoint must still reject it.
 - **Invitation acceptance is the authorization.** Website acceptance consumes the invitation
-  while status remains pending. After app-based PH mobile verification, only the API writes
+  while status remains pending. After app-based details confirmation, only the API writes
   active status and creates the branch-scoped `Offline`, unassigned Fleet roster entry. No
   Branch Manager approval or applicant-selected branch is allowed.
 - **Customers see delivery status milestones only — never live GPS coordinates.**
@@ -264,8 +263,9 @@ Shared workflow:
    exposing branch data.
 4. Website acceptance consumes the invitation and records immutable attribution to the Owner
    while the protected Delivery Rider account remains pending.
-5. After app sign-in, the rider verifies the invitation-bound PH mobile number. The API then
-   activates protected claims and creates the `Offline`, unassigned Fleet roster entry. The
+5. After email/password sign-in, the Delivery Rider confirms the saved details. Keep the
+   PH mobile number in contact metadata and allow shared numbers. The API activates
+   protected claims and creates the `Offline`, unassigned Fleet roster entry. The
    Branch Manager manages vehicle readiness but cannot authorize identity or membership.
 
 ---

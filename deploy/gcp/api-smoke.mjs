@@ -22,7 +22,6 @@ const env = {
   SUPABASE_PUBLISHABLE_KEY: setup.SUPABASE_PUBLISHABLE_KEY,
   SUPABASE_SECRET_KEY: source.SUPABASE_SECRET_KEY || source.SUPABASE_SERVICE_ROLE_KEY,
   SUPABASE_JWT_SECRET: source.SUPABASE_JWT_SECRET,
-  DELIVERY_RIDER_MOBILE_VERIFICATION_MODE: 'sms',
 };
 for (const [name, value] of Object.entries(env)) {
   if (!value || /[\r\n]/.test(value)) throw new Error(`Missing or multiline input: ${name}`);
