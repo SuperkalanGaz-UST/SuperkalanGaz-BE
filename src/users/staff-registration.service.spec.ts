@@ -33,6 +33,9 @@ describe('StaffRegistrationService', () => {
         created_at: '2026-08-21T00:00:00.000Z',
       }),
       user('active-owner', 'branch-owner', 'Active'),
+      user('invited-owner', 'branch-owner', 'Pending', {
+        app_metadata: { role: 'branch-owner', status: 'Pending', branch_owner_invitation: true },
+      }),
       user('admin', 'franchise-admin', 'Pending'),
       user('customer', 'customer', 'Pending'),
       user('banned-manager', 'branch-manager', 'Pending', {

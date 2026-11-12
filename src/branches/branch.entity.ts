@@ -1,13 +1,15 @@
 import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
 
 /**
- * Delivery coverage area for a branch. Currently only hand-drawn polygons are
- * supported (the registration wizard's "Draw on map"); `points` are [lat, lng]
+ * Delivery coverage area for a branch. Circular coverage is stored as polygon vertices
+ * plus its branch centre and radius for editing; `points` are [lat, lng]
  * vertices. Stored as jsonb; null means no coverage set.
  */
 export interface BranchGeofence {
   type: 'polygon';
   points: [number, number][];
+  center?: [number, number];
+  radiusMeters?: number;
 }
 
 export interface LoyaltyPointRates {

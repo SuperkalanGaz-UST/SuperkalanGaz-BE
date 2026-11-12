@@ -1,3 +1,5 @@
+import { BranchOwnerInvitationsService } from './branch-owner-invitations.service';
+import { normalizeGeofence } from './branch-geofence';
 import {
   BadRequestException,
   ForbiddenException,
@@ -28,8 +30,7 @@ const PG_UNIQUE_VIOLATION = '23505';
 export interface ProvisionedOwner {
   id: string;
   email: string;
-  /** Plaintext one-time password — returned once so the UI can hand it over. */
-  tempPassword: string;
+  invitationSent: true;
 }
 
 export interface CreateBranchResult {
@@ -62,11 +63,6 @@ export interface AssignedBranchRow {
   geofence: BranchGeofence | null;
 }
 
-/** URL-safe temp password; 16 chars easily clears Supabase's default policy. */
-function generateTempPassword(): string {
-  return randomBytes(12).toString('base64url');
-}
-
 /**
  * Derives a stable branch code from the name: an uppercased slug plus a short
  * random suffix so genuinely different stores that share a name (e.g. the two
@@ -96,12 +92,14 @@ export class BranchesService {
     @InjectRepository(Branch)
     private readonly branches: Repository<Branch>,
     private readonly goTrue: GoTrueAdminService,
+    private readonly invitations: BranchOwnerInvitationsService,
     @Optional()
     private readonly governanceAudit?: GovernanceAuditService,
   ) {}
 
   async create(principal: Principal, dto: CreateBranchDto): Promise<CreateBranchResult> {
     const name = dto.name.trim();
+    const geofence = normalizeGeofence(dto.geofence);
 
     let existingOwner: GoTrueUser | null = null;
     if (dto.ownerType === 'existing') {
@@ -113,7 +111,7 @@ export class BranchesService {
       if (
         !existingOwner ||
         existingOwner.app_metadata?.role !== 'branch-owner' ||
-        existingOwner.app_metadata?.status === 'Inactive'
+        (existingOwner.app_metadata?.status !== undefined && existingOwner.app_metadata.status !== 'Active')
       ) {
         throw new BadRequestException('Select an active Branch Owner account');
       }
@@ -128,23 +126,9 @@ export class BranchesService {
       if (!dto.ownerEmail || !dto.ownerName) {
         throw new BadRequestException('A new owner requires a name and email address');
       }
-      const tempPassword = generateTempPassword();
-      newOwnerMetadata = {
-        username: dto.ownerEmail.split('@')[0],
-        display_name: dto.ownerName,
-        role: 'branch-owner',
-        branch_ids: [],
-        branches: [],
-        phone: dto.ownerMobile ?? null,
-        status: 'Active',
-      };
-      const { id } = await this.goTrue.createUser({
-        email: dto.ownerEmail,
-        password: tempPassword,
-        email_confirm: true,
-        app_metadata: newOwnerMetadata,
-      });
-      owner = { id, email: dto.ownerEmail, tempPassword };
+      const invited = await this.invitations.inviteNew(principal, dto.ownerName, dto.ownerEmail, dto.ownerMobile);
+      newOwnerMetadata = invited.app_metadata;
+      owner = { id: invited.id, email: invited.email!, invitationSent: true };
     }
 
     const now = new Date();
@@ -166,7 +150,7 @@ export class BranchesService {
         status: 'active',
         ownerId: owner?.id ?? existingOwner?.id ?? null,
         sourceStoreLocationId: dto.sourceStoreLocationId ?? null,
-        geofence: dto.geofence ?? null,
+        geofence,
         createdAt: now,
         updatedAt: now,
       });
@@ -200,7 +184,10 @@ export class BranchesService {
         linkedOwner = await this.linkOwner(existingOwner, saved);
       } else if (owner && newOwnerMetadata) {
         await this.goTrue.updateUser(owner.id, {
-          app_metadata: withBranchScope(newOwnerMetadata, [{ id: saved.id, name: saved.name }]),
+          app_metadata: {
+            ...withBranchScope(newOwnerMetadata, [{ id: saved.id, name: saved.name }]),
+            invitation_branch_id: saved.id,
+          },
         });
         linkedOwner = { id: owner.id, email: owner.email };
       }
@@ -233,6 +220,13 @@ export class BranchesService {
       });
     }
 
+    if (owner && this.governanceAudit) {
+      await this.governanceAudit.record({
+        category: 'branch-owner-change', action: 'branch-owner-invitation-sent', actor: principal,
+        affectedRecordType: 'branch-owner-invitation', affectedRecordId: owner.id, branchId: saved.id,
+        afterState: { email: owner.email, status: 'Pending', expiresAt: newOwnerMetadata?.invitation_expires_at },
+      });
+    }
     return { id: saved.id, code: saved.code, owner };
   }
 
@@ -338,7 +332,7 @@ export class BranchesService {
     if (dto.city !== undefined) branch.city = dto.city.trim() ? dto.city.trim() : null;
     if (dto.province !== undefined)
       branch.province = dto.province.trim() ? dto.province.trim() : null;
-    if (dto.geofence !== undefined) branch.geofence = dto.geofence ?? null;
+    if (dto.geofence !== undefined) branch.geofence = normalizeGeofence(dto.geofence);
     if (dto.region !== undefined) branch.region = dto.region;
     branch.updatedAt = new Date();
 

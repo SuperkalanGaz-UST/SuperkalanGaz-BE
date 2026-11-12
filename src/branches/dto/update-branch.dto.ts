@@ -36,8 +36,8 @@ export class UpdateBranchDto {
   province?: string;
 
   /**
-   * Delivery coverage polygon, or null to clear it. Shape is validated on the
-   * client (draw editor); stored as-is in the jsonb column.
+   * Delivery coverage polygon, or null to clear it. Geometry is validated by the service;
+   * circle vertices are recomputed before storage.
    */
   @IsOptional()
   @IsObject()

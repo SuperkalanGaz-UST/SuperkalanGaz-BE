@@ -348,3 +348,29 @@ describe('UsersService multi-branch owner scope', () => {
     });
   });
 });
+
+describe('Branch Owner invitation account boundaries', () => {
+  const principal: Principal = { userId: 'franchise-a', role: 'franchise-admin', branchIds: [], branches: [] };
+  function setup() {
+    const user: GoTrueUser = { id: 'invited-owner', email: 'invited@example.invalid', banned_until: null,
+      created_at: new Date().toISOString(), user_metadata: {},
+      app_metadata: { role: 'branch-owner', status: 'Pending', branch_owner_invitation: true, branch_ids: ['branch-a'] } };
+    const auth = { getUser: jest.fn().mockResolvedValue(user), listUsers: jest.fn().mockResolvedValue([user]), createUser: jest.fn(), updateUser: jest.fn() };
+    const branches = { find: jest.fn().mockResolvedValue([{ id: 'branch-a', name: 'Branch A', ownerId: user.id }]) };
+    return { service: new UsersService(auth as unknown as GoTrueAdminService, branches as unknown as Repository<Branch>, makeAudit()), auth };
+  }
+  it('preserves Pending status in the directory rather than advertising active access', async () => {
+    const { service } = setup();
+    expect(await service.list(principal, { role: 'branch-owner' })).toEqual([expect.objectContaining({ id: 'invited-owner', status: 'Pending' })]);
+  });
+  it('cannot activate an invitation or set its password through ordinary profile editing', async () => {
+    const { service, auth } = setup();
+    await expect(service.update(principal, 'invited-owner', { status: 'Active', password: 'AdminChosenPassword1' })).rejects.toBeInstanceOf(ForbiddenException);
+    expect(auth.updateUser).not.toHaveBeenCalled();
+  });
+  it('cannot bypass the invitation path through generic password-based account creation', async () => {
+    const { service, auth } = setup();
+    await expect(service.create(principal, { role: 'branch-owner', name: 'Owner', email: 'owner@example.invalid', password: 'AdminChosenPassword1', branchIds: ['branch-a'] })).rejects.toBeInstanceOf(ForbiddenException);
+    expect(auth.createUser).not.toHaveBeenCalled();
+  });
+});
