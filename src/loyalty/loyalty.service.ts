@@ -268,7 +268,11 @@ export class LoyaltyService {
     principal: Principal,
     query: ListRedemptionsQuery,
   ): Promise<RedemptionListItem[]> {
-    const branchIds = this.requireBranches(principal);
+    // A Branch Owner reads one explicitly selected branch; a Branch Manager has one.
+    const branchIds =
+      principal.role === 'branch-owner'
+        ? [this.requireSelectedBranch(principal, query.branchId)]
+        : this.requireBranches(principal);
 
     const track: RedemptionTrack = query.track ?? HOUSEHOLD_TRACK;
     // Default to the actionable queue; 'all' means "no status filter".

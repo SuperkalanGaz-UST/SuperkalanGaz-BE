@@ -1,5 +1,5 @@
 import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { Principal } from '../auth/principal';
 import { LpgProduct } from '../prices/lpg-product.entity';
 import { PricesService } from '../prices/prices.service';
@@ -41,6 +41,34 @@ describe('ReorderRequestsService', () => {
     branches: ['Amadeo, Cavite'],
     branchIds: ['branch-1'],
     ...overrides,
+  });
+
+  describe('listForOwner', () => {
+    const owner = principal({ userId: 'owner-1', role: 'branch-owner', branchIds: ['branch-1', 'branch-2'] });
+
+    it('checks ownership, then reads only the selected branch', async () => {
+      const repo = makeRepo();
+      const inventory = { assertOwnedBranch: jest.fn(() => Promise.resolve()) } as unknown as jest.Mocked<InventoryService>;
+      const service = new ReorderRequestsService(repo, makePrices([product()]), inventory);
+
+      await service.listForOwner(owner, 'branch-2');
+
+      expect(inventory.assertOwnedBranch).toHaveBeenCalledWith(owner, 'branch-2');
+      expect(repo.find).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ branchId: In(['branch-2']) }),
+      }));
+    });
+
+    it('reads nothing when the ownership check fails', async () => {
+      const repo = makeRepo();
+      const inventory = {
+        assertOwnedBranch: jest.fn(() => Promise.reject(new ForbiddenException())),
+      } as unknown as jest.Mocked<InventoryService>;
+      const service = new ReorderRequestsService(repo, makePrices([product()]), inventory);
+
+      await expect(service.listForOwner(owner, 'outside')).rejects.toThrow(ForbiddenException);
+      expect(repo.find).not.toHaveBeenCalled();
+    });
   });
 
   describe('create', () => {

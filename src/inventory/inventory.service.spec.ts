@@ -173,6 +173,48 @@ describe('InventoryService', () => {
     });
   });
 
+  describe('updateOwnerThreshold', () => {
+    const owner = (): Principal => ({
+      userId: 'owner-1', role: 'branch-owner', branches: ['Alpha', 'Beta'],
+      branchIds: ['branch-1', 'branch-2'],
+    });
+
+    it('upserts only the threshold for the selected owned branch', async () => {
+      const { repo, insertQb } = makeRepo();
+      const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
+
+      await service.updateOwnerThreshold(owner(), {
+        branchId: 'branch-2', productId: 'product-11kg', thresholdQty: 25,
+      });
+
+      expect(insertQb.values).toHaveBeenCalledWith(expect.objectContaining({
+        branchId: 'branch-2', productId: 'product-11kg', thresholdQty: 25, updatedBy: 'owner-1',
+      }));
+      expect(insertQb.onConflict).toHaveBeenCalledWith(expect.stringContaining('threshold_qty = EXCLUDED.threshold_qty'));
+      expect(insertQb.onConflict).toHaveBeenCalledWith(expect.not.stringContaining('current_qty'));
+    });
+
+    it('rejects a branch outside the Owner scope without writing', async () => {
+      const { repo, insertQb } = makeRepo();
+      const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
+
+      await expect(service.updateOwnerThreshold(owner(), {
+        branchId: 'outside', productId: 'product-11kg', thresholdQty: 25,
+      })).rejects.toThrow(ForbiddenException);
+      expect(insertQb.execute).not.toHaveBeenCalled();
+    });
+
+    it('rejects a Branch Manager even for their own branch', async () => {
+      const { repo, insertQb } = makeRepo();
+      const service = new InventoryService(repo, stockCheckLogs, makePrices([product()]));
+
+      await expect(service.updateOwnerThreshold(principal(), {
+        branchId: 'branch-1', productId: 'product-11kg', thresholdQty: 25,
+      })).rejects.toThrow(ForbiddenException);
+      expect(insertQb.execute).not.toHaveBeenCalled();
+    });
+  });
+
   describe('intake', () => {
     it('inserts with an ON CONFLICT increment and returns the merged view', async () => {
       const { repo, insertQb } = makeRepo();

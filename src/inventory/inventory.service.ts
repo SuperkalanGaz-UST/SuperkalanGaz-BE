@@ -6,6 +6,7 @@ import { Branch } from '../branches/branch.entity';
 import { LpgProduct } from '../prices/lpg-product.entity';
 import { PricesService } from '../prices/prices.service';
 import { IntakeStockDto } from './dto/intake-stock.dto';
+import { UpdateStockThresholdDto } from './dto/update-stock-threshold.dto';
 import { StockLevel } from './stock-level.entity';
 import { StockCheckLog } from './stock-check-log.entity';
 
@@ -61,6 +62,13 @@ export class InventoryService {
   }
 
   async listForOwner(principal: Principal, branchId: string): Promise<StockLevelView[]> {
+    await this.assertOwnedBranch(principal, branchId);
+    // Reuse the Manager's stock/catalog merge, narrowed to exactly this branch.
+    return this.listForBranch({ ...principal, branchIds: [branchId] });
+  }
+
+  /** The Branch Owner's explicitly selected branch must be one they currently own. */
+  async assertOwnedBranch(principal: Principal, branchId: string): Promise<void> {
     if (principal.role !== 'branch-owner') {
       throw new ForbiddenException('Only Branch Owners can access this inventory view');
     }
@@ -76,9 +84,41 @@ export class InventoryService {
       select: { id: true },
     });
     if (!branch) throw new ForbiddenException('Branch is outside your authorized scope');
+  }
 
-    // Reuse the Manager's stock/catalog merge, narrowed to exactly this branch.
-    return this.listForBranch({ ...principal, branchIds: [branchId] });
+  /** Branch Owner low-stock alert level for one LPG product in their branch. */
+  async updateOwnerThreshold(
+    principal: Principal,
+    dto: UpdateStockThresholdDto,
+  ): Promise<StockLevelView> {
+    await this.assertOwnedBranch(principal, dto.branchId);
+    const product = await this.findProduct(dto.productId);
+    const now = new Date();
+    await this.stockLevels
+      .createQueryBuilder()
+      .insert()
+      .into(StockLevel)
+      .values({
+        branchId: dto.branchId,
+        productId: dto.productId,
+        thresholdQty: dto.thresholdQty,
+        updatedBy: principal.userId,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .onConflict(
+        `(branch_id, product_id) WHERE deleted_at IS NULL DO UPDATE SET
+          threshold_qty = EXCLUDED.threshold_qty,
+          updated_by = EXCLUDED.updated_by,
+          updated_at = EXCLUDED.updated_at`,
+      )
+      .execute();
+    const row = await this.stockLevels.findOneByOrFail({
+      branchId: dto.branchId,
+      productId: dto.productId,
+      deletedAt: IsNull(),
+    });
+    return this.toView(dto.branchId, product, row);
   }
 
   async logStockCheck(principal: Principal): Promise<void> {

@@ -1,9 +1,10 @@
-import { Body, Controller, Get, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, ParseUUIDPipe, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { IntakeStockDto } from './dto/intake-stock.dto';
+import { UpdateStockThresholdDto } from './dto/update-stock-threshold.dto';
 import { InventoryService, StockLevelView } from './inventory.service';
 
 @Controller('inventory')
@@ -28,6 +29,16 @@ export class InventoryController {
   ): Promise<{ stockLevels: ReturnType<InventoryController['toRow']>[] }> {
     const views = await this.inventory.listForOwner(principal, branchId);
     return { stockLevels: views.map((view) => this.toRow(view)) };
+  }
+
+  @Patch('stock-levels/owner/threshold')
+  @Roles('branch-owner')
+  async updateOwnerThreshold(
+    @CurrentPrincipal() principal: Principal,
+    @Body() dto: UpdateStockThresholdDto,
+  ): Promise<{ stockLevel: ReturnType<InventoryController['toRow']> }> {
+    const view = await this.inventory.updateOwnerThreshold(principal, dto);
+    return { stockLevel: this.toRow(view) };
   }
 
   @Post('stock-checks')

@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
@@ -18,6 +18,16 @@ export class ReorderRequestsController {
     @CurrentPrincipal() principal: Principal,
   ): Promise<{ reorderRequests: ReturnType<ReorderRequestsController['toRow']>[] }> {
     const views = await this.reorderRequests.listForBranch(principal);
+    return { reorderRequests: views.map((view) => this.toRow(view)) };
+  }
+
+  @Get('owner')
+  @Roles('branch-owner')
+  async listForOwner(
+    @CurrentPrincipal() principal: Principal,
+    @Query('branchId', new ParseUUIDPipe()) branchId: string,
+  ): Promise<{ reorderRequests: ReturnType<ReorderRequestsController['toRow']>[] }> {
+    const views = await this.reorderRequests.listForOwner(principal, branchId);
     return { reorderRequests: views.map((view) => this.toRow(view)) };
   }
 

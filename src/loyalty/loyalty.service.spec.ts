@@ -331,3 +331,32 @@ describe('LoyaltyService.getCustomerLedgerByCimId (Customer Directory detail vie
     ).rejects.toBeInstanceOf(NotFoundException);
   });
 });
+
+describe('LoyaltyService.listRedemptions (Branch Owner read access)', () => {
+  it('reads only the Branch Owner selected branch', async () => {
+    const { service, repos } = makeService();
+
+    await service.listRedemptions(multiBranchOwnerPrincipal(), { status: 'all', branchId: 'branch-2' });
+
+    const where = (repos.redemptions.find.mock.calls[0][0] as unknown as { where: { branchId: FindOperator<string[]> } }).where;
+    expect(where.branchId.value).toEqual(['branch-2']);
+  });
+
+  it('requires a multi-branch Owner to select a branch', async () => {
+    const { service, repos } = makeService();
+
+    await expect(
+      service.listRedemptions(multiBranchOwnerPrincipal(), { status: 'all' }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(repos.redemptions.find).not.toHaveBeenCalled();
+  });
+
+  it('rejects a branch outside the Owner scope', async () => {
+    const { service, repos } = makeService();
+
+    await expect(
+      service.listRedemptions(multiBranchOwnerPrincipal(), { status: 'all', branchId: 'branch-9' }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(repos.redemptions.find).not.toHaveBeenCalled();
+  });
+});
