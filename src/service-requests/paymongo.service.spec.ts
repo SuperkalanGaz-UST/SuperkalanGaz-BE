@@ -57,8 +57,8 @@ describe('PayMongoService', () => {
     });
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe('https://api.paymongo.com/v2/checkout_sessions');
-    expect(new Headers(init?.headers).get('Idempotency-Key')).toBe(
-      'service-request-11111111-1111-4111-8111-111111111111-checkout',
+    expect(new Headers(init?.headers).get('Idempotency-Key')).toMatch(
+      /^service-request-11111111-1111-4111-8111-111111111111-checkout-[a-f0-9]{24}$/,
     );
     const body = JSON.parse(String(init?.body)) as {
       data: { attributes: Record<string, unknown> };
@@ -72,6 +72,27 @@ describe('PayMongoService', () => {
     );
     expect(body.data.attributes.line_items).toEqual([
       expect.objectContaining({ amount: 65000, currency: 'PHP', quantity: 2 }),
+    ]);
+  });
+
+  it('charges all cylinder lines using their saved unit prices', async () => {
+    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      data: { id: 'cs_test_1', attributes: { checkout_url: 'https://checkout.paymongo.com/cs_test_1' } },
+    })));
+    const request = serviceRequest();
+    request.items = [
+      { cylinderSize: '11kg', quantity: 2, unitPrice: 650 },
+      { cylinderSize: '2.7kg', quantity: 3, unitPrice: 200 },
+    ];
+    request.totalAmount = 1900;
+    await new PayMongoService(config()).createCheckout(request);
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as {
+      data: { attributes: { line_items: unknown[] } };
+    };
+    expect(body.data.attributes.line_items).toEqual([
+      { name: '11kg LPG cylinder', amount: 65000, quantity: 2, currency: 'PHP' },
+      { name: '2.7kg LPG cylinder', amount: 20000, quantity: 3, currency: 'PHP' },
     ]);
   });
 

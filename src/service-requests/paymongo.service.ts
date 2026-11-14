@@ -7,8 +7,8 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createHmac, timingSafeEqual } from 'node:crypto';
-import { ServiceRequest } from './service-request.entity';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { ServiceRequest, serviceRequestItems } from './service-request.entity';
 
 interface PayMongoCheckoutResponse {
   data?: {
@@ -75,9 +75,22 @@ export class PayMongoService {
 
   async createCheckout(serviceRequest: ServiceRequest): Promise<PayMongoCheckout> {
     const { secretKey, publicBaseUrl } = this.requireConfiguration();
-    if (serviceRequest.unitPrice === null || serviceRequest.totalAmount === null) {
+    const lineItems = serviceRequestItems(serviceRequest).map(item => {
+      if (item.unitPrice === null) {
+        throw new BadRequestException('Service Request has no payable amount');
+      }
+      return {
+        name: `${item.cylinderSize} LPG cylinder`,
+        amount: this.toCentavos(item.unitPrice),
+        currency: 'PHP',
+        quantity: item.quantity,
+      };
+    });
+    const total = lineItems.reduce((sum, item) => sum + item.amount * item.quantity, 0);
+    if (serviceRequest.totalAmount === null || total !== this.toCentavos(serviceRequest.totalAmount)) {
       throw new BadRequestException('Service Request has no payable amount');
     }
+    const itemVersion = createHash('sha256').update(JSON.stringify(lineItems)).digest('hex').slice(0, 24);
 
     const reference = `SR-${serviceRequest.id}`;
     const result = await this.request(
@@ -87,19 +100,12 @@ export class PayMongoService {
         headers: {
           Authorization: this.basicAuthorization(secretKey),
           'Content-Type': 'application/json',
-          'Idempotency-Key': `service-request-${serviceRequest.id}-checkout`,
+          'Idempotency-Key': `service-request-${serviceRequest.id}-checkout-${itemVersion}`,
         },
         body: JSON.stringify({
           data: {
             attributes: {
-              line_items: [
-                {
-                  name: `${serviceRequest.cylinderSize} LPG cylinder`,
-                  amount: this.toCentavos(serviceRequest.unitPrice),
-                  currency: 'PHP',
-                  quantity: serviceRequest.quantity,
-                },
-              ],
+              line_items: lineItems,
               payment_method_types: ['gcash', 'paymaya', 'qrph'],
               success_url: `${publicBaseUrl}/api/payments/paymongo/return/success`,
               cancel_url: `${publicBaseUrl}/api/payments/paymongo/return/cancelled`,

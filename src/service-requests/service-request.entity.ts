@@ -10,6 +10,30 @@ const decimalTransformer = {
  * customer-initiated (later slice). */
 export type OrderSource = 'Mobile App' | 'Walk-in/Phone';
 
+export interface ServiceRequestItem {
+  cylinderSize: string;
+  quantity: number;
+  unitPrice: number | null;
+}
+
+export function serviceRequestItems(
+  request: Pick<ServiceRequest, 'items' | 'cylinderSize' | 'quantity' | 'unitPrice'>,
+): ServiceRequestItem[] {
+  return request.items ?? [{
+    cylinderSize: request.cylinderSize,
+    quantity: request.quantity,
+    unitPrice: request.unitPrice,
+  }];
+}
+
+export function serviceRequestItemRows(request: ServiceRequest) {
+  return serviceRequestItems(request).map(({ cylinderSize, quantity, unitPrice }) => ({
+    cylinder_size: cylinderSize,
+    quantity,
+    unit_price: unitPrice,
+  }));
+}
+
 export type PaymentMethod = 'Cash on Delivery' | 'PayMongo';
 export type PaymentStatus = 'Unpaid' | 'Pending' | 'Paid';
 
@@ -93,6 +117,10 @@ export class ServiceRequest {
     transformer: decimalTransformer,
   })
   unitPrice!: number | null;
+
+  /** Priced cylinder lines on the same branch-scoped Service Request. */
+  @Column({ type: 'jsonb', nullable: true })
+  items!: ServiceRequestItem[] | null;
 
   @Column({
     name: 'total_amount',

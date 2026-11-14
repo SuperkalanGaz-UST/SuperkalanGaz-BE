@@ -18,7 +18,7 @@ import {
 import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
 import { CimService } from '../cim/cim.service';
-import { ServiceRequest } from '../service-requests/service-request.entity';
+import { ServiceRequest, serviceRequestItemRows } from '../service-requests/service-request.entity';
 import { ConnectVehicleGpsDto } from './dto/connect-vehicle-gps.dto';
 import { CreateVehicleDto } from './dto/create-vehicle.dto';
 import { ListRidersQuery } from './dto/list-riders.query';
@@ -190,6 +190,7 @@ export class FleetService {
             deliveryAddress: activeServiceRequest.deliveryAddress,
             cylinderSize: activeServiceRequest.cylinderSize,
             quantity: activeServiceRequest.quantity,
+            ...(activeServiceRequest.items ? { items: serviceRequestItemRows(activeServiceRequest) } : {}),
             vehicleLabel: vehicle?.plateNumber ?? 'Vehicle not assigned',
             requestedAt: activeServiceRequest.requestedAt.toISOString(),
             dispatchedAt: activeServiceRequest.dispatchedAt!.toISOString(),

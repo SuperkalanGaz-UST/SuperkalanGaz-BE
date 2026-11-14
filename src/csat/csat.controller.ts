@@ -15,7 +15,7 @@ import { RolesGuard } from '../auth/roles.guard';
 import { CsatService, CsatSummary, FranchiseCsatAnalyticsSeries, IncidentListItem, RatingListItem } from './csat.service';
 import { Rating } from './rating.entity';
 import { Incident } from './incident.entity';
-import { ServiceRequest } from '../service-requests/service-request.entity';
+import { ServiceRequest, serviceRequestItemRows } from '../service-requests/service-request.entity';
 import { ListRatingsQuery } from './dto/list-ratings.query';
 import { ResolveRatingDto } from './dto/resolve-rating.dto';
 import { CreateIncidentDto } from './dto/create-incident.dto';
@@ -255,6 +255,7 @@ export class CsatController {
       customer_name: sr.customerName,
       delivery_address: sr.deliveryAddress,
       cylinder_size: sr.cylinderSize,
+      items: serviceRequestItemRows(sr),
       quantity: sr.quantity,
       rider_id: sr.riderId,
       // All four SLA timestamps — BM-039's AC calls for them explicitly.

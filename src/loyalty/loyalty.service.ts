@@ -1280,6 +1280,7 @@ export class LoyaltyService {
     serviceRequestId: string,
     cylinderSize: string,
     quantity = 1,
+    items?: { cylinderSize: string; quantity: number }[],
   ): Promise<void> {
     const customer = await this.cim.findInBranch(customerId, branchId);
     if (!customer) throw new BadRequestException('Customer not found in this branch');
@@ -1294,6 +1295,7 @@ export class LoyaltyService {
       serviceRequestId,
       cylinderSize,
       quantity,
+      ...(items ? [items] as const : []),
     );
   }
 
@@ -1304,6 +1306,7 @@ export class LoyaltyService {
     serviceRequestId: string,
     cylinderSize: string,
     quantity = 1,
+    items = [{ cylinderSize, quantity }],
   ): Promise<void> {
     const now = new Date();
     const expiresAt = new Date(now);
@@ -1313,9 +1316,11 @@ export class LoyaltyService {
       const branch = await manager.findOne(Branch, { where: { id: branchId } });
       if (!branch) throw new BadRequestException('Branch not found');
       const rates = branch.loyaltyPointRates ?? DEFAULT_CYLINDER_POINTS;
-      const pointsPerUnit = rates[cylinderSize as keyof LoyaltyPointRates];
-      if (!Number.isInteger(pointsPerUnit) || pointsPerUnit <= 0) return;
-      const points = pointsPerUnit * quantity;
+      const points = items.reduce((sum, item) => {
+        const rate = rates[item.cylinderSize as keyof LoyaltyPointRates];
+        return Number.isInteger(rate) && rate > 0 ? sum + rate * item.quantity : sum;
+      }, 0);
+      if (points === 0) return;
 
       await manager
         .createQueryBuilder()
@@ -1331,7 +1336,7 @@ export class LoyaltyService {
 
       await this.expireHouseholdPointsInTx(manager, account, now);
       const existing = await manager.findOne(HouseholdPointTransaction, {
-        where: { sourceServiceRequestId: serviceRequestId, type: 'earn' },
+        where: { sourceServiceRequestId: serviceRequestId, branchId, type: 'earn' },
         select: { id: true },
       });
       if (existing) return;
