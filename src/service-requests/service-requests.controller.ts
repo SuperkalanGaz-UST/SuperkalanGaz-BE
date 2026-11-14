@@ -142,7 +142,33 @@ export class ServiceRequestsController {
     return { serviceRequests: items.map((item) => this.toRow(item)) };
   }
 
-  /** Branch Owner read-only Service Level Management analytics. */
+  /** Cross-branch SLA compliance per active branch for the Franchise Administrator. */
+  @Get('reports/franchise-sla')
+  @Roles('franchise-admin')
+  async franchiseSlaReport(@Query() query: BranchReportQuery) {
+    const branches = await this.serviceRequests.franchiseSlaReport(query);
+    return {
+      branches: branches.map((branch) => ({
+        branch_id: branch.branchId,
+        branch_name: branch.branchName,
+        total_service_requests: branch.totalServiceRequests,
+        evaluated_requests: branch.evaluatedRequests,
+        within_sla: branch.withinSla,
+        breaches: branch.breaches,
+        not_evaluated: branch.notEvaluated,
+        overall_compliance_rate: branch.overallComplianceRate,
+        segments: Object.entries(branch.segments).map(([segment, metric]) => ({
+          segment,
+          evaluated_requests: metric.evaluated,
+          breached_requests: metric.breached,
+          compliance_rate: metric.complianceRate,
+          average_minutes: metric.averageMinutes,
+        })),
+      })),
+    };
+  }
+
+  /** Branch-scoped Service Level Management analytics. */
   @Get('reports/sla')
   @Roles('branch-manager', 'branch-owner')
   async slaReport(
