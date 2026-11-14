@@ -21,19 +21,17 @@ export class StaffLoginService {
   private async resolveEmail(username: string): Promise<string | null> {
     const normalized = username.trim().toLowerCase();
     const users = await this.goTrue.listUsers();
-    const matches = users.filter((user) =>
-      typeof user.app_metadata.username === 'string' &&
-      user.app_metadata.username.trim().toLowerCase() === normalized,
-    );
-    // Legacy duplicate metadata must never pick an arbitrary identity. Only an
-    // exact, unambiguous protected username may reach the password exchange.
-    if (matches.length !== 1) return null;
-    const user = matches[0];
-    if (
-      !STAFF_ROLES.includes(String(user.app_metadata.role)) ||
-      (user.app_metadata.status !== undefined && user.app_metadata.status !== 'Active') ||
-      (user.banned_until && new Date(user.banned_until).getTime() > Date.now())
-    ) return null;
-    return user.email;
+    const now = Date.now();
+    const matches = users.filter((user) => {
+      const { username: savedUsername, role, status } = user.app_metadata;
+      return typeof savedUsername === 'string' &&
+        savedUsername.trim().toLowerCase() === normalized &&
+        STAFF_ROLES.includes(String(role)) &&
+        (status === undefined || status === 'Active') &&
+        !(user.banned_until && Date.parse(user.banned_until) > now);
+    });
+    // Retained ineligible accounts cannot block a staff login. Multiple eligible
+    // matches still fail closed instead of guessing which account to authenticate.
+    return matches.length === 1 ? matches[0].email : null;
   }
 }
