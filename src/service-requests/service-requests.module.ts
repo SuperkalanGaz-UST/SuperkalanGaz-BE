@@ -11,6 +11,7 @@ import { ServiceRequestStatusHistory } from './service-request-status-history.en
 import { SlaConfiguration } from './sla-configuration.entity';
 import { ServiceRequestsController } from './service-requests.controller';
 import { DeliveryRiderServiceRequestsController } from './delivery-rider-service-requests.controller';
+import { DeliveryOffersService } from './delivery-offers.service';
 import { ServiceRequestsService } from './service-requests.service';
 import { PayMongoController } from './paymongo.controller';
 import { PayMongoService } from './paymongo.service';
@@ -48,6 +49,7 @@ import { PrivateObjectStorageService } from '../storage/private-object-storage.s
   ],
   providers: [
     ServiceRequestsService,
+    DeliveryOffersService,
     ServiceRequestPaymentsService,
     PayMongoService,
     PrivateObjectStorageService,

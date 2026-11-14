@@ -19,7 +19,7 @@ describe('VehiclesController read-only access', () => {
     expect(guard.canActivate(context(method, owner))).toBe(true);
   });
 
-  it.each(['create', 'connectGps', 'retryGpsProvisioning', 'logMileage', 'resetPms'] as const)(
+  it.each(['create', 'rename', 'connectGps', 'retryGpsProvisioning', 'logMileage', 'resetPms'] as const)(
     'denies Owner writes through %s while preserving Manager access', method => {
       expect(() => guard.canActivate(context(method, owner))).toThrow(ForbiddenException);
       expect(guard.canActivate(context(method, { ...owner, role: 'branch-manager' }))).toBe(true);

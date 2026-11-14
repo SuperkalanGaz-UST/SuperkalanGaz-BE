@@ -29,6 +29,7 @@ describe('FleetService', () => {
       id: 'vehicle-1',
       branchId: 'branch-uuid-1',
       plateNumber: 'NBH-1234',
+      displayName: null,
       vehicleType: 'motorcycle',
       assignedRiderId: 'rider-1',
       status: 'active',
@@ -113,6 +114,12 @@ describe('FleetService', () => {
   ) => {
     // Transactions reuse these repository fakes for unit coverage.
     const manager = {
+      createQueryBuilder: jest.fn(() => ({
+        where: jest.fn().mockReturnThis(), andWhere: jest.fn().mockReturnThis(),
+        innerJoin: jest.fn().mockReturnThis(), getExists: jest.fn().mockResolvedValue(false),
+      })),
+      findOne: jest.fn((entity, options) => entity === Rider ? riderRepo.findOne(options) : null),
+      update: jest.fn((entity, criteria, value) => entity === Rider ? riderRepo.update(criteria, value) : vehicleRepo.update(criteria, value)),
       getRepository: jest.fn((entity: unknown) => {
         if (entity === Vehicle) return vehicleRepo;
         if (entity === Rider) return riderRepo;
@@ -126,6 +133,7 @@ describe('FleetService', () => {
       value: { transaction: (work: (value: EntityManager) => Promise<unknown>) => work(manager as unknown as EntityManager) },
       configurable: true,
     });
+    Object.defineProperty(riderRepo, 'manager', { value: vehicleRepo.manager, configurable: true });
     return new FleetService(
     riderRepo,
     vehicleRepo,
@@ -507,68 +515,10 @@ describe('FleetService', () => {
     }));
   });
 
-  it('looks up an assignable rider by id, branch, Available status, and live row', async () => {
-    const repo = makeRiderRepo();
-    const service = makeService(repo);
-
-    await service.findAssignableRider('rider-1', 'branch-uuid-1');
-
-    const where = repo.findOne.mock.calls[0][0]?.where as Record<string, unknown>;
-    expect(where.id).toBe('rider-1');
-    expect(where.branchId).toBe('branch-uuid-1');
-    expect(where.status).toBe('Available');
-    expect(where).toHaveProperty('deletedAt');
-  });
-
-  it('flips a rider to On Delivery and bumps updated_at', async () => {
-    const repo = makeRiderRepo();
-    const service = makeService(repo);
-
-    await service.markOnDelivery('rider-1');
-
-    expect(repo.update).toHaveBeenCalledTimes(1);
-    const [criteria, patch] = repo.update.mock.calls[0];
-    expect(criteria).toEqual({ id: 'rider-1' });
-    expect((patch as Partial<Rider>).status).toBe('On Delivery');
-    expect((patch as Partial<Rider>).updatedAt).toBeInstanceOf(Date);
-  });
-
-  it('returns a rider to Available when their vehicle is not under maintenance', async () => {
+  it('registers an unassigned vehicle in the JWT-derived branch and starts PMS tracking at its odometer', async () => {
     const riderRepo = makeRiderRepo();
     const vehicleRepo = makeVehicleRepo();
-    vehicleRepo.findOne.mockResolvedValueOnce(null); // no vehicle flagged 'maintenance' for this rider
-    const service = makeService(riderRepo, vehicleRepo);
-
-    await service.markAvailable('rider-1');
-
-    expect(riderRepo.update).toHaveBeenCalledTimes(1);
-    const [criteria, patch] = riderRepo.update.mock.calls[0];
-    expect(criteria).toEqual({ id: 'rider-1' });
-    expect((patch as Partial<Rider>).status).toBe('Available');
-  });
-
-  it('sends a rider to Maintenance Due instead of Available if their vehicle is flagged (BM-US-09)', async () => {
-    const riderRepo = makeRiderRepo();
-    const vehicleRepo = makeVehicleRepo({ status: 'maintenance' });
-    const service = makeService(riderRepo, vehicleRepo);
-
-    await service.markAvailable('rider-1');
-
-    const [, patch] = riderRepo.update.mock.calls[0];
-    expect((patch as Partial<Rider>).status).toBe('Maintenance Due');
-  });
-
-  it('registers a vehicle in the JWT-derived branch and starts PMS tracking at its odometer', async () => {
-    const riderRepo = makeRiderRepo();
-    riderRepo.findOne.mockResolvedValueOnce({
-      id: '550e8400-e29b-41d4-a716-446655440000',
-      branchId: 'branch-uuid-1',
-      deletedAt: null,
-    } as Rider);
-    const vehicleRepo = makeVehicleRepo();
-    vehicleRepo.findOne
-      .mockResolvedValueOnce(null) // plate is free
-      .mockResolvedValueOnce(null); // rider is not assigned elsewhere
+    vehicleRepo.findOne.mockResolvedValueOnce(null);
     const traccar = makeTraccar();
     const service = makeService(
       riderRepo,
@@ -581,7 +531,6 @@ describe('FleetService', () => {
     const registered = await service.registerVehicle(principal(['branch-uuid-1']), {
       plateNumber: '  abc-1234  ',
       initialOdometerKm: 4250,
-      assignedRiderId: '550e8400-e29b-41d4-a716-446655440000',
     });
 
     expect(vehicleRepo.create).toHaveBeenCalledWith(
@@ -589,7 +538,7 @@ describe('FleetService', () => {
         branchId: 'branch-uuid-1',
         plateNumber: 'ABC-1234',
         vehicleType: 'motorcycle',
-        assignedRiderId: '550e8400-e29b-41d4-a716-446655440000',
+        assignedRiderId: null,
         status: 'active',
         hardwareUniqueId: null,
         traccarProvisioningStatus: 'unconfigured',
@@ -742,6 +691,51 @@ describe('FleetService', () => {
     expect(vehicleRepo.save).toHaveBeenCalledTimes(2);
   });
 
+  it('stores the optional vehicle label on registration', async () => {
+    const vehicleRepo = makeVehicleRepo();
+    vehicleRepo.findOne.mockResolvedValueOnce(null);
+    const service = makeService(makeRiderRepo(), vehicleRepo, makeLogRepo(), makeBranchRepo());
+
+    await service.registerVehicle(principal(['branch-uuid-1']), {
+      plateNumber: 'ABC-1234',
+      initialOdometerKm: 0,
+      displayName: 'Red Yamaha Single Tank',
+    });
+
+    expect(vehicleRepo.create).toHaveBeenCalledWith(
+      expect.objectContaining({ plateNumber: 'ABC-1234', displayName: 'Red Yamaha Single Tank' }),
+    );
+  });
+
+  it('renames only the label of a vehicle inside the manager branch', async () => {
+    const vehicleRepo = makeVehicleRepo();
+    const service = makeService(makeRiderRepo(), vehicleRepo);
+
+    const renamed = await service.renameVehicle(principal(['branch-uuid-1']), 'vehicle-1', {
+      displayName: 'Red Yamaha Single Tank',
+    });
+
+    expect(vehicleRepo.findOne).toHaveBeenCalledWith({
+      where: expect.objectContaining({ id: 'vehicle-1', branchId: expect.anything() }),
+    });
+    const [criteria, patch] = vehicleRepo.update.mock.calls[0];
+    expect(criteria).toEqual(expect.objectContaining({ id: 'vehicle-1', branchId: 'branch-uuid-1' }));
+    expect(Object.keys(patch as object).sort()).toEqual(['displayName', 'updatedAt']);
+    expect(renamed.displayName).toBe('Red Yamaha Single Tank');
+    expect(renamed.plateNumber).toBe('NBH-1234');
+  });
+
+  it('returns 404 instead of renaming a vehicle outside the manager branch', async () => {
+    const vehicleRepo = makeVehicleRepo();
+    vehicleRepo.findOne.mockResolvedValueOnce(null);
+    const service = makeService(makeRiderRepo(), vehicleRepo);
+
+    await expect(
+      service.renameVehicle(principal(['branch-uuid-1']), 'other-branch-vehicle', { displayName: 'X' }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(vehicleRepo.update).not.toHaveBeenCalled();
+  });
+
   it('rejects registration when the plate already exists in the manager branch', async () => {
     const vehicleRepo = makeVehicleRepo();
     const service = makeService(makeRiderRepo(), vehicleRepo);
@@ -752,25 +746,6 @@ describe('FleetService', () => {
         initialOdometerKm: 0,
       }),
     ).rejects.toBeInstanceOf(ConflictException);
-
-    expect(vehicleRepo.save).not.toHaveBeenCalled();
-  });
-
-  it('rejects registration when a rider is outside the manager branch', async () => {
-    const riderRepo = makeRiderRepo();
-    const vehicleRepo = makeVehicleRepo();
-    vehicleRepo.findOne
-      .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce(null);
-    const service = makeService(riderRepo, vehicleRepo);
-
-    await expect(
-      service.registerVehicle(principal(['branch-uuid-1']), {
-        plateNumber: 'ABC-1234',
-        initialOdometerKm: 0,
-        assignedRiderId: '550e8400-e29b-41d4-a716-446655440000',
-      }),
-    ).rejects.toThrow('Assigned Delivery Rider was not found in this branch');
 
     expect(vehicleRepo.save).not.toHaveBeenCalled();
   });

@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import {
+  EntityManager,
   In,
   IsNull,
   LessThanOrEqual,
@@ -19,15 +20,17 @@ import { Principal } from '../auth/principal';
 import { Branch } from '../branches/branch.entity';
 import { CimService } from '../cim/cim.service';
 import { ServiceRequest } from '../service-requests/service-request.entity';
+import { openDeliveryOffers } from '../service-requests/delivery-offer.entity';
 import { ConnectVehicleGpsDto } from './dto/connect-vehicle-gps.dto';
 import { CreateVehicleDto } from './dto/create-vehicle.dto';
+import { UpdateVehicleNameDto } from './dto/update-vehicle-name.dto';
 import { ListRidersQuery } from './dto/list-riders.query';
 import { LogMileageDto } from './dto/log-mileage.dto';
 import { UpdateDeliveryRiderLocationDto } from './dto/update-delivery-rider-location.dto';
 import { Rider } from './rider.entity';
 import { Vehicle } from './vehicle.entity';
 import { VehicleMaintenanceLog } from './vehicle-maintenance-log.entity';
-import { TraccarClient } from './traccar/traccar.client';
+import { TraccarClient, type VehiclePosition } from './traccar/traccar.client';
 
 /**
  * Fleet roster (Fleet module). This slice is minimal: list the caller's branch
@@ -112,8 +115,7 @@ export class FleetService {
     return currentOrders;
   }
 
-  /** Read the manager's saved assignment; phone positions never identify or
-   * mutate a vehicle. Callers pass only their guard-scoped, live roster rows. */
+  /** Read current dispatch assignments for guard-scoped roster rows. */
   async assignedVehiclesForRiders(riders: Rider[]): Promise<Map<string, Vehicle>> {
     if (riders.length === 0) return new Map();
     const riderBranches = new Map(riders.map(rider => [rider.id, rider.branchId]));
@@ -146,7 +148,7 @@ export class FleetService {
     });
     if (!rider) throw new NotFoundException('Delivery Rider roster entry not found');
     const vehicle = await this.vehicles.findOne({
-      where: { branchId, assignedRiderId: rider.id },
+      where: { branchId, assignedRiderId: rider.id, status: Not('inactive') },
     });
     const activeServiceRequest = await this.serviceRequests.findOne({
       where: {
@@ -162,6 +164,22 @@ export class FleetService {
       // and keeps the rider's view branch-scoped.
       order: { dispatchedAt: 'DESC' },
     });
+
+    const offer = rider.status === 'Available' ? await openDeliveryOffers(this.serviceRequests.manager, branchId)
+      .andWhere('offer.rider_id = :riderId', { riderId: rider.id })
+      .addSelect('request.id', 'request_id')
+      .addSelect('request.sr_code', 'sr_code')
+      .addSelect('request.customer_name', 'customer_name')
+      .addSelect('request.delivery_address', 'delivery_address')
+      .addSelect('request.cylinder_size', 'cylinder_size')
+      .addSelect('request.quantity', 'quantity')
+      .addSelect('request.requested_at', 'requested_at')
+      .getRawAndEntities<{
+        request_id: string; sr_code: string; customer_name: string; delivery_address: string;
+        cylinder_size: string; quantity: number; requested_at: Date;
+      }>() : null;
+    const currentOffer = offer?.entities[0];
+    const offeredRequest = offer?.raw[0];
 
     return {
       deliveryRider: {
@@ -181,7 +199,19 @@ export class FleetService {
             }
           : null,
       },
-      currentOffer: null,
+      currentOffer: currentOffer && offeredRequest ? {
+        offerId: currentOffer.id,
+        expiresAt: currentOffer.expiresAt.toISOString(),
+        assignment: {
+          serviceRequestId: offeredRequest.request_id,
+          srCode: offeredRequest.sr_code,
+          customerName: offeredRequest.customer_name,
+          deliveryAddress: offeredRequest.delivery_address,
+          cylinderSize: offeredRequest.cylinder_size,
+          quantity: offeredRequest.quantity,
+          requestedAt: offeredRequest.requested_at.toISOString(),
+        },
+      } : null,
       activeDelivery: activeServiceRequest
         ? {
             serviceRequestId: activeServiceRequest.id,
@@ -250,41 +280,59 @@ export class FleetService {
     }
   }
 
-  /**
-   * A rider can go Available only when a healthy same-branch vehicle has been
-   * assigned by the Branch Manager. Going Offline is always allowed unless an
-   * active delivery already owns the rider state.
-   */
-  async setDeliveryRiderAvailability(
-    principal: Principal,
-    available: boolean,
-  ): Promise<void> {
+  /** Availability enables phone GPS and offers. A motorcycle is claimed on acceptance. */
+  async setDeliveryRiderAvailability(principal: Principal, available: boolean): Promise<void> {
     const branchId = this.requireSingleBranch(principal);
-    const rider = await this.riders.findOne({
-      where: { authUserId: principal.userId, branchId, deletedAt: IsNull() },
-    });
-    if (!rider) throw new NotFoundException('Delivery Rider roster entry not found');
-    if (rider.status === 'On Delivery') {
-      throw new ConflictException('Availability cannot change during an active delivery');
-    }
-    if (available) {
-      const vehicle = await this.vehicles.findOne({
-        where: { branchId, assignedRiderId: rider.id, status: 'active' },
+    await this.riders.manager.transaction(async manager => {
+      const rider = await manager.findOne(Rider, {
+        where: { authUserId: principal.userId, branchId, deletedAt: IsNull() },
+        lock: { mode: 'pessimistic_write' },
       });
-      if (!vehicle) {
-        throw new ConflictException(
-          'A healthy branch vehicle must be assigned before going available',
-        );
+      if (!rider) throw new NotFoundException('Delivery Rider roster entry not found');
+      if (rider.status === 'On Delivery') {
+        throw new ConflictException('Availability cannot change during an active delivery');
       }
-    }
-    await this.riders.update(
-      { id: rider.id, branchId },
-      {
+      if (!available && await openDeliveryOffers(manager, branchId)
+        .andWhere('offer.rider_id = :riderId', { riderId: rider.id }).getExists()) {
+        throw new ConflictException('Respond to your delivery offer before going Offline');
+      }
+      await manager.update(Rider, { id: rider.id, branchId }, {
         status: available ? 'Available' : 'Offline',
         updatedAt: new Date(),
         ...(!available ? this.emptyOperationalLocation() : {}),
-      },
-    );
+      });
+    });
+  }
+
+  async dispatchMotorcycles(branchId: string, previousRiderId: string | null): Promise<Vehicle[]> {
+    const eligible = {
+      branchId,
+      status: 'active' as const,
+      traccarProvisioningStatus: 'provisioned' as const,
+      traccarDeviceId: Not(IsNull()),
+      hardwareUniqueId: Not(IsNull()),
+    };
+    return this.vehicles.find({
+      where: previousRiderId
+        ? [{ ...eligible, assignedRiderId: IsNull() }, { ...eligible, assignedRiderId: previousRiderId }]
+        : { ...eligible, assignedRiderId: IsNull() },
+      order: { plateNumber: 'ASC' },
+    });
+  }
+
+  async dispatchMotorcyclePositions(vehicles: Vehicle[]): Promise<VehiclePosition[]> {
+    const devices = vehicles.flatMap(vehicle => vehicle.traccarDeviceId && vehicle.hardwareUniqueId
+      ? [{ id: vehicle.traccarDeviceId, uniqueId: vehicle.hardwareUniqueId }]
+      : []);
+    return this.traccar.latestVehiclePositions(devices);
+  }
+
+  /** Vehicle rows are locked before rider rows, matching the PMS write order. */
+  async releaseDeliveryVehicle(manager: EntityManager, branchId: string, riderId: string, now: Date): Promise<void> {
+    await manager.update(Vehicle, { branchId, assignedRiderId: riderId }, { assignedRiderId: null, updatedAt: now });
+    await manager.update(Rider, { id: riderId, branchId, status: 'On Delivery', deletedAt: IsNull() }, {
+      plate: '', status: 'Available', updatedAt: now,
+    });
   }
 
   /**
@@ -345,40 +393,8 @@ export class FleetService {
       : { recorded: false, receivedAt: null };
   }
 
-  /**
-   * Internal lookup used by the SRD dispatch flow to confirm a rider is
-   * assignable to a Service Request: the rider exists, is not soft-deleted,
-   * belongs to the SAME branch as the request, and is currently 'Available'.
-   * Returns null when any of those fail — the caller turns that into a
-   * BadRequestException. Referential integrity is checked here in the service
-   * layer; the schema has no FK constraints by design (AGENTS.md §6).
-   */
-  async findAssignableRider(
-    riderId: string,
-    branchId: string,
-  ): Promise<Rider | null> {
-    return this.riders.findOne({
-      where: {
-        id: riderId,
-        branchId,
-        status: 'Available',
-        deletedAt: IsNull(),
-      },
-    });
-  }
-
-  /**
-   * Look up a rider by id, scoped to the SAME branch, regardless of their
-   * current status. Used by the SRD reassignment flow (story BM-010) to load
-   * the CURRENTLY assigned rider — who is 'On Delivery', not 'Available', so
-   * findAssignableRider (status-filtered) cannot find them. Mirrors
-   * CimService.findInBranch's naming/shape. Returns null if unknown,
-   * soft-deleted, or in another branch.
-   */
   async findInBranch(riderId: string, branchId: string): Promise<Rider | null> {
-    return this.riders.findOne({
-      where: { id: riderId, branchId, deletedAt: IsNull() },
-    });
+    return this.riders.findOne({ where: { id: riderId, branchId, deletedAt: IsNull() } });
   }
 
   /** Look up the live roster entry for an authenticated Delivery Rider in the
@@ -430,43 +446,6 @@ export class FleetService {
   }
 
   /**
-   * Flip a rider to 'On Delivery' so they drop out of the Available list once
-   * dispatched — prevents another Service Request picking the same rider. The
-   * rider returns to 'Available' in the later "mark delivered" slice (Slice 3).
-   */
-  async markOnDelivery(riderId: string): Promise<void> {
-    await this.riders.update(
-      { id: riderId },
-      { status: 'On Delivery', updatedAt: new Date() },
-    );
-  }
-
-  /**
-   * Return a rider to 'Available' once their Service Request is marked delivered
-   * (Slice 3, story BM-007) — the inverse of markOnDelivery. Puts the rider back
-   * on the dispatch roster so the branch can assign them to the next order.
-   *
-   * Vehicle-aware (story BM-US-09): if the rider's assigned vehicle was flagged
-   * 'maintenance' while they were out (logMileage can fire mid-delivery), they go
-   * to 'Maintenance Due' instead of 'Available' — otherwise this unconditional
-   * "delivery done" transition would silently clear a maintenance flag BM-045
-   * requires to stick until an explicit PMS reset.
-   */
-  async markAvailable(riderId: string): Promise<void> {
-    const dueForMaintenance = await this.vehicles.findOne({
-      where: { assignedRiderId: riderId, status: 'maintenance' },
-    });
-    await this.riders.update(
-      { id: riderId },
-      {
-        status: dueForMaintenance ? 'Maintenance Due' : 'Available',
-        updatedAt: new Date(),
-        ...(dueForMaintenance ? this.emptyOperationalLocation() : {}),
-      },
-    );
-  }
-
-  /**
    * Register a delivery motorcycle in the authenticated Branch Manager's sole
    * branch. No branch identifier is accepted from the client. The starting
    * odometer is also the initial PMS baseline, so maintenance distance begins
@@ -488,36 +467,13 @@ export class FleetService {
       throw new ConflictException('A vehicle with this plate number is already registered');
     }
 
-    if (dto.assignedRiderId) {
-      const rider = await this.riders.findOne({
-        where: {
-          id: dto.assignedRiderId,
-          branchId,
-          deletedAt: IsNull(),
-        },
-      });
-      if (!rider) {
-        throw new BadRequestException(
-          'Assigned Delivery Rider was not found in this branch',
-        );
-      }
-
-      const assignedVehicle = await this.vehicles.findOne({
-        where: { branchId, assignedRiderId: rider.id },
-      });
-      if (assignedVehicle) {
-        throw new ConflictException(
-          'This Delivery Rider is already assigned to another vehicle',
-        );
-      }
-    }
-
     const now = new Date();
     const vehicle = this.vehicles.create({
       branchId,
       plateNumber,
+      displayName: dto.displayName ?? null,
       vehicleType: 'motorcycle',
-      assignedRiderId: dto.assignedRiderId ?? null,
+      assignedRiderId: null,
       status: 'active',
       hardwareUniqueId: null,
       traccarDeviceId: null,
@@ -539,7 +495,7 @@ export class FleetService {
         (error as { code?: string }).code === '23505'
       ) {
         throw new ConflictException(
-          'The plate number or Delivery Rider is already assigned in this branch',
+          'A vehicle with this plate number is already registered',
         );
       }
       throw error;
@@ -632,6 +588,28 @@ export class FleetService {
     vehicle.updatedAt = new Date();
     const pending = await this.vehicles.save(vehicle);
     return this.provisionVehicle(pending);
+  }
+
+  /**
+   * Set or clear the display label of a vehicle in the Branch Manager's sole
+   * branch. getVehicle applies the JWT-derived branch scope, so a vehicle UUID
+   * from another branch resolves to 404. Only the label column is written, so
+   * a concurrent mileage/GPS update to the same row is not overwritten.
+   */
+  async renameVehicle(
+    principal: Principal,
+    vehicleId: string,
+    dto: UpdateVehicleNameDto,
+  ): Promise<Vehicle> {
+    const branchId = this.requireSingleBranch(principal);
+    const vehicle = await this.getVehicle(principal, vehicleId);
+    const displayName = dto.displayName ?? null;
+    const updatedAt = new Date();
+    await this.vehicles.update(
+      { id: vehicle.id, branchId, status: Not('inactive') },
+      { displayName, updatedAt },
+    );
+    return { ...vehicle, displayName, updatedAt };
   }
 
   /** The caller's branch vehicle roster (story BM-042), plate order. */

@@ -55,19 +55,10 @@ describe('ServiceRequestsService', () => {
     };
   };
 
-  // Fake Fleet service: `findAssignableRider` returns the NEW rider being
-  // assigned (or null when not assignable); `findInBranch` is the
-  // status-agnostic lookup reassign() uses to name the CURRENT rider (who is
-  // 'On Delivery', not 'Available') — defaults to the same rider so existing
-  // dispatch/deliver tests (which only care about one rider) are unaffected;
-  // `markOnDelivery` / `markAvailable` are spies.
-  const makeFleet = (assignableRider: Rider | null, currentRider: Rider | null = assignableRider) =>
+  const makeFleet = (rider: Rider | null) =>
     ({
-      findAssignableRider: jest.fn(() => Promise.resolve(assignableRider)),
-      findInBranch: jest.fn(() => Promise.resolve(currentRider)),
-      findByAuthUserInBranch: jest.fn(() => Promise.resolve(currentRider)),
-      markOnDelivery: jest.fn(() => Promise.resolve()),
-      markAvailable: jest.fn(() => Promise.resolve()),
+      findByAuthUserInBranch: jest.fn(() => Promise.resolve(rider)),
+      releaseDeliveryVehicle: jest.fn(() => Promise.resolve()),
     }) as unknown as jest.Mocked<FleetService>;
 
   // Fake SLA-configuration repo: `find` returns no rows by default (no
@@ -238,13 +229,6 @@ describe('ServiceRequestsService', () => {
 
   const availableRider = (): Rider =>
     ({ id: 'rider-1', branchId: 'branch-uuid-1', status: 'Available' }) as Rider;
-
-  // For reassign() tests: the rider CURRENTLY assigned (On Delivery, matches
-  // outForDeliverySr's riderId) and a DIFFERENT rider being reassigned to.
-  const currentAssignedRider = (): Rider =>
-    ({ id: 'rider-1', branchId: 'branch-uuid-1', status: 'On Delivery', name: 'Current Rider' }) as Rider;
-  const newAssignableRider = (): Rider =>
-    ({ id: 'rider-2', branchId: 'branch-uuid-1', status: 'Available', name: 'New Rider' }) as Rider;
 
   const dto: CreateServiceRequestDto = {
     customerName: '  Juan Dela Cruz ',
@@ -428,9 +412,6 @@ describe('ServiceRequestsService', () => {
     await expect(service.findById(principal([]), 'x')).rejects.toBeInstanceOf(
       ForbiddenException,
     );
-    await expect(
-      service.dispatch(principal([]), 'sr-1', { riderId: 'rider-1' }),
-    ).rejects.toBeInstanceOf(ForbiddenException);
     await expect(service.deliver(principal([]), 'sr-1')).rejects.toBeInstanceOf(
       ForbiddenException,
     );
@@ -502,105 +483,6 @@ describe('ServiceRequestsService', () => {
     });
   });
 
-  describe('dispatch', () => {
-    it('assigns the rider, stamps dispatch, and flips the rider to On Delivery', async () => {
-      const { repo, qb } = makeRepo(1);
-      repo.findOne = jest.fn(() => Promise.resolve(pendingSr())) as never;
-      const fleet = makeFleet(availableRider());
-      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
-
-      const result = await service.dispatch(principal(['branch-uuid-1']), 'sr-1', {
-        riderId: 'rider-1',
-      });
-
-      // The four fields the dispatch commits.
-      expect(result.riderId).toBe('rider-1');
-      expect(result.dispatchedAt).toBeInstanceOf(Date);
-      expect(result.status).toBe('Dispatched');
-      expect(result.updatedAt).toBeInstanceOf(Date);
-      // Committed via a conditional UPDATE (the race guard), not a plain save.
-      expect(qb.execute).toHaveBeenCalledTimes(1);
-      // Rider drops out of the Available list.
-      expect(fleet.markOnDelivery).toHaveBeenCalledWith('rider-1');
-    });
-
-    it('409s when the request is already dispatched (status not Pending)', async () => {
-      const { repo, qb } = makeRepo();
-      const dispatched = { ...pendingSr(), status: 'Dispatched' } as ServiceRequest;
-      repo.findOne = jest.fn(() => Promise.resolve(dispatched)) as never;
-      const fleet = makeFleet(availableRider());
-      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
-
-      await expect(
-        service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-1' }),
-      ).rejects.toBeInstanceOf(ConflictException);
-      // Bailed before validating a rider or touching the data layer.
-      expect(fleet.findAssignableRider).not.toHaveBeenCalled();
-      expect(qb.execute).not.toHaveBeenCalled();
-    });
-
-    it('409s an unpaid PayMongo request before assigning a rider', async () => {
-      const { repo, qb } = makeRepo();
-      repo.findOne = jest.fn(() => Promise.resolve({
-        ...pendingSr(),
-        paymentMethod: 'PayMongo',
-        paymentStatus: 'Pending',
-      } as ServiceRequest)) as never;
-      const fleet = makeFleet(availableRider());
-      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
-
-      await expect(
-        service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-1' }),
-      ).rejects.toBeInstanceOf(ConflictException);
-      expect(fleet.findAssignableRider).not.toHaveBeenCalled();
-      expect(qb.execute).not.toHaveBeenCalled();
-    });
-
-    it('409s when a concurrent dispatch won the race (0 rows affected)', async () => {
-      // Row still looks Pending on load, but the conditional UPDATE touches 0
-      // rows because another dispatch committed first (AGENTS.md §8.2).
-      const { repo, qb } = makeRepo(0);
-      repo.findOne = jest.fn(() => Promise.resolve(pendingSr())) as never;
-      const fleet = makeFleet(availableRider());
-      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
-
-      await expect(
-        service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-1' }),
-      ).rejects.toBeInstanceOf(ConflictException);
-      expect(qb.execute).toHaveBeenCalledTimes(1);
-      // The loser must NOT flip the rider — that rider is on the winner's order.
-      expect(fleet.markOnDelivery).not.toHaveBeenCalled();
-    });
-
-    it('400s when the rider is not assignable (wrong branch, soft-deleted, or not Available)', async () => {
-      const { repo, qb } = makeRepo();
-      repo.findOne = jest.fn(() => Promise.resolve(pendingSr())) as never;
-      // Fleet lookup returns null for any of: unknown, soft-deleted, wrong
-      // branch, or not-Available rider.
-      const fleet = makeFleet(null);
-      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
-
-      await expect(
-        service.dispatch(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-x' }),
-      ).rejects.toBeInstanceOf(BadRequestException);
-      // No commit and no rider flip when validation fails.
-      expect(qb.execute).not.toHaveBeenCalled();
-      expect(fleet.markOnDelivery).not.toHaveBeenCalled();
-    });
-
-    it('404s for a request outside the caller scope or not found', async () => {
-      const { repo } = makeRepo();
-      // findOne already returns null by default (out of scope / missing).
-      const fleet = makeFleet(availableRider());
-      const service = makeService(repo, makeHistory(), fleet, makeCim(null));
-
-      await expect(
-        service.dispatch(principal(['branch-uuid-1']), 'missing', { riderId: 'rider-1' }),
-      ).rejects.toBeInstanceOf(NotFoundException);
-      expect(fleet.findAssignableRider).not.toHaveBeenCalled();
-    });
-  });
-
   describe('deliver', () => {
     const manualDeliverySr = (): ServiceRequest => ({
       ...outForDeliverySr(), riderId: null, orderSource: 'Walk-in/Phone',
@@ -660,7 +542,7 @@ describe('ServiceRequestsService', () => {
         changedAt: result.deliveredAt, note: 'Delivery Rider submitted proof of delivery',
       }));
       expect(qb.where).toHaveBeenCalledWith(expect.stringContaining('rider_id = :riderId'), expect.objectContaining({ riderId: 'rider-1', expectedStatus: 'En Route' }));
-      expect(fleet.markAvailable).toHaveBeenCalledWith('rider-1');
+      expect(fleet.releaseDeliveryVehicle).toHaveBeenCalledWith(expect.anything(), 'branch-uuid-1', 'rider-1', result.deliveredAt);
       expect(proofRepo.save).toHaveBeenCalledWith(expect.objectContaining({
         serviceRequestId: 'sr-1',
         branchId: 'branch-uuid-1',
@@ -814,7 +696,7 @@ describe('ServiceRequestsService', () => {
       expect(qb.set).toHaveBeenCalledWith(
         expect.objectContaining({ paymentStatus: 'Paid' }),
       );
-      expect(fleet.markAvailable).not.toHaveBeenCalled();
+      expect(fleet.releaseDeliveryVehicle).not.toHaveBeenCalled();
       expect(history.save).toHaveBeenCalledWith(expect.objectContaining({
         changedBy: 'user-1', toStatus: 'Delivered',
         note: 'Branch Manager marked Walk-in/Phone order delivered',
@@ -836,7 +718,7 @@ describe('ServiceRequestsService', () => {
       ).rejects.toBeInstanceOf(ConflictException);
       expect(qb.execute).toHaveBeenCalledTimes(1);
       // The loser must NOT touch the rider — nothing was committed.
-      expect(fleet.markAvailable).not.toHaveBeenCalled();
+      expect(fleet.releaseDeliveryVehicle).not.toHaveBeenCalled();
     });
 
     it('repairs a missing loyalty entry when a committed delivery is retried', async () => {
@@ -885,7 +767,7 @@ describe('ServiceRequestsService', () => {
       ).rejects.toBeInstanceOf(NotFoundException);
       // Bailed before committing or touching the fleet.
       expect(qb.execute).not.toHaveBeenCalled();
-      expect(fleet.markAvailable).not.toHaveBeenCalled();
+      expect(fleet.releaseDeliveryVehicle).not.toHaveBeenCalled();
     });
   });
 
@@ -1173,127 +1055,6 @@ describe('ServiceRequestsService', () => {
       ).rejects.toBeInstanceOf(NotFoundException);
       expect(qb.execute).not.toHaveBeenCalled();
       expect(history.save).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('reassign', () => {
-    it('swaps the rider, updates fleet availability, and writes an audit note (BM-010)', async () => {
-      const { repo, qb } = makeRepo(1);
-      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
-      const history = makeHistory();
-      const fleet = makeFleet(newAssignableRider(), currentAssignedRider());
-      const service = new ServiceRequestsService(
-        repo,
-        makeBranches(),
-        history,
-        makeSlaConfig(),
-        fleet,
-        makeCim(null),
-        makePrices(),
-        makePayMongo(),
-        makeLoyalty(),
-        makeDataSource(),
-      );
-
-      const result = await service.reassign(principal(['branch-uuid-1']), 'sr-1', {
-        riderId: 'rider-2',
-      });
-
-      expect(result.riderId).toBe('rider-2');
-      // dispatched_at / in_transit_at are never part of the SET clause —
-      // the interpretation call: reassignment never touches SLA timestamps.
-      expect(qb.set).toHaveBeenCalledWith(
-        expect.objectContaining({ riderId: 'rider-2' }),
-      );
-      const setArg = qb.set.mock.calls[0][0];
-      expect(setArg).not.toHaveProperty('dispatchedAt');
-      expect(setArg).not.toHaveProperty('inTransitAt');
-      expect(setArg).not.toHaveProperty('status');
-      expect(fleet.markAvailable).toHaveBeenCalledWith('rider-1');
-      expect(fleet.markOnDelivery).toHaveBeenCalledWith('rider-2');
-      expect(history.save).toHaveBeenCalledWith(
-        expect.objectContaining({
-          fromStatus: 'Dispatched',
-          toStatus: 'Dispatched',
-          note: expect.stringContaining('Current Rider'),
-        }),
-      );
-    });
-
-    it('400s when the request is not out for delivery', async () => {
-      const { repo, qb } = makeRepo();
-      repo.findOne = jest.fn(() => Promise.resolve(pendingSr())) as never;
-      const service = makeService(repo, makeHistory(), makeFleet(newAssignableRider()), makeCim(null));
-
-      await expect(
-        service.reassign(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-2' }),
-      ).rejects.toBeInstanceOf(BadRequestException);
-      expect(qb.execute).not.toHaveBeenCalled();
-    });
-
-    it('400s when reassigning to the same rider already assigned', async () => {
-      const { repo } = makeRepo();
-      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
-      const service = makeService(
-        repo,
-        makeHistory(),
-        makeFleet(currentAssignedRider(), currentAssignedRider()),
-        makeCim(null),
-      );
-
-      await expect(
-        service.reassign(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-1' }),
-      ).rejects.toBeInstanceOf(BadRequestException);
-    });
-
-    it('400s when the new rider is not assignable', async () => {
-      const { repo } = makeRepo();
-      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
-      const service = makeService(
-        repo,
-        makeHistory(),
-        makeFleet(null, currentAssignedRider()),
-        makeCim(null),
-      );
-
-      await expect(
-        service.reassign(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-2' }),
-      ).rejects.toBeInstanceOf(BadRequestException);
-    });
-
-    it('409s when a concurrent reassign/deliver already won the race (0 rows affected)', async () => {
-      const { repo, qb } = makeRepo(0);
-      repo.findOne = jest.fn(() => Promise.resolve(outForDeliverySr())) as never;
-      const history = makeHistory();
-      const fleet = makeFleet(newAssignableRider(), currentAssignedRider());
-      const service = new ServiceRequestsService(
-        repo,
-        makeBranches(),
-        history,
-        makeSlaConfig(),
-        fleet,
-        makeCim(null),
-        makePrices(),
-        makePayMongo(),
-        makeLoyalty(),
-        makeDataSource(),
-      );
-
-      await expect(
-        service.reassign(principal(['branch-uuid-1']), 'sr-1', { riderId: 'rider-2' }),
-      ).rejects.toBeInstanceOf(ConflictException);
-      expect(qb.execute).toHaveBeenCalled();
-      expect(fleet.markAvailable).not.toHaveBeenCalled();
-      expect(history.save).not.toHaveBeenCalled();
-    });
-
-    it('404s for a request outside the caller scope or not found', async () => {
-      const { repo } = makeRepo();
-      const service = makeService(repo, makeHistory(), makeFleet(newAssignableRider()), makeCim(null));
-
-      await expect(
-        service.reassign(principal(['branch-uuid-1']), 'missing', { riderId: 'rider-2' }),
-      ).rejects.toBeInstanceOf(NotFoundException);
     });
   });
 

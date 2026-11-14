@@ -212,7 +212,7 @@ export class CimService {
    * belongs to the SAME branch as the request. Returns null when any of those
    * fail — the caller turns that into a BadRequestException. Referential
    * integrity is checked here in the service layer; the schema has no FK
-   * constraints by design (AGENTS.md §6). Mirrors FleetService.findAssignableRider.
+   * constraints by design (AGENTS.md §6).
    */
   async findInBranch(
     customerId: string,

@@ -4,6 +4,7 @@ import { AuthModule } from '../auth/auth.module';
 import { Branch } from '../branches/branch.entity';
 import { CimModule } from '../cim/cim.module';
 import { GovernanceModule } from '../governance/governance.module';
+import { DeliveryOffer } from '../service-requests/delivery-offer.entity';
 import { ServiceRequest } from '../service-requests/service-request.entity';
 import { UsersModule } from '../users/users.module';
 import { DeliveryRiderInvitationsController } from './delivery-rider-invitations.controller';
@@ -33,6 +34,7 @@ import { GpsMileageService } from './traccar/gps-mileage.service';
       Branch,
       // Read-only dashboard lookup for the rider's assigned Service Request.
       ServiceRequest,
+      DeliveryOffer,
     ]),
     AuthModule,
     GovernanceModule,

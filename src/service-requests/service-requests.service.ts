@@ -29,11 +29,9 @@ import { LoyaltyService } from '../loyalty/loyalty.service';
 import { Redemption } from '../loyalty/redemption.entity';
 import { PricesService } from '../prices/prices.service';
 import { CreateCustomerServiceRequestDto } from './dto/create-customer-service-request.dto';
-import { DispatchServiceRequestDto } from './dto/dispatch-service-request.dto';
 import { CreateServiceRequestDto } from './dto/create-service-request.dto';
 import { EditServiceRequestDto } from './dto/edit-service-request.dto';
 import { CancelServiceRequestDto } from './dto/cancel-service-request.dto';
-import { ReassignServiceRequestDto } from './dto/reassign-service-request.dto';
 import { LogDelayReasonDto } from './dto/log-delay-reason.dto';
 import { OrderSource, ServiceRequest } from './service-request.entity';
 import { ServiceRequestStatusHistory } from './service-request-status-history.entity';
@@ -901,106 +899,6 @@ export class ServiceRequestsService {
   }
 
   /**
-   * Manual dispatch (story BM-004): assign an Available rider to a Pending
-   * request, opening the request→dispatch leg of the SLA chain (AGENTS.md §8.2).
-   * This is MANUAL dispatch only — no in_transit_at / "En Route" transition here;
-   * that leg is GPS/hardware-dependent and deferred (AGENTS.md §8).
-   *
-   * Order of checks (all in the service layer, AGENTS.md §5/§6):
-   *  1. Load the SR scoped to the caller's branches — 404 if missing,
-   *     soft-deleted, or out of scope (never leak another branch's rows).
-   *  2. Race guard: reject if already dispatched. Re-checked below with a
-   *     conditional UPDATE, not just here, so two concurrent dispatches can't
-   *     both win (AGENTS.md §8.2 double-dispatch defense).
-   *  3. Validate the rider via the Fleet service: live, Available, and in the
-   *     SAME branch as the request — else 400.
-   *  4. Commit with a conditional UPDATE (WHERE dispatched_at IS NULL): 0 rows
-   *     means another request won the race → 409. On success, flip the rider to
-   *     'On Delivery' so they drop out of the Available list (prevents
-   *     double-assignment).
-   *
-   * The assignment is then locked — there is no re-dispatch (the race guard
-   * enforces this). The rider returns to 'Available' and delivered_at is stamped
-   * in the later "mark delivered" slice (Slice 3) — NOT here.
-   */
-  async dispatch(
-    principal: Principal,
-    id: string,
-    dto: DispatchServiceRequestDto,
-  ): Promise<ServiceRequest> {
-    const branchIds = this.requireBranches(principal);
-
-    // 1. Load, scoped to the caller's branch(es). Out-of-scope / soft-deleted /
-    //    unknown ids all 404 — same as findById (AGENTS.md §5).
-    const serviceRequest = await this.serviceRequests.findOne({
-      where: { id, branchId: In(branchIds), deletedAt: IsNull() },
-    });
-    if (!serviceRequest) throw new NotFoundException('Service request not found');
-
-    // 2. Fast conflict feedback before we touch the fleet. The authoritative
-    //    guard is the conditional UPDATE in step 4.
-    if (serviceRequest.dispatchedAt !== null || serviceRequest.status !== 'Pending') {
-      throw new ConflictException('Service request already dispatched');
-    }
-    if (
-      serviceRequest.paymentMethod === 'PayMongo' &&
-      serviceRequest.paymentStatus !== 'Paid'
-    ) {
-      throw new ConflictException('PayMongo payment is required before dispatch');
-    }
-
-    // 3. Rider must be live, Available, and in the SAME branch as the request.
-    const rider = await this.fleet.findAssignableRider(
-      dto.riderId,
-      serviceRequest.branchId,
-    );
-    if (!rider) throw new BadRequestException('Rider is not assignable');
-
-    // 4. Commit atomically: only the request still Pending / not-yet-dispatched
-    //    is updated. 0 rows affected means a concurrent dispatch already won —
-    //    treat that as the conflict so both callers can't dispatch the same
-    //    request (AGENTS.md §8.2).
-    const now = new Date();
-    const result = await this.serviceRequests
-      .createQueryBuilder()
-      .update(ServiceRequest)
-      .set({
-        riderId: rider.id,
-        dispatchedAt: now,
-        status: 'Dispatched',
-        updatedAt: now,
-      })
-      .where(
-        `id = :id
-          AND branch_id = :branchId
-          AND dispatched_at IS NULL
-          AND status = :status
-          AND (payment_method <> :paymongo OR payment_status = :paid)`,
-        {
-          id,
-          branchId: serviceRequest.branchId,
-          status: 'Pending',
-          paymongo: 'PayMongo',
-          paid: 'Paid',
-        },
-      )
-      .execute();
-    if (!result.affected) {
-      throw new ConflictException('Service request already dispatched');
-    }
-
-    // Rider drops out of the Available list so no other request picks them.
-    await this.fleet.markOnDelivery(rider.id);
-
-    // Reflect the committed state back to the caller without a re-read.
-    serviceRequest.riderId = rider.id;
-    serviceRequest.dispatchedAt = now;
-    serviceRequest.status = 'Dispatched';
-    serviceRequest.updatedAt = now;
-    return serviceRequest;
-  }
-
-  /**
    * Mark delivered (story BM-007): close the SLA chain on an out-for-delivery
    * request and return its rider to the roster. This is the inverse of dispatch.
    *
@@ -1014,7 +912,7 @@ export class ServiceRequestsService {
    *     (0 rows affected) is a 409 and two concurrent deliveries can't both win.
    *  3. When a Delivery Rider completes the request, the validated proof is
    *     uploaded first and its metadata is committed with the delivery state.
-   *  4. Return the rider to 'Available' so the branch can dispatch them again.
+   *  4. Release the motorcycle and return the Delivery Rider to Available.
    *
    * Delivery Riders must have started the delivery (En Route). Branch Managers
    * retain manual completion for Walk-in/Phone requests with no assigned rider.
@@ -1149,6 +1047,9 @@ export class ServiceRequestsService {
             deletedAt: null,
           }));
         }
+        if (authenticatedRiderId) {
+          await this.fleet.releaseDeliveryVehicle(manager, serviceRequest.branchId, authenticatedRiderId, now);
+        }
         const history = manager.getRepository(ServiceRequestStatusHistory);
         await history.save(history.create({
           serviceRequestId: id,
@@ -1180,19 +1081,6 @@ export class ServiceRequestsService {
         return concurrentlyDelivered;
       }
       throw new ConflictException('Service request is not out for delivery');
-    }
-
-    // 4. Return the assigned rider to the Available roster (inverse of dispatch's
-    //    markOnDelivery). rider_id is always set on an out-for-delivery request,
-    //    but guard defensively in case of legacy data. Best-effort: a vehicle
-    //    lookup failure must never block the delivery itself — the rider can be
-    //    reset manually or on the next deliver attempt.
-    if (serviceRequest.riderId) {
-      try {
-        await this.fleet.markAvailable(serviceRequest.riderId);
-      } catch {
-        // Non-fatal — the delivery committed; the rider may need a manual reset.
-      }
     }
 
     // Reflect the committed state back to the caller without a re-read.
@@ -1371,117 +1259,6 @@ export class ServiceRequestsService {
   }
 
   /**
-   * Replace the assigned rider on a delayed, still-in-flight request (story
-   * BM-010). Interpretation call (stated in the PR): this does NOT touch
-   * dispatched_at / in_transit_at — it only swaps the rider and writes an
-   * audit entry. The story's bold AC title says "new dispatched_at segment
-   * logged", but its actual Given/When/Then only requires "the system logs
-   * the reassignment event with a timestamp" (which the audit row satisfies).
-   * Taking the literal, testable clause over the loose title also means the
-   * original SLA timing — and therefore the eventual persisted breach record
-   * (BM-012) — is never disturbed by a reassignment, satisfying "the original
-   * SLA breach is not erased" by construction rather than by extra logic.
-   *
-   * Order of checks (all in the service layer, AGENTS.md §5/§6):
-   *  1. Load the SR scoped to the caller's branches — 404 if missing.
-   *  2. Must be Dispatched/En Route with a currently assigned rider — else 400
-   *     (nothing to reassign: still Pending, already Delivered, or Cancelled).
-   *  3. The CURRENT rider is looked up status-agnostically (they are 'On
-   *     Delivery', not 'Available') to name them in the audit note.
-   *  4. The NEW rider must be Available, in the same branch, and different
-   *     from the current rider — else 400.
-   *  5. Commit atomically: conditional UPDATE (WHERE rider_id = the OLD rider
-   *     AND status still Dispatched/En Route). 0 rows => a concurrent
-   *     reassign/deliver already won => 409.
-   *  6. Free the old rider ('Available'), claim the new one ('On Delivery').
-   *  7. Append an audit entry naming both riders.
-   */
-  async reassign(
-    principal: Principal,
-    id: string,
-    dto: ReassignServiceRequestDto,
-  ): Promise<ServiceRequest> {
-    const branchIds = this.requireBranches(principal);
-
-    // 1. Load, scoped to the caller's branch(es).
-    const serviceRequest = await this.serviceRequests.findOne({
-      where: { id, branchId: In(branchIds), deletedAt: IsNull() },
-    });
-    if (!serviceRequest) throw new NotFoundException('Service request not found');
-
-    // 2. Must be out for delivery with a rider already assigned.
-    if (
-      !['Dispatched', 'En Route'].includes(serviceRequest.status) ||
-      !serviceRequest.riderId
-    ) {
-      throw new BadRequestException(
-        'Cannot reassign: request is not out for delivery',
-      );
-    }
-    const oldRiderId = serviceRequest.riderId;
-
-    // 3. Name the current rider for the audit note (status-agnostic lookup —
-    //    they are 'On Delivery', so findAssignableRider would not find them).
-    const oldRider = await this.fleet.findInBranch(oldRiderId, serviceRequest.branchId);
-
-    // 4. The new rider must be Available, in-branch, and a genuine change.
-    if (dto.riderId === oldRiderId) {
-      throw new BadRequestException('Request is already assigned to this rider');
-    }
-    const newRider = await this.fleet.findAssignableRider(
-      dto.riderId,
-      serviceRequest.branchId,
-    );
-    if (!newRider) throw new BadRequestException('Rider is not assignable');
-
-    // 5. Commit atomically: only a still-out-for-delivery request currently
-    //    assigned to the OLD rider is updated. 0 rows => a concurrent
-    //    reassign or deliver already won => 409.
-    const now = new Date();
-    const result = await this.serviceRequests
-      .createQueryBuilder()
-      .update(ServiceRequest)
-      .set({ riderId: newRider.id, updatedAt: now })
-      .where(
-        'id = :id AND rider_id = :oldRiderId AND status IN (:...statuses)',
-        { id, oldRiderId, statuses: ['Dispatched', 'En Route'] },
-      )
-      .execute();
-    if (!result.affected) {
-      throw new ConflictException('Request is no longer assigned to that rider');
-    }
-
-    // 6. Swap fleet availability: free the old rider, claim the new one.
-    //    markAvailable is best-effort — a vehicle-lookup failure must not prevent
-    //    the new rider from being claimed (the old rider can be reset manually).
-    try {
-      await this.fleet.markAvailable(oldRiderId);
-    } catch {
-      // Non-fatal — the old rider may remain On Delivery; manual reset possible.
-    }
-    await this.fleet.markOnDelivery(newRider.id);
-
-    // 7. Audit the reassignment. Status is unchanged (see the interpretation
-    //    note above), so from/to are both the request's current status.
-    await this.statusHistory.save(
-      this.statusHistory.create({
-        serviceRequestId: id,
-        branchId: serviceRequest.branchId,
-        fromStatus: serviceRequest.status,
-        toStatus: serviceRequest.status,
-        changedBy: principal.userId,
-        changedAt: now,
-        note: `Reassigned from ${oldRider?.name ?? oldRiderId} to ${newRider.name}`,
-      }),
-    );
-
-    // Reflect the committed state back to the caller without a re-read.
-    serviceRequest.riderId = newRider.id;
-    serviceRequest.updatedAt = now;
-    return serviceRequest;
-  }
-
-  /**
    * Log a delay reason (story BM-011). The dropdown category + optional
    * free-text note are combined into the single `delay_reason` display
    * string. No status change — this is purely documentation, available on any
@@ -1639,8 +1416,8 @@ export class ServiceRequestsService {
       .update(ServiceRequest)
       .set({ ...set, updatedAt: now })
       .where(
-        'id = :id AND dispatched_at IS NULL AND status = :status AND deleted_at IS NULL',
-        { id, status: 'Pending' },
+        'id = :id AND branch_id = :branchId AND dispatched_at IS NULL AND status = :status AND deleted_at IS NULL',
+        { id, branchId: serviceRequest.branchId, status: 'Pending' },
       )
       .execute();
     if (!result.affected) {

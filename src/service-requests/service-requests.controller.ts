@@ -24,6 +24,7 @@ import { EditServiceRequestDto } from './dto/edit-service-request.dto';
 import { CancelServiceRequestDto } from './dto/cancel-service-request.dto';
 import { ReassignServiceRequestDto } from './dto/reassign-service-request.dto';
 import { LogDelayReasonDto } from './dto/log-delay-reason.dto';
+import { DeliveryOffersService } from './delivery-offers.service';
 import { ServiceRequest } from './service-request.entity';
 import { ServiceRequestsService, FranchiseOrderAnalyticsSeries } from './service-requests.service';
 import {
@@ -46,6 +47,7 @@ export class ServiceRequestsController {
   constructor(
     private readonly serviceRequests: ServiceRequestsService,
     private readonly payments: ServiceRequestPaymentsService,
+    private readonly deliveryOffers: DeliveryOffersService,
   ) {}
 
   @Get('me')
@@ -122,9 +124,16 @@ export class ServiceRequestsController {
   @Get()
   async list(
     @CurrentPrincipal() principal: Principal,
-  ): Promise<{ serviceRequests: ReturnType<ServiceRequestsController['toListRow']>[] }> {
-    const items = await this.serviceRequests.listWithSlaRisk(principal);
-    return { serviceRequests: items.map((item) => this.toListRow(item)) };
+  ): Promise<{ serviceRequests: (ReturnType<ServiceRequestsController['toListRow']> & { delivery_offer_expires_at: string | null })[] }> {
+    const [items, offers] = await Promise.all([
+      this.serviceRequests.listWithSlaRisk(principal),
+      this.deliveryOffers.listOpen(principal),
+    ]);
+    const offersByRequest = new Map(offers.map(offer => [offer.serviceRequestId, offer]));
+    return { serviceRequests: items.map(item => {
+      const offer = offersByRequest.get(item.serviceRequest.id);
+      return { ...this.toListRow(item), delivery_offer_expires_at: offer?.expiresAt.toISOString() ?? null };
+    }) };
   }
 
   /** Branch-scoped completed records used by the staff Proof of Delivery
@@ -300,20 +309,13 @@ export class ServiceRequestsController {
     return { serviceRequest: this.toRow(row) };
   }
 
-  /**
-   * Assign an Available rider to a Pending request (manual dispatch, story
-   * BM-004). Conflicts if the request is already dispatched (409) and rejects a
-   * rider that is not live/Available/in-branch (400) — see the service for the
-   * race guard. The updated row (now with rider_id, dispatched_at, status=
-   * 'Dispatched') is returned in the standard envelope.
-   */
   @Post(':id/dispatch')
   async dispatch(
     @CurrentPrincipal() principal: Principal,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: DispatchServiceRequestDto,
   ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
-    const row = await this.serviceRequests.dispatch(principal, id, dto);
+    const row = await this.deliveryOffers.offer(principal, id, dto.riderId);
     return { serviceRequest: this.toRow(row) };
   }
 
@@ -368,20 +370,13 @@ export class ServiceRequestsController {
     return { serviceRequest: this.toRow(row) };
   }
 
-  /**
-   * Replace the assigned rider on a delayed, out-for-delivery request (story
-   * BM-010). Body is just the new rider. 400 if the request is not out for
-   * delivery, the new rider isn't assignable, or it's the same rider already
-   * assigned; 409 if the request's rider assignment changed concurrently
-   * (race); 404 if outside the caller's branch. The updated row is returned.
-   */
   @Post(':id/reassign')
   async reassign(
     @CurrentPrincipal() principal: Principal,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: ReassignServiceRequestDto,
   ): Promise<{ serviceRequest: ReturnType<ServiceRequestsController['toRow']> }> {
-    const row = await this.serviceRequests.reassign(principal, id, dto);
+    const row = await this.deliveryOffers.offer(principal, id, dto.riderId, true);
     return { serviceRequest: this.toRow(row) };
   }
 

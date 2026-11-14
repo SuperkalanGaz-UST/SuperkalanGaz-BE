@@ -1,4 +1,5 @@
 import {
+  Body,
   Controller,
   BadRequestException,
   UploadedFile,
@@ -14,6 +15,8 @@ import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { FleetService } from '../fleet/fleet.service';
+import { DeliveryOffersService } from './delivery-offers.service';
+import { AcceptDeliveryOfferDto } from './dto/accept-delivery-offer.dto';
 import { ServiceRequestsService } from './service-requests.service';
 import type { DeliveryProofUpload } from './service-requests.service';
 import {
@@ -25,16 +28,36 @@ import {
 /** Delivery Rider milestone writes. This is separate from the Branch Manager
  * queue controller so the route remains explicitly role-gated and the mobile
  * client can use the delivery-rider URL namespace. */
-@Controller('delivery-rider/service-requests')
+@Controller('delivery-rider')
 @UseGuards(AuthGuard, RolesGuard)
 @Roles('driver')
 export class DeliveryRiderServiceRequestsController {
   constructor(
     private readonly serviceRequests: ServiceRequestsService,
     private readonly fleet: FleetService,
+    private readonly deliveryOffers: DeliveryOffersService,
   ) {}
 
-  @Post(':id/deliver')
+  @Post('offers/:id/accept')
+  async accept(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: AcceptDeliveryOfferDto,
+  ) {
+    const result = await this.deliveryOffers.accept(principal, id, dto?.vehicleId);
+    return { ...await this.fleet.deliveryRiderDashboard(principal), ...result };
+  }
+
+  @Post('offers/:id/decline')
+  async decline(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+  ) {
+    await this.deliveryOffers.decline(principal, id);
+    return this.fleet.deliveryRiderDashboard(principal);
+  }
+
+  @Post('service-requests/:id/deliver')
   @UseInterceptors(FileInterceptor('proof', {
     limits: { files: 1, fileSize: DELIVERY_PROOF_MAX_BYTES },
     fileFilter: (_request, file, callback) => {

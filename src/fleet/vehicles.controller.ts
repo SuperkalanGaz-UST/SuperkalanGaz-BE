@@ -1,10 +1,11 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Principal } from '../auth/principal';
 import { CurrentPrincipal, Roles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
 import { ConnectVehicleGpsDto } from './dto/connect-vehicle-gps.dto';
 import { CreateVehicleDto } from './dto/create-vehicle.dto';
+import { UpdateVehicleNameDto } from './dto/update-vehicle-name.dto';
 import { VehicleBranchQuery } from './dto/vehicle-branch.query';
 import { LogMileageDto } from './dto/log-mileage.dto';
 import { FleetService } from './fleet.service';
@@ -80,6 +81,21 @@ export class VehiclesController {
     };
   }
 
+  /** Branch Manager only (class-level role): set or clear the vehicle label. */
+  @Patch(':id/name')
+  async rename(
+    @CurrentPrincipal() principal: Principal,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateVehicleNameDto,
+  ): Promise<{ vehicle: ReturnType<VehiclesController['toRow']> }> {
+    const vehicle = await this.fleet.renameVehicle(principal, id, dto);
+    const [riderNames, thresholds] = await Promise.all([
+      this.fleet.riderNamesFor(this.assignedRiderIds([vehicle])),
+      this.fleet.maintenanceThresholdsForBranches([vehicle.branchId]),
+    ]);
+    return { vehicle: this.toRow(vehicle, riderNames, thresholds) };
+  }
+
   @Post(':id/retry-gps-provisioning')
   async retryGpsProvisioning(
     @CurrentPrincipal() principal: Principal,
@@ -151,6 +167,7 @@ export class VehiclesController {
       id: vehicle.id,
       branch_id: vehicle.branchId,
       plate_number: vehicle.plateNumber,
+      display_name: vehicle.displayName,
       vehicle_type: vehicle.vehicleType,
       assigned_rider_id: vehicle.assignedRiderId,
       assigned_rider_name: vehicle.assignedRiderId

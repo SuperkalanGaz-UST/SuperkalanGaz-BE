@@ -28,6 +28,11 @@ export class Vehicle {
   @Column({ name: 'plate_number', type: 'text' })
   plateNumber!: string;
 
+  /** Optional Branch Manager label such as "Red Yamaha Single Tank".
+   * Display-only: the plate stays the identifier for uniqueness and dispatch. */
+  @Column({ name: 'display_name', type: 'text', nullable: true })
+  displayName!: string | null;
+
   @Column({ name: 'vehicle_type', type: 'text', nullable: true })
   vehicleType!: string | null;
 

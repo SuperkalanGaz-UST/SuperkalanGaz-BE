@@ -8,6 +8,16 @@ export interface TraccarDevice {
   uniqueId: string;
 }
 
+type ScopedDevice = { id: string; uniqueId: string };
+type LatestPosition = { deviceId: string; positionAt: Date; row: Record<string, unknown> };
+
+export interface VehiclePosition {
+  deviceId: string;
+  positionAt: Date;
+  latitude: number;
+  longitude: number;
+}
+
 class TraccarRequestError extends Error {
   constructor(
     message: string,
@@ -25,10 +35,27 @@ class TraccarRequestError extends Error {
 export class TraccarClient {
   constructor(private readonly config: ConfigService) {}
 
-  /** Two bounded batch reads, only for server-resolved devices. Fetch device
-   * position IDs first: /positions?deviceId is singular, not a batch filter.
-   * Never fall back to an unfiltered all-device request. */
-  async latestDistances(devices: { id: string; uniqueId: string }[]): Promise<DistanceReading[]> {
+  async latestDistances(devices: ScopedDevice[]): Promise<DistanceReading[]> {
+    return (await this.latestPositions(devices)).flatMap(({ deviceId, positionAt, row }) => {
+      const attributes = row.attributes as Record<string, unknown> | null;
+      const distance = attributes?.totalDistance;
+      if (typeof distance !== 'number' || !Number.isFinite(distance) || distance < 0 || distance >= 1e12) return [];
+      return [{ deviceId, positionAt, totalDistanceM: distance }];
+    });
+  }
+
+  async latestVehiclePositions(devices: ScopedDevice[]): Promise<VehiclePosition[]> {
+    return (await this.latestPositions(devices)).flatMap(({ deviceId, positionAt, row }) => {
+      const { latitude, longitude } = row;
+      if (typeof latitude !== 'number' || !Number.isFinite(latitude) || Math.abs(latitude) > 90 ||
+          typeof longitude !== 'number' || !Number.isFinite(longitude) || Math.abs(longitude) > 180) return [];
+      return [{ deviceId, positionAt, latitude, longitude }];
+    });
+  }
+
+  /** Device IDs and position IDs come from scoped records and validated
+   * responses. An empty batch must never request all devices or positions. */
+  private async latestPositions(devices: ScopedDevice[]): Promise<LatestPosition[]> {
     if (devices.length === 0) return [];
     if (devices.length > 100 || devices.some(({ id }) => !/^[1-9]\d*$/.test(id))) {
       throw new TraccarRequestError('Invalid device batch', false);
@@ -50,20 +77,17 @@ export class TraccarClient {
     const query = new URLSearchParams([...positionIds.keys()].map((id): [string, string] => ['id', id]));
     const positions = await this.request<unknown>(`/api/positions?${query}`, { method: 'GET' }, 2000);
     if (!Array.isArray(positions)) throw new TraccarRequestError('Invalid position response', false);
-    const readings: DistanceReading[] = [];
+    const readings: LatestPosition[] = [];
     for (const value of positions) {
       if (!value || typeof value !== 'object') continue;
       const row = value as Record<string, unknown>;
-      const attributes = row.attributes as Record<string, unknown> | null;
-      const distance = attributes?.totalDistance;
       const deviceId = String(row.deviceId);
       const positionAt = typeof row.fixTime === 'string' ? new Date(row.fixTime) : new Date(NaN);
       if (
         positionIds.get(String(row.id)) !== deviceId || !expected.has(deviceId) ||
-        row.valid !== true || typeof distance !== 'number' || !Number.isFinite(distance) ||
-        distance < 0 || distance >= 1e12 || !Number.isFinite(positionAt.getTime())
+        row.valid !== true || !Number.isFinite(positionAt.getTime())
       ) continue;
-      readings.push({ deviceId, totalDistanceM: distance, positionAt });
+      readings.push({ deviceId, positionAt, row });
     }
     return readings;
   }

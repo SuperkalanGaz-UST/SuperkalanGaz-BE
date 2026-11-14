@@ -22,6 +22,20 @@ describe('StaffLoginService', () => {
     expect(goTrue.signInWithPassword).toHaveBeenCalledWith('verified@example.com', 'secret');
   });
 
+  it('authenticates the only eligible staff account when an inactive account shares its username', async () => {
+    goTrue.listUsers.mockResolvedValue([{
+      ...user,
+      id: 'former-staff',
+      email: 'former@example.com',
+      app_metadata: { ...user.app_metadata, status: 'Inactive' },
+      banned_until: '2126-01-01T00:00:00Z',
+    }, user]);
+
+    expect(await service.signIn('new.name', 'secret')).toEqual(tokens);
+    expect(goTrue.signInWithPassword).toHaveBeenCalledTimes(1);
+    expect(goTrue.signInWithPassword).toHaveBeenCalledWith('verified@example.com', 'secret');
+  });
+
   it('does not accept the old username or user-editable metadata as an alias', async () => {
     goTrue.listUsers.mockResolvedValue([{ ...user, user_metadata: { username: 'old.name' } }]);
     await expect(service.signIn('old.name', 'secret')).rejects.toThrow('Invalid username or password');
