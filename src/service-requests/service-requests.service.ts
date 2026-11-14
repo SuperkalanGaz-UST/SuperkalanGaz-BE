@@ -35,7 +35,13 @@ import { EditServiceRequestDto } from './dto/edit-service-request.dto';
 import { CancelServiceRequestDto } from './dto/cancel-service-request.dto';
 import { ReassignServiceRequestDto } from './dto/reassign-service-request.dto';
 import { LogDelayReasonDto } from './dto/log-delay-reason.dto';
-import { OrderSource, ServiceRequest } from './service-request.entity';
+import {
+  OrderSource,
+  ServiceRequest,
+  ServiceRequestItem,
+  serviceRequestItems,
+} from './service-request.entity';
+import { ServiceRequestItemDto } from './dto/service-request-item.dto';
 import { ServiceRequestStatusHistory } from './service-request-status-history.entity';
 import { ServiceRequestDeliveryProof } from './service-request-delivery-proof.entity';
 import { SlaConfiguration, SlaSegment } from './sla-configuration.entity';
@@ -304,8 +310,11 @@ export class ServiceRequestsService {
       const day = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Manila', day: 'numeric' }).format(date));
       hourly.set(hour, (hourly.get(hour) ?? 0) + amount);
       weekly.set(Math.floor((day - 1) / 7) + 1, (weekly.get(Math.floor((day - 1) / 7) + 1) ?? 0) + amount);
-      tankCounts.set(request.cylinderSize, (tankCounts.get(request.cylinderSize) ?? 0) + request.quantity);
-      tankRevenue.set(request.cylinderSize, (tankRevenue.get(request.cylinderSize) ?? 0) + amount);
+      for (const item of serviceRequestItems(request)) {
+        const lineAmount = request.items ? (item.unitPrice ?? 0) * item.quantity : amount;
+        tankCounts.set(item.cylinderSize, (tankCounts.get(item.cylinderSize) ?? 0) + item.quantity);
+        tankRevenue.set(item.cylinderSize, (tankRevenue.get(item.cylinderSize) ?? 0) + lineAmount);
+      }
       const dayKey = new Intl.DateTimeFormat('en-CA', {
         timeZone: 'Asia/Manila',
         month: '2-digit',
@@ -341,7 +350,7 @@ export class ServiceRequestsService {
       date: request.requestedAt,
       receipt: request.srCode,
       customer: request.customerName,
-      orders: request.quantity,
+      orders: serviceRequestItems(request).reduce((sum, item) => sum + item.quantity, 0),
       spent: request.totalAmount ?? 0,
       paid: request.paymentStatus === 'Paid' ? 'Paid' : 'Unpaid',
     }));
@@ -424,7 +433,7 @@ export class ServiceRequestsService {
       date: request.requestedAt,
       receipt: request.srCode,
       customer: request.customerName,
-      orders: request.quantity,
+      orders: serviceRequestItems(request).reduce((sum, item) => sum + item.quantity, 0),
       spent: request.totalAmount ?? 0,
       paid: request.paymentStatus === 'Paid' ? 'Paid' : 'Unpaid',
     }));
@@ -513,20 +522,20 @@ export class ServiceRequestsService {
     if (!principal.accountType) {
       throw new ForbiddenException('Customer account type is missing');
     }
-    // L4 fix: never log PII (customer name was previously included here).
-    console.log('[service-requests-service] createForCustomer input', {
-      userId: principal.userId,
-      role: principal.role,
-      branchId: dto.branchId,
-      quantity: dto.quantity,
-      cylinderSize: dto.cylinderSize,
-    });
+    if (dto.items !== undefined && (dto.cylinderSize !== undefined || dto.quantity !== undefined)) {
+      throw new BadRequestException('Provide either cylinder items or a single cylinder size and quantity');
+    }
+    const selections = dto.items ??
+      (dto.cylinderSize && dto.quantity ? [{ cylinderSize: dto.cylinderSize, quantity: dto.quantity }] : []);
     const branch = await this.branches.findOne({
       where: { id: dto.branchId, status: 'active' },
     });
     if (!branch) {
       throw new BadRequestException('Branch not found');
     }
+
+    const { items, totalAmount } = await this.priceItems(selections, branch.id);
+    const first = items[0];
 
     const customer = await this.cim.upsertSelfRegisteredInBranch({
       authUserId: principal.userId,
@@ -537,7 +546,6 @@ export class ServiceRequestsService {
       accountType: principal.accountType,
     });
 
-    const product = await this.prices.findByCylinderSize(dto.cylinderSize, branch.id);
     const now = new Date();
     const serviceRequest = this.serviceRequests.create({
       branchId: branch.id,
@@ -547,10 +555,11 @@ export class ServiceRequestsService {
       customerName: dto.customerName.trim(),
       customerContact: dto.customerContact.trim(),
       deliveryAddress: dto.deliveryAddress.trim(),
-      cylinderSize: product.cylinderSize,
-      quantity: dto.quantity,
-      unitPrice: product.unitPrice,
-      totalAmount: Number((product.unitPrice * dto.quantity).toFixed(2)),
+      cylinderSize: first.cylinderSize,
+      quantity: first.quantity,
+      unitPrice: first.unitPrice,
+      items: items.length > 1 ? items : null,
+      totalAmount,
       paymentMethod: dto.paymentMethod,
       paymentStatus: 'Unpaid',
       paymongoCheckoutSessionId: null,
@@ -569,15 +578,31 @@ export class ServiceRequestsService {
       deletedAt: null,
     });
 
-    const saved = await this.serviceRequests.save(serviceRequest);
-    console.log('[service-requests-service] createForCustomer saved', {
-      id: saved.id,
-      branchId: saved.branchId,
-      status: saved.status,
-      customerId: saved.customerId,
-      orderSource: saved.orderSource,
-    });
-    return saved;
+    return this.serviceRequests.save(serviceRequest);
+  }
+
+  private async priceItems(
+    selections: ServiceRequestItemDto[],
+    branchId: string,
+    previous: ServiceRequestItem[] = [],
+  ) {
+    if (!selections.length || new Set(selections.map(item => item.cylinderSize)).size !== selections.length) {
+      throw new BadRequestException('Select at least one cylinder and list each size only once');
+    }
+
+    const items = await Promise.all(selections.map(async ({ cylinderSize, quantity }) => {
+      const unchanged = previous.find(item => item.cylinderSize === cylinderSize && item.quantity === quantity);
+      if (unchanged?.unitPrice != null) {
+        return { cylinderSize, quantity, unitPrice: unchanged.unitPrice };
+      }
+      const product = await this.prices.findByCylinderSize(cylinderSize, branchId);
+      return { cylinderSize: product.cylinderSize, quantity, unitPrice: product.unitPrice };
+    }));
+    const centavos = items.reduce((sum, item) => sum + Math.round(item.unitPrice * 100) * item.quantity, 0);
+    if (!Number.isSafeInteger(centavos) || centavos > 999999999999) {
+      throw new BadRequestException('The total cylinder price exceeds the supported order amount');
+    }
+    return { items, totalAmount: centavos / 100 };
   }
 
   /**
@@ -1318,6 +1343,7 @@ export class ServiceRequestsService {
       serviceRequest.id,
       serviceRequest.cylinderSize,
       serviceRequest.quantity,
+      ...(serviceRequest.items ? [serviceRequest.items] as const : []),
     );
   }
 
@@ -1544,7 +1570,30 @@ export class ServiceRequestsService {
     // cylinderSize/quantity are priced fields — never patch either without
     // re-deriving unitPrice/totalAmount from the live catalog (H2 fix: an
     // edit must never leave a stale price snapshot on the order).
-    if (dto.cylinderSize !== undefined || dto.quantity !== undefined) {
+    const changesSingleCylinder = dto.cylinderSize != null || dto.quantity != null;
+    if (changesSingleCylinder && (dto.items || serviceRequest.items)) {
+      throw new BadRequestException('Use cylinder items to edit this Service Request');
+    }
+    if (dto.items) {
+      const previousItems = serviceRequestItems(serviceRequest);
+      const describeItems = (items: Pick<ServiceRequestItem, 'cylinderSize' | 'quantity'>[]) =>
+        items.map(item => `${item.quantity}× ${item.cylinderSize}`).join(', ');
+      const previous = describeItems(previousItems);
+      const next = describeItems(dto.items);
+      if (previous !== next) {
+        const { items, totalAmount } = await this.priceItems(dto.items, serviceRequest.branchId, previousItems);
+        const first = items[0];
+        Object.assign(set, {
+          cylinderSize: first.cylinderSize,
+          quantity: first.quantity,
+          unitPrice: first.unitPrice,
+          items: items.length > 1 ? items : null,
+          totalAmount,
+        });
+        changes.push(`cylinders "${previous}" → "${next}"`);
+        changes.push(`total_amount ${serviceRequest.totalAmount} → ${totalAmount}`);
+      }
+    } else if (changesSingleCylinder) {
       const nextCylinderSize = dto.cylinderSize ?? serviceRequest.cylinderSize;
       const nextQuantity = dto.quantity ?? serviceRequest.quantity;
 
@@ -1590,12 +1639,15 @@ export class ServiceRequestsService {
       .update(ServiceRequest)
       .set({ ...set, updatedAt: now })
       .where(
-        'id = :id AND dispatched_at IS NULL AND status = :status AND deleted_at IS NULL',
-        { id, status: 'Pending' },
+        `id = :id AND branch_id = :branchId AND dispatched_at IS NULL
+          AND status = :status AND deleted_at IS NULL
+          AND paymongo_checkout_session_id IS NULL
+          AND date_trunc('milliseconds', updated_at) = :updatedAt`,
+        { id, branchId: serviceRequest.branchId, status: 'Pending', updatedAt: serviceRequest.updatedAt },
       )
       .execute();
     if (!result.affected) {
-      throw new ConflictException('Cannot edit: request already dispatched');
+      throw new ConflictException('Cannot edit: the request has changed. Refresh and try again.');
     }
 
     // 4. Audit the diff. An edit keeps the status Pending → Pending; the note

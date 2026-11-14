@@ -1,6 +1,13 @@
+import { Type } from 'class-transformer';
 import {
   IsIn,
+  ArrayMaxSize,
+  ArrayMinSize,
+  IsArray,
   IsInt,
+  Max,
+  ValidateIf,
+  ValidateNested,
   IsNotEmpty,
   IsOptional,
   IsString,
@@ -8,6 +15,7 @@ import {
   registerDecorator,
   ValidationArguments,
 } from 'class-validator';
+import { ServiceRequestItemDto } from './service-request-item.dto';
 import { CYLINDER_SIZES, CylinderSize } from '../../prices/dto/update-prices.dto';
 
 /**
@@ -50,6 +58,7 @@ function AtLeastOneField(keys: string[]): ClassDecorator {
   'deliveryAddress',
   'cylinderSize',
   'quantity',
+  'items',
   'specialInstructions',
 ])
 export class EditServiceRequestDto {
@@ -68,7 +77,16 @@ export class EditServiceRequestDto {
   @IsOptional()
   @IsInt()
   @Min(1)
+  @Max(2147483647)
   quantity?: number;
+
+  @ValidateIf((_dto, value: unknown) => value !== undefined)
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(CYLINDER_SIZES.length)
+  @ValidateNested({ each: true })
+  @Type(() => ServiceRequestItemDto)
+  items?: ServiceRequestItemDto[];
 
   // May be an empty string: passing "" intentionally clears the instructions.
   // Hence @IsString() without @IsNotEmpty(), unlike the fields above.

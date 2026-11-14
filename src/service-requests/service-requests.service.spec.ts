@@ -395,6 +395,37 @@ describe('ServiceRequestsService', () => {
     expect(repo.save).toHaveBeenCalledTimes(1);
   });
 
+  it('persists all mobile cylinder selections on one branch-priced Service Request', async () => {
+    const { repo } = makeRepo();
+    const service = makeService(
+      repo, makeHistory(), makeFleet(null), makeCim(null), makeSlaConfig(),
+      makeBranches({ id: 'branch-uuid-1', status: 'active' } as Branch),
+    );
+    const payload = {
+      branchId: 'branch-uuid-1',
+      customerName: 'Test Customer',
+      customerContact: '+639399168168',
+      deliveryAddress: 'Test Address',
+      paymentMethod: 'Cash on Delivery' as const,
+      items: [
+        { cylinderSize: '2.7kg' as const, quantity: 2 },
+        { cylinderSize: '11kg' as const, quantity: 3 },
+      ],
+    };
+
+    const order = await service.createForCustomer(
+      { ...principal([]), role: 'customer', accountType: 'household' },
+      payload,
+    );
+    expect(order).toMatchObject({
+      branchId: payload.branchId,
+      orderSource: 'Mobile App',
+      totalAmount: 3250,
+      items: payload.items.map(item => ({ ...item, unitPrice: 650 })),
+    });
+    expect(repo.save).toHaveBeenCalledTimes(1);
+  });
+
   it('loads customer history through owned CIM profile ids with a legacy fallback', async () => {
     const { repo } = makeRepo();
     const cim = makeCim(inBranchCustomer());

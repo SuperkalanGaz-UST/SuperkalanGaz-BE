@@ -77,6 +77,12 @@ export class ServiceRequestPaymentsService {
           AND payment_method = :method
           AND payment_status <> :paid
           AND status <> :cancelled
+          AND deleted_at IS NULL
+          AND total_amount = :totalAmount
+          AND cylinder_size = :cylinderSize
+          AND quantity = :quantity
+          AND unit_price = :unitPrice
+          AND items IS NOT DISTINCT FROM CAST(:items AS jsonb)
           AND paymongo_checkout_session_id IS NULL`,
         {
           id: serviceRequest.id,
@@ -84,6 +90,11 @@ export class ServiceRequestPaymentsService {
           method: 'PayMongo',
           paid: 'Paid',
           cancelled: 'Cancelled',
+          totalAmount: serviceRequest.totalAmount,
+          cylinderSize: serviceRequest.cylinderSize,
+          quantity: serviceRequest.quantity,
+          unitPrice: serviceRequest.unitPrice,
+          items: serviceRequest.items ? JSON.stringify(serviceRequest.items) : null,
         },
       )
       .execute();

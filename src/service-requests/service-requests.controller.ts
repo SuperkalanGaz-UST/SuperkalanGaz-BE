@@ -24,7 +24,7 @@ import { EditServiceRequestDto } from './dto/edit-service-request.dto';
 import { CancelServiceRequestDto } from './dto/cancel-service-request.dto';
 import { ReassignServiceRequestDto } from './dto/reassign-service-request.dto';
 import { LogDelayReasonDto } from './dto/log-delay-reason.dto';
-import { ServiceRequest } from './service-request.entity';
+import { ServiceRequest, serviceRequestItemRows } from './service-request.entity';
 import { ServiceRequestsService, FranchiseOrderAnalyticsSeries } from './service-requests.service';
 import {
   CheckoutView,
@@ -388,6 +388,7 @@ export class ServiceRequestsController {
       customer_contact: sr.customerContact,
       delivery_address: sr.deliveryAddress,
       cylinder_size: sr.cylinderSize,
+      items: serviceRequestItemRows(sr),
       quantity: sr.quantity,
       unit_price: sr.unitPrice,
       total_amount: sr.totalAmount,

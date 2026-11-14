@@ -1,5 +1,12 @@
+import { Type } from 'class-transformer';
 import {
+  ArrayMaxSize,
+  ArrayMinSize,
+  IsArray,
   IsInt,
+  Max,
+  ValidateIf,
+  ValidateNested,
   IsNotEmpty,
   IsOptional,
   IsIn,
@@ -8,7 +15,8 @@ import {
   Matches,
   Min,
 } from 'class-validator';
-import { CylinderSize } from '../../prices/dto/update-prices.dto';
+import { CYLINDER_SIZES, CylinderSize } from '../../prices/dto/update-prices.dto';
+import { ServiceRequestItemDto } from './service-request-item.dto';
 import { PaymentMethod } from '../service-request.entity';
 
 const PH_MOBILE_E164 = /^\+639\d{9}$/;
@@ -34,14 +42,23 @@ export class CreateCustomerServiceRequestDto {
   @IsNotEmpty()
   deliveryAddress!: string;
 
-  @IsString()
-  @IsNotEmpty()
-  @Matches(/^(2\.7kg|5kg|11kg|22kg|50kg)$/)
-  cylinderSize!: CylinderSize;
+  @ValidateIf(dto => dto.items === undefined || dto.cylinderSize !== undefined)
+  @IsIn([...CYLINDER_SIZES])
+  cylinderSize?: CylinderSize;
 
+  @ValidateIf(dto => dto.items === undefined || dto.quantity !== undefined)
   @IsInt()
   @Min(1)
-  quantity!: number;
+  @Max(2147483647)
+  quantity?: number;
+
+  @ValidateIf((_dto, value: unknown) => value !== undefined)
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(CYLINDER_SIZES.length)
+  @ValidateNested({ each: true })
+  @Type(() => ServiceRequestItemDto)
+  items?: ServiceRequestItemDto[];
 
   @IsIn(['Cash on Delivery', 'PayMongo'])
   paymentMethod!: PaymentMethod;
