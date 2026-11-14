@@ -32,7 +32,7 @@ test('verifies the no-traffic candidate before promoting digest-pinned images', 
   const f = fixture();
   const result = await release(f);
   assert.equal(result.previous, 'previous');
-  assert.equal(f.requests.length, 9);
+  assert.equal(f.requests.length, 10);
   const update = f.calls.find((args) => args.includes('update'));
   assert.ok(update.includes('--no-traffic'));
   assert.equal(update.filter((arg) => arg.startsWith('--image=')).length, 2);
@@ -95,3 +95,13 @@ for (const path of ['/api/salary-expenses', '/api/salary-expenses/staff']) {
     assert.ok(!f.calls.some((args) => args.includes('update-traffic')));
   });
 }
+
+test('a candidate missing the Franchise Administrator SLA report cannot receive traffic', async () => {
+  const f = fixture();
+  const request = f.request;
+  f.request = async (url, options) => new URL(url).pathname === '/api/service-requests/reports/franchise-sla'
+    ? new Response('', { status: 404 })
+    : request(url, options);
+  await assert.rejects(release(f), /franchise-sla.*expected 401, received 404/);
+  assert.ok(!f.calls.some((args) => args.includes('update-traffic')));
+});
